@@ -1,0 +1,21 @@
+# Rust build artifacts
+/rust-core/target/
+**/*.rs.bk
+
+# Android / Gradle build artifacts
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/local.properties
+/android/app/src/main/jniLibs/
+
+# Keep Gradle Wrapper JAR tracked in Git
+!android/gradle/wrapper/gradle-wrapper.jar
+
+# IDE & OS clutter
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+*.apk
+!RedmiNote14-ARVR-debug.apk
