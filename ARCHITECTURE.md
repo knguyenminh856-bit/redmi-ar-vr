@@ -19,10 +19,11 @@
 | Mechanism | Specification |
 | :--- | :--- |
 | **1-Eye Mono AR / 2-Eye VR Toggle** | Default **1 Mắt** (`stereoMode = false`, zero IPD, full `2400x1080`, `1.02` overscan, `near = 0.02m`) with independent `LayoutParams` per HUD pane; 1-tap toggle switches to **2 Mắt** cardboard stereo (`1.06` overscan) + dynamic `ARSession.setDisplayGeometry`. |
-| **Incremental 3D Fusion (`spatial_mesh.rs`)** | **Rule 1 (Single Canonical State):** ARCore true `plane.polygon` merged via Coplanar 2D Convex Hull Union (max `32` planes, adaptive `24cm` ring tessellation) + `192` Sparse Hashed Chunks (`16x16x16` @ **`4cm`** with quantized `0.15mm` sub-voxel centroids, `~3.8 MB` RAM, LRU eviction). **Rule 2 (Static Lock + Old/New Realtime):** Static multi-view accumulation (`>=64` lock across 3+ hits from 5Hz SLAM `PointCloud` + 3Hz high-confidence `RAW_DEPTH_ONLY` `24x18` grid `conf>=175`, `<28` hysteresis) + `3.6cm`-step Free-Space Ray Carving erases moved objects; `InstantPlacement` (`hit_kind=4`) stays preview-only dashed reticle. **Rule 3 & 4 (Smooth Surface Nets + Caps):** FPS-governed **Surface Nets** + 1-pass Laplacian smoothing (`1..2` dirty chunks/tick) drapes a continuous organic triangle skin over static furniture, capped at `54,000` vertices + Frustum/`6m` culling. |
-| **Hardware Z-Buffer Mesh Occlusion & `🔺 Lưới △`** | **Pass 0 Depth Pre-Pass (`draw_depth_occlusion`):** Writes static locked room mesh into Hardware Z-Buffer (`color_mask=false`, `-1.6cm` normal bias so items ON tables never clip) -> **automatically hides occluded back-scan mesh layers AND occludes virtual 3D balls/cubes/drawings behind real furniture/walls** with zero raw-depth jitter (toggleable via `⚙ ➔ 🛡 Che khuất`). Mode `4` (`🔺 Lưới △`, default) renders crisp GLES 3.0 `fwidth(v_bary)` triangle sheets in 1 static draw call. |
-| **Persistent `.arroom` & 4-DoF Reloc (`room_persistence.rs`)** | **Rule 5 (Compact Persistence):** Atomic async disk I/O (`RoomMapStorage.kt`) saves merged canonical planes, sparse `(idx: u16, weight: u8)` solid voxels (3B/cell), and up to `8` `32x24` grayscale keyframes to `<app>/files/rooms/*.arroom` (~15–150 KB), plus standard Wavefront `.obj` export. **Rule 6 (4-DoF Offline Relocalization):** 1Hz keyframe capture while scanning; 4Hz brightness-invariant shifted-NCC matching (`>=0.72` x2 frames) auto-aligns `(yaw, tx, ty, tz)` + merges saved prior (`weight<=96`, carvable if furniture moved!) into live state, with instant **`📍 Khớp ngay`** 1-tap fallback. |
-| **Zero-Copy Camera** | ARCore `CameraConfig` picks `imageSize<=480p` (CPU) + `textureSize>=1080p` (GPU OES `0x8D65`); `DepthMode.DISABLED`; 0x MSAA EGL surface; ungrounded demo cube/octahedron hidden by default (`show_demo_scene = false`). |
+| **Sparse TSDF Conformal Object Mesh (`spatial_mesh.rs`)** | **True Signed Distance Field (TSDF):** `256` Sparse Chunks (`16x16x16` @ **`3.5cm`**, `±10.5cm` truncation band, `~2.0 MB` raw TSDF RAM) fused from zero-copy ARCore **`Config.DepthMode.AUTOMATIC`** (`acquireDepthImage16Bits` + optional `acquireRawDepthConfidenceImage`) using exact official `cam.imageIntrinsics` + `cam.pose` sensor-space unprojection + silhouette edge-jump rejection (eliminates floating spiderwebs). **Fast `18x18x18` Halo Surface Nets** extracts exact `tsdf = 0` sub-centimeter linear zero-crossings with guaranteed outward-CCW winding (`CULL_FACE(BACK)`) and **ZERO stacked flat ARCore planes** on top of the conformal mesh (canonical ARCore planes remain active for infinite-crisp physics colliders & non-Depth fallback). Nearest-first sorted VBO capped at `90,000` vertices (`30,000` triangles). |
+| **Turbo Scan (`⚡ Quét mạnh`) & Maintain (`🛡 Duy trì`)** | **1-Tap Toggle:** **Turbo ON (`10Hz`, `stride=1..2`, `6` dirty chunks/tick):** continuous high-density 3.5cm TSDF capture wrapping real objects tightly in realtime. **Turbo OFF / After Room Load (`2.5Hz`, `stride=2`, `1..2` dirty chunks/tick):** read-only diff comparison against locked TSDF first — unchanged regions stay 100% frozen (`0` voxel writes, `0` GPU uploads), updating/carving **ONLY** voxels where real-world geometry changed (`step = 0.85 * cell` chunk-cached uniform carving, zero Swiss-cheese artifacts). |
+| **Hardware Z-Buffer Mesh Occlusion & `🔺 Lưới △`** | **Pass 0 Depth Pre-Pass (`draw_depth_occlusion`):** Writes static locked conformal TSDF mesh into Hardware Z-Buffer (`color_mask=false`, `-1.4cm` normal bias so items ON tables never clip) -> **automatically hides occluded back-scan mesh layers AND occludes virtual 3D balls/cubes/drawings behind real objects/furniture/walls** at 120Hz (toggleable via `⚙ ➔ 🛡 Che khuất`). Mode `4` (`🔺 Lưới △`, default) renders surface-normal color-coded GLES 3.0 `fwidth(v_bary)` triangles with back-face culling. |
+| **Persistent `.arroom` v2 & 4-DoF Reloc (`room_persistence.rs`)** | **Compact TSDF Persistence:** Saves canonical planes, sparse narrow-band TSDF `(idx: u16, tsdf: i8, weight: u8)` (4B/cell, v1 backward-compatible), and up to `8` `32x24` grayscale keyframes to `<app>/files/rooms/*.arroom`, plus Wavefront `.obj` export. Auto-switches loaded rooms into **`🛡 Duy trì`** (Compare & Maintain) mode immediately after 4-DoF relocalization! |
+| **Zero-Copy Camera & Depth** | ARCore `CameraConfig` picks `imageSize<=480p` (CPU) + `textureSize>=1080p` (GPU OES `0x8D65`); `DepthMode.AUTOMATIC` (fallback `RAW_DEPTH_ONLY` -> `DISABLED`); 0x MSAA EGL surface; direct `ByteBuffer` zero-copy depth ingestion into Rust. |
 | **Full-Screen 1:1 Scale** | Cover-fit `compute_eye_projection` (`tan_v = min(cam_tan_v, cam_tan_h / aspect) / (fov_scale * overscan)`) fills 100% edge-to-edge at `100%` while locking world-to-camera scale 1:1. |
 | **120Hz Async Timewarp** | `ArSession.update()` throttled to ~32Hz (`31ms`); `onDrawFrame()` runs at 120Hz (`preferredRefreshRate` + `Surface.setFrameRate`) using `ar_rot * (gyro_at_capture.inv() * gyro_latest)`. |
 | **RAM Vision Ring & Lazy AI** | Pre-allocated 2MB 3D YUV->RGBA LUT, 4KB YCbCr skin mask, 4-slot `RwLock` frame ring (`vision_ram.rs`); Hand AI (`handMode = 0` default) and Object AI (`roomScanMode = 2`) lazy-initialize TFLite/GPU delegates only when toggled ON. |
@@ -42,6 +43,8 @@
 | `nativeSetCalibration` | `fovScale, ipdMeters` | `Unit` |
 | `nativeSetStereoMode` | `enabled: Boolean` (`false=Mono, true=Stereo`) | `Unit` |
 | `nativeSetMeshOcclusion` | `enabled: Boolean` (Hardware Z-Buffer static mesh occlusion) | `Unit` |
+| `nativeSetScanTurbo` | `enabled: Boolean` (`true=⚡ 10Hz Turbo, false=🛡 2.5Hz Diff Maintain`) | `Unit` |
+| `nativeIngestDepthMap` | `depthBuf, dims/strides, opt confBuf, isRawOnly, intrinsics, sensorPose` | `Int` (`updated_voxels`) |
 | `nativeSetDrawMode` | `drawMode: Int` | `Unit` |
 | `nativeClearDrawings` | None | `Unit` |
 | `nativeRecenter` | None | `Unit` |
@@ -57,12 +60,12 @@
 | `nativeThrowPhysicsAtReticle` | `throwSpeed: Float` | `Unit` |
 | `nativeClearPhysicsBodies` | None | `Unit` |
 | `nativeGetRoomLabels` | `outArr: FloatArray(36)` | `Int` (`0..6`) |
-| `nativeGetPerfMetrics` | `outArr: FloatArray(21)` (`+chunks, +tris, +kfs, +relocState, +relocPct`) | `Unit` |
+| `nativeGetPerfMetrics` | `outArr: FloatArray(24)` (`+chunks, +tris, +kfs, +reloc, +depthSrc, +turbo, +diff`) | `Unit` |
 | `nativeGetRenderFrameMs` | None | `Float` |
 | `nativeIngestCameraImage` | `yBuf, uBuf, vBuf, yLen, uLen, vLen, w, h, strides, rotDeg, ndcBasis` | `Long` (`seq`) |
 | `nativeConvertLatestFrameRgba` | `outRgbaBuf, dstW, dstH, lastSeq, updateMotion, outMeta(19)` | `Long` (`seq`) |
 | `nativeTickRelocalizer` | None (1Hz scan / 4Hz reloc NCC tick) | `Int` (`0=idle,1=match,2=auto,3=manual`) |
-| `nativeSerializeRoom` | None | `ByteArray?` (`.arroom` v1) |
+| `nativeSerializeRoom` | None | `ByteArray?` (`.arroom` v2 TSDF) |
 | `nativeLoadRoomBytes` | `data: ByteArray, outCounts: IntArray(3)` | `Boolean` |
 | `nativeForceRelocalizeNow` | None | `Boolean` |
 | `nativeCancelRelocalize` | None | `Unit` |

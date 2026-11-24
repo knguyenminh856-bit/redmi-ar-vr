@@ -1,20 +1,19 @@
 # Redmi Note 14 4G — Rust AR/VR Passthrough Demo
 
-Ứng dụng thực tế hỗn hợp (Passthrough AR/VR) tối ưu cho **Xiaomi Redmi Note 14 4G** (`arm64-v8a`, Helio G99-Ultra, GPU Mali-G57 MC2, AMOLED 120Hz `2400×1080`), viết bằng **Rust + OpenGL ES 3.0 (`glow`) + ARCore + MediaPipe GPU**.
+Ứng dụng thực tế hỗn hợp (Passthrough AR/VR) tối ưu cho **Xiaomi Redmi Note 14 4G** (`arm64-v8a`, Helio G99-Ultra, GPU Mali-G57 MC2, AMOLED 120Hz `2400×1080`), viết bằng **Rust + OpenGL ES 3.0 (`glow`) + ARCore Depth API + MediaPipe GPU**.
 
-## Tính năng chính (Build #11 — Lưới Surface Nets mượt `4cm` + Che khuất Z-Buffer 3D)
+## Tính năng chính (Build #12 — Lưới TSDF ôm sát vật thể `3.5cm` + Quét Mạnh / Duy Trì)
 
-1. **Lưới 3D Mượt ôm sát thực thể tĩnh (`🔺 Lưới △` mặc định — `spatial_mesh.rs`):**
-   - **Độ chi tiết `4cm` + Sub-Voxel Surface Nets (`0.15mm`) + Làm mượt Laplacian:** Nâng độ phân giải khối gấp `3.375×` (192 Sparse Chunks `~3.8 MB` RAM), giữ lại tọa độ bề mặt dưới-centimet của từng điểm 3D và nối thành **lớp lưới tam giác mượt ôm sát vật thể thật** (bỏ hoàn toàn dạng khối hộp vuông cứng).
-   - **Tăng cường chi tiết đa nguồn (`RawDepth 3Hz` + `SLAM PointCloud 5Hz` + Đa giác ARCore thật):** Nếu máy hỗ trợ `RAW_DEPTH_ONLY`, app tự lấy thêm lưới độ sâu tin cậy cao (`conf >= 175`, `24×18` điểm @ `3Hz`) hợp nhất qua tối thiểu 3 khung hình — chỉ **thực thể tĩnh** mới khóa thành lưới chắc chắn, còn đồ đã dời bị **Free-Space Carving (`3.6cm`)** tự gọt sạch.
-2. **Che khuất tự động bằng Hardware Z-Buffer (`🛡 Che khuất vật thật: BẬT`):**
-   - Dùng chính mô hình lưới 3D tĩnh đã hợp nhất để ghi độ sâu phần cứng (`color_mask = false`, đẩy lùi `1.6cm` theo pháp tuyến để vật đặt *trên* bàn không bị cắt):
-     - **Tự che các lớp lưới scan bị khuất phía sau** tủ, ghế, giường, tường (không còn rối mắt khi nhìn xuyên qua vật thể).
-     - **Tự che khuất bóng/khối vật lý và nét vẽ 3D** khi lăn hoặc nằm ra sau đồ vật thật — ổn định 120Hz, không nhấp nháy như depth từng khung hình. (Có nút bật/tắt `🛡 Che khuất` trong menu `⚙`).
-3. **Lưu / Nạp Phòng 3D Offline (`💾 Phòng`), Xuất `.obj` & Tự khớp 4-DoF:**
-   - Lưu/nạp bản đồ phòng siêu gọn `.arroom` trên luồng I/O nền (`Android/data/com.minhkhoi.arvr/files/rooms/`), xuất `.obj` mở được trên Blender/PC, và tự khớp lại căn phòng bằng 8 mốc ảnh `32×24` (Shifted-NCC) kèm nút **`📍 Khớp ngay`**.
-4. **Chế độ `👁 1 Mắt` / `🥽 2 Mắt`, Vật lý 4x Substeps & Tự cập nhật OTA (`🔄` ➔ `⬇ #11`):**
-   - Mặc định **`👁 1 Mắt`** Full màn `2400×1080`, nút **`⬇ Thả`** & **`🎯 Ném`** góc dưới phải; bấm **`🔄`** để cập nhật thẳng APK mới nhất từ GitHub Releases (`latest-apk`).
+1. **Lưới TSDF ôm khít thực thể thật (Bỏ hoàn toàn mặt phẳng xếp chồng — `spatial_mesh.rs`):**
+   - **ARCore Dense Depth (`DepthMode.AUTOMATIC`, zero-copy `ByteBuffer`):** Dùng chính `acquireDepthImage16Bits()` kết hợp `cam.imageIntrinsics` + `cam.pose` chuẩn cảm biến và lọc nhảy cạnh bóng ma (*silhouette jump guard*) để chiếu chính xác từng điểm bề mặt của cốc, laptop, bàn phím, ghế, tủ, tường vào không gian 3D.
+   - **Sparse TSDF `3.5cm` + Surface Nets cắt điểm 0 (`256` chunks, tối đa `30.000△` ưu tiên vật gần):** Nội suy tuyến tính chính xác mặt `tsdf = 0` cho độ sắc nét dưới-centimet, tự phân màu theo pháp tuyến (sàn xanh ngọc, mặt bàn/đỉnh vật vàng hổ phách, thành đứng/vật cong xanh lá-lam), bật `CULL_FACE(BACK)` một mặt duy nhất, **không còn vẽ đè các tấm mặt phẳng ARCore lên vật thể**.
+2. **Nút 1 chạm `⚡ Quét mạnh` (10Hz liên tục) ⇄ `🛡 Duy trì` (2.5Hz so sánh & giữ nguyên):**
+   - **`⚡ Quét mạnh` (BẬT):** Quét độ sâu liên tục `~10Hz` (độ phân giải đầy đủ `1×`, dựng tới `6` chunk/frame) giúp lưới 3D bám kín nhanh từng đồ vật ngay khi lia máy.
+   - **`🛡 Duy trì` (TẮT quét mạnh / Tự bật sau khi nạp phòng `.arroom`):** Hạ tốc độ xuống `2.5Hz` (`stride = 2`), **so sánh chỉ-đọc với TSDF đang khóa trước** — vùng không đổi giữ nguyên `0` cập nhật (nhẹ CPU/GPU, không rung), chỉ quét bổ sung hoặc gọt sạch đúng khu vực có đồ vật mới đặt vào hoặc vừa dời đi.
+3. **Che khuất vật bị khuất bằng Hardware Z-Buffer (`🛡 Che khuất vật thật: BẬT`):**
+   - Pass 0 ghi chính lưới TSDF ôm sát vật thể vào Depth Buffer (`-1.4cm` bias theo pháp tuyến): tự động **che lớp lưới phía sau đồ vật** và **che bóng/khối vật lý, nét vẽ 3D** khi lăn ra sau bàn/ghế/cốc/tường ở 120Hz.
+4. **Lưu / Nạp Phòng 3D `.arroom` v2 (TSDF), Xuất `.obj` & Tự cập nhật OTA (`🔄` ➔ `⬇ #12`):**
+   - Lưu/nạp nguyên trường TSDF gọn nhẹ trên luồng nền (`Android/data/com.minhkhoi.arvr/files/rooms/`), tương thích ngược file v1 cũ, tự khớp 4-DoF và tự chuyển sang **`🛡 Duy trì`** sau khi khớp phòng.
 
 ---
 

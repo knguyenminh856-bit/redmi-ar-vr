@@ -58,6 +58,36 @@ object NativeBridge {
     external fun nativeSpawnPhysicsBody(throwSpeed: Float)
     external fun nativeSetStereoMode(enabled: Boolean)
     external fun nativeSetMeshOcclusion(enabled: Boolean)
+    external fun nativeSetScanTurbo(enabled: Boolean)
+    external fun nativeIngestDepthMap(
+        depthBuf: ByteBuffer,
+        depthLen: Int,
+        dw: Int,
+        dh: Int,
+        dRowStride: Int,
+        dPixStride: Int,
+        hasConf: Boolean,
+        confBuf: ByteBuffer,
+        confLen: Int,
+        cw: Int,
+        ch: Int,
+        cRowStride: Int,
+        cPixStride: Int,
+        isRawOnly: Boolean,
+        fx: Float,
+        fy: Float,
+        cx: Float,
+        cy: Float,
+        imgW: Int,
+        imgH: Int,
+        px: Float,
+        py: Float,
+        pz: Float,
+        qx: Float,
+        qy: Float,
+        qz: Float,
+        qw: Float
+    ): Int
     external fun nativeOnSurfaceReticle(
         valid: Boolean,
         hitKind: Int,

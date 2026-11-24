@@ -153,9 +153,11 @@ class MainActivity : Activity(), SensorEventListener {
     @Volatile
     private var stereoMode = false // false=1 Mắt (Full màn zero-IPD), true=2 Mắt (VR Stereo)
     @Volatile
-    private var meshOcclusionEnabled = true // Che khuất bằng Hardware Z-Buffer từ lưới 3D tĩnh
+    private var meshOcclusionEnabled = true // Che khuất bằng Hardware Z-Buffer từ lưới TSDF 3D tĩnh
     @Volatile
-    private var isRawDepthSupported = false
+    private var depthSupportLevel = 0 // 2=AUTOMATIC Dense Depth, 1=RAW_DEPTH_ONLY, 0=SLAM
+    @Volatile
+    private var scanTurbo = true // true=⚡ Quét mạnh (10Hz liên tục), false=🛡 Duy trì (2.5Hz so sánh thay đổi)
     @Volatile
     private var drawMode = 0 // 0=Off, 1=1 Finger, 2=5 Fingers
     @Volatile
@@ -192,9 +194,9 @@ class MainActivity : Activity(), SensorEventListener {
     private val packedPolyCountsBuf = IntArray(16)
     private val packedPolyXzBuf = FloatArray(16 * 24 * 2)
     private val pointCloudBuf = FloatArray(512 * 4)
-    private val rawDepthPtsBuf = FloatArray(512 * 4)
-    private val tmpCamPt = FloatArray(3)
-    private val tmpWorldPt = FloatArray(3)
+    private val depthFocalBuf = FloatArray(2)
+    private val depthPpBuf = FloatArray(2)
+    private val depthDimsBuf = IntArray(2)
     private val reticleInfoBuf = FloatArray(3)
     private var lastPlaneExtractNs = 0L
     private var lastPointCloudNs = 0L
@@ -209,6 +211,7 @@ class MainActivity : Activity(), SensorEventListener {
     private lateinit var drawToggleBtn: Button
     private lateinit var handModeBtn: Button
     private lateinit var roomScanToggleBtn: Button
+    private lateinit var scanTurboBtn: Button
     private lateinit var checkUpdateBtn: Button
     private lateinit var installUpdateBtn: Button
     private lateinit var telemetryToggleBtn: Button
@@ -217,7 +220,7 @@ class MainActivity : Activity(), SensorEventListener {
     private lateinit var roomListContainer: LinearLayout
     private lateinit var relocBar: LinearLayout
     private lateinit var relocStatusLabel: TextView
-    private val metricsBuf = FloatArray(21)
+    private val metricsBuf = FloatArray(24)
     private var cachedGpuName = ""
     private var telemetryRunnable: Runnable? = null
 
@@ -235,6 +238,7 @@ class MainActivity : Activity(), SensorEventListener {
         loadCalibration()
         NativeBridge.nativeSetStereoMode(stereoMode)
         NativeBridge.nativeSetMeshOcclusion(meshOcclusionEnabled)
+        NativeBridge.nativeSetScanTurbo(scanTurbo)
         NativeBridge.nativeSetDrawMode(drawMode)
         NativeBridge.nativeSetRoomScanMode(roomScanMode)
         configureHighRefreshDisplayAndKeepOn()
@@ -574,6 +578,12 @@ class MainActivity : Activity(), SensorEventListener {
         ) {
             cycleRoomScanMode(showPopup = true)
         }
+        scanTurboBtn = makeQuickButton(
+            if (scanTurbo) "\u26A1 Quét mạnh" else "\uD83D\uDEE1 Duy trì",
+            fillColor = if (scanTurbo) Color.argb(225, 217, 119, 6) else Color.argb(200, 14, 116, 144)
+        ) {
+            toggleScanTurbo(showPopup = true)
+        }
         val roomMgrBtn = makeQuickButton("\uD83D\uDCBE Phòng", fillColor = Color.argb(195, 36, 62, 110)) {
             toggleRoomManagerPanel()
         }
@@ -616,6 +626,7 @@ class MainActivity : Activity(), SensorEventListener {
         }
 
         bar.addView(roomScanToggleBtn, itemParams)
+        bar.addView(scanTurboBtn, itemParams)
         bar.addView(roomMgrBtn, itemParams)
         bar.addView(eyeModeBtn, itemParams)
         bar.addView(clearBtn, itemParams)
@@ -712,6 +723,35 @@ class MainActivity : Activity(), SensorEventListener {
         3 -> "\uD83C\uDFE0 Ẩn lưới"
         2 -> "\uD83C\uDFE0 +AI Vật"
         else -> "\uD83C\uDFE0 TẮT"
+    }
+
+    private fun updateScanTurboButtonUi() {
+        scanTurboBtn.text = if (scanTurbo) "\u26A1 Quét mạnh" else "\uD83D\uDEE1 Duy trì"
+        (scanTurboBtn.background as? GradientDrawable)?.setColor(
+            if (scanTurbo) Color.argb(225, 217, 119, 6) else Color.argb(200, 14, 116, 144)
+        )
+    }
+
+    private fun toggleScanTurbo(showPopup: Boolean) {
+        scanTurbo = !scanTurbo
+        if (scanTurbo && roomScanMode == 0) {
+            roomScanMode = 4
+            roomScanToggleBtn.text = roomScanLabel(roomScanMode)
+            (roomScanToggleBtn.background as? GradientDrawable)?.setColor(Color.argb(215, 14, 138, 108))
+            NativeBridge.nativeSetRoomScanMode(roomScanMode)
+            updateArPlaneFindingMode()
+            startRoomLabelLoop()
+        }
+        NativeBridge.nativeSetScanTurbo(scanTurbo)
+        updateScanTurboButtonUi()
+        if (showPopup) {
+            val banner = if (scanTurbo) {
+                "\u26A1  QUÉT MẠNH BẬT (10Hz): Quét liên tục 3.5cm ôm sát mọi vật thể!"
+            } else {
+                "\uD83D\uDEE1  DUY TRÌ (2.5Hz): Giữ lưới đã quét — chỉ cập nhật vùng bị thay đổi!"
+            }
+            showStereoBanner(banner, if (scanTurbo) "#FFB300" else "#26C6DA", 1900L, strokeWidth = 4)
+        }
     }
 
     private fun toggleStereoMode(showPopup: Boolean) {
@@ -945,7 +985,14 @@ class MainActivity : Activity(), SensorEventListener {
             NativeBridge.nativeGetPerfMetrics(metricsBuf)
             if (roomScanMode == 4) {
                 val triCount = metricsBuf[17].toInt()
-                meshPrefix = "\uD83D\uDD3A ${triCount}\u25B3 \u00B7 "
+                val diffChanged = metricsBuf[23].toInt()
+                meshPrefix = if (scanTurbo) {
+                    "\u26A1 ${triCount}\u25B3 \u00B7 "
+                } else if (diffChanged > 0) {
+                    "\uD83D\uDEE1 Đổi +${diffChanged} (${triCount}\u25B3) \u00B7 "
+                } else {
+                    "\uD83D\uDEE1 Ổn định (${triCount}\u25B3) \u00B7 "
+                }
             }
             if (relocPending) {
                 val bestPct = metricsBuf[20].toInt()
@@ -1194,14 +1241,29 @@ class MainActivity : Activity(), SensorEventListener {
             else -> "Mốc:${kfCount}/8"
         }
 
-        val depthSrc = if (isRawDepthSupported) "RawDepth+SLAM" else "SLAM"
+        val depthModeAct = metricsBuf[21].toInt()
+        val diffChanged = metricsBuf[23].toInt()
+        val depthSrc = when {
+            depthModeAct == 2 -> "DenseDepth 3.5cm"
+            depthModeAct == 1 -> "RawDepth 3.5cm"
+            depthSupportLevel == 2 -> "DenseDepth(chờ)"
+            depthSupportLevel == 1 -> "RawDepth(chờ)"
+            else -> "SLAM"
+        }
+        val scanTag = if (scanTurbo) {
+            "\u26A1Mạnh(10Hz)"
+        } else if (diffChanged > 0) {
+            "\uD83D\uDEE1Duy trì(+${diffChanged})"
+        } else {
+            "\uD83D\uDEE1Duy trì(0 đổi)"
+        }
         val occTag = if (meshOcclusionEnabled) "Che:BẬT" else "Che:TẮT"
 
         val summary = StringBuilder()
             .append("v${BuildConfig.VERSION_NAME} ($shortSha) | $viewLabel | ${batPct}% ${String.format(Locale.US, "%.1f", tempC)}°C | ${totalRamMb}MB\n")
             .append(String.format(Locale.US, "GPU: %d fps (%.1fms) | %s | %s\n", renderFps, frameMs, depthSrc, occTag))
-            .append("Track: $trackMode | Tâm: $reticleSummary | Vật lý: $physBodies\n")
-            .append("3D: $cachedPlanes mặt gộp | $meshChunks chunk ($voxelCount ô) | ${meshTris}\u25B3 | $relocTag\n")
+            .append("Track: $trackMode | $scanTag | Tâm: $reticleSummary | Vật lý: $physBodies\n")
+            .append("3D: $meshChunks chunk ($voxelCount ô) | ${meshTris}\u25B3 | $cachedPlanes phẳng | $relocTag\n")
             .append("Tay ($activeHands): $gestureName | $handAiText | $objScanText")
             .toString()
 
@@ -1292,7 +1354,9 @@ class MainActivity : Activity(), SensorEventListener {
             relocPending = false
             relocBar.visibility = View.GONE
             if (ok) {
-                showStereoBanner("\uD83D\uDCCD  Đã khớp phòng 4-DoF — tiếp tục cập nhật 3D realtime!", "#00E676", 2200L)
+                scanTurbo = false
+                updateScanTurboButtonUi()
+                showStereoBanner("\uD83D\uDCCD  Đã khớp phòng — chuyển sang [🛡 Duy trì] (chỉ quét khi đổi)!", "#00E676", 2400L)
             }
         }
         val cancelRelocBtn = makeQuickButton("\u2716", fillColor = Color.argb(190, 90, 35, 35)) {
@@ -1496,7 +1560,9 @@ class MainActivity : Activity(), SensorEventListener {
                                 NativeBridge.nativeForceRelocalizeNow()
                                 relocPending = false
                                 relocBar.visibility = View.GONE
-                                showStereoBanner("\uD83D\uDCCD  Đã nạp & khớp ${info.name} ($p mặt)", "#00E676", 2000L)
+                                scanTurbo = false
+                                updateScanTurboButtonUi()
+                                showStereoBanner("\uD83D\uDCCD  Đã nạp & khớp ${info.name} — đang ở [🛡 Duy trì]", "#00E676", 2200L)
                             }
                         }.onFailure { err ->
                             showStereoBanner("\u26A0\uFE0F  ${err.message}", "#FF5252", 2200L)
@@ -1777,12 +1843,21 @@ class MainActivity : Activity(), SensorEventListener {
                         session.cameraConfig = preferred
                         Log.i(TAG, "ARCore CameraConfig: cpu=${preferred.imageSize}, gpu=${preferred.textureSize}")
                     }
+                    val autoDepthOk = try {
+                        session.isDepthModeSupported(Config.DepthMode.AUTOMATIC)
+                    } catch (_: Throwable) {
+                        false
+                    }
                     val rawDepthOk = try {
                         session.isDepthModeSupported(Config.DepthMode.RAW_DEPTH_ONLY)
                     } catch (_: Throwable) {
                         false
                     }
-                    isRawDepthSupported = rawDepthOk
+                    depthSupportLevel = when {
+                        autoDepthOk -> 2
+                        rawDepthOk -> 1
+                        else -> 0
+                    }
                     val config = Config(session).apply {
                         focusMode = Config.FocusMode.AUTO
                         planeFindingMode = if (roomScanMode > 0) {
@@ -1792,10 +1867,11 @@ class MainActivity : Activity(), SensorEventListener {
                         }
                         lightEstimationMode = Config.LightEstimationMode.DISABLED
                         instantPlacementMode = Config.InstantPlacementMode.LOCAL_Y_UP
-                        depthMode = if (rawDepthOk && roomScanMode > 0) {
-                            Config.DepthMode.RAW_DEPTH_ONLY
-                        } else {
-                            Config.DepthMode.DISABLED
+                        depthMode = when {
+                            roomScanMode <= 0 -> Config.DepthMode.DISABLED
+                            depthSupportLevel == 2 -> Config.DepthMode.AUTOMATIC
+                            depthSupportLevel == 1 -> Config.DepthMode.RAW_DEPTH_ONLY
+                            else -> Config.DepthMode.DISABLED
                         }
                         updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
                     }
@@ -1840,10 +1916,11 @@ class MainActivity : Activity(), SensorEventListener {
                 } else {
                     Config.PlaneFindingMode.DISABLED
                 }
-                val targetDepth = if (isRawDepthSupported && roomScanMode > 0) {
-                    Config.DepthMode.RAW_DEPTH_ONLY
-                } else {
-                    Config.DepthMode.DISABLED
+                val targetDepth = when {
+                    roomScanMode <= 0 -> Config.DepthMode.DISABLED
+                    depthSupportLevel == 2 -> Config.DepthMode.AUTOMATIC
+                    depthSupportLevel == 1 -> Config.DepthMode.RAW_DEPTH_ONLY
+                    else -> Config.DepthMode.DISABLED
                 }
                 if (cfg.planeFindingMode != target || cfg.depthMode != targetDepth) {
                     cfg.planeFindingMode = target
@@ -2330,8 +2407,9 @@ class MainActivity : Activity(), SensorEventListener {
                                     }
                                 }
 
-                                // 5Hz ARCore SLAM 3D PointCloud ingestion for 4cm Surface-Nets static fusion
-                                if (roomScanMode > 0 && valid && nowNs - lastPointCloudNs >= 200_000_000L) {
+                                // Fallback SLAM 3D PointCloud (only active before dense Depth warms up or on non-Depth devices)
+                                val pcIntervalNs = if (depthSupportLevel > 0) 500_000_000L else 200_000_000L
+                                if (roomScanMode > 0 && valid && (depthSupportLevel == 0 || scanTurbo) && nowNs - lastPointCloudNs >= pcIntervalNs) {
                                     lastPointCloudNs = nowNs
                                     try {
                                         val pc = frame.acquirePointCloud()
@@ -2350,85 +2428,80 @@ class MainActivity : Activity(), SensorEventListener {
                                     }
                                 }
 
-                                // 3Hz high-confidence ARCore RawDepth static surface feed (24x18 grid, conf >= 175)
-                                // Fused over 3+ frames into 4cm Surface Nets -> rich detail on static furniture/objects without jitter!
-                                if (roomScanMode > 0 && valid && isRawDepthSupported && nowNs - lastRawDepthNs >= 330_000_000L) {
+                                // Primary Conformal 3.5cm TSDF Depth Pipeline (Zero-Copy Direct ByteBuffer -> Rust):
+                                // - Turbo Scan ON:  ~10Hz (105ms), full dense depth continuous fusion hugging every object
+                                // - Maintain Mode:  2.5Hz (400ms), read-only diff comparison updating ONLY changed regions!
+                                val depthIntervalNs = if (scanTurbo) 105_000_000L else 400_000_000L
+                                if (roomScanMode > 0 && valid && depthSupportLevel > 0 && nowNs - lastRawDepthNs >= depthIntervalNs) {
                                     lastRawDepthNs = nowNs
                                     try {
-                                        val depthImg = frame.acquireRawDepthImage16Bits()
+                                        val isRawOnly = depthSupportLevel == 1
+                                        val depthImg = if (isRawOnly) {
+                                            frame.acquireRawDepthImage16Bits()
+                                        } else {
+                                            frame.acquireDepthImage16Bits()
+                                        }
+                                        var confImg: Image? = null
                                         try {
-                                            val confImg = frame.acquireRawDepthConfidenceImage()
-                                            try {
-                                                frame.transformCoordinates2d(
-                                                    Coordinates2d.IMAGE_NORMALIZED,
-                                                    imgBasis,
-                                                    Coordinates2d.OPENGL_NORMALIZED_DEVICE_COORDINATES,
-                                                    ndcBasis
-                                                )
-                                                val ox = ndcBasis[0]
-                                                val oy = ndcBasis[1]
-                                                val ux = ndcBasis[2] - ox
-                                                val uy = ndcBasis[3] - oy
-                                                val vx = ndcBasis[4] - ox
-                                                val vy = ndcBasis[5] - oy
+                                            confImg = try {
+                                                frame.acquireRawDepthConfidenceImage()
+                                            } catch (_: Throwable) {
+                                                null
+                                            }
+                                            if (isRawOnly && confImg == null) {
+                                                // RAW_DEPTH_ONLY requires confidence image to reject invalid pixels
+                                            } else {
+                                                val intrinsics = cam.imageIntrinsics
+                                                intrinsics.getFocalLength(depthFocalBuf, 0)
+                                                intrinsics.getPrincipalPoint(depthPpBuf, 0)
+                                                intrinsics.getImageDimensions(depthDimsBuf, 0)
+                                                val sensorPose = cam.pose
 
                                                 val dPlane = depthImg.planes[0]
                                                 val dBuf = dPlane.buffer
-                                                val dRowStride = dPlane.rowStride
-                                                val dPixStride = dPlane.pixelStride
-                                                val dw = depthImg.width
-                                                val dh = depthImg.height
+                                                dBuf.position(0)
+                                                val dLen = dBuf.remaining()
 
-                                                val cPlane = confImg.planes[0]
-                                                val cBuf = cPlane.buffer
-                                                val cRowStride = cPlane.rowStride
-                                                val cPixStride = cPlane.pixelStride
-                                                val cw = confImg.width
-                                                val ch = confImg.height
+                                                val hasConf = confImg != null
+                                                val cPlane = confImg?.planes?.get(0)
+                                                val cBuf = cPlane?.buffer ?: dBuf
+                                                if (hasConf) cBuf.position(0)
+                                                val cLen = if (hasConf) cBuf.remaining() else 0
 
-                                                var ptCount = 0
-                                                for (gy in 0 until 18) {
-                                                    val v = 0.06f + (gy / 17f) * 0.88f
-                                                    val dy = (v * (dh - 1)).toInt().coerceIn(0, dh - 1)
-                                                    val cy = (v * (ch - 1)).toInt().coerceIn(0, ch - 1)
-                                                    for (gx in 0 until 24) {
-                                                        if (ptCount >= 512) break
-                                                        val u = 0.06f + (gx / 23f) * 0.88f
-                                                        val dx = (u * (dw - 1)).toInt().coerceIn(0, dw - 1)
-                                                        val cx = (u * (cw - 1)).toInt().coerceIn(0, cw - 1)
-
-                                                        val confU8 = cBuf.get(cy * cRowStride + cx * cPixStride).toInt() and 0xFF
-                                                        if (confU8 < 175) continue
-
-                                                        val dOff = dy * dRowStride + dx * dPixStride
-                                                        val lo = dBuf.get(dOff).toInt() and 0xFF
-                                                        val hi = dBuf.get(dOff + 1).toInt() and 0xFF
-                                                        val depthMm = lo or (hi shl 8)
-                                                        if (depthMm !in 250..3500) continue
-
-                                                        val dm = depthMm * 0.001f
-                                                        val ndcX = ox + u * ux + v * vx
-                                                        val ndcY = oy + u * uy + v * vy
-                                                        tmpCamPt[0] = ndcX * tanH * dm
-                                                        tmpCamPt[1] = ndcY * tanV * dm
-                                                        tmpCamPt[2] = -dm
-                                                        pose.transformPoint(tmpCamPt, 0, tmpWorldPt, 0)
-
-                                                        val outBase = ptCount * 4
-                                                        rawDepthPtsBuf[outBase] = tmpWorldPt[0]
-                                                        rawDepthPtsBuf[outBase + 1] = tmpWorldPt[1]
-                                                        rawDepthPtsBuf[outBase + 2] = tmpWorldPt[2]
-                                                        rawDepthPtsBuf[outBase + 3] = confU8 / 255f
-                                                        ptCount++
-                                                    }
-                                                }
-                                                if (ptCount > 0) {
-                                                    NativeBridge.nativeOnPointCloud(ptCount, rawDepthPtsBuf)
-                                                }
-                                            } finally {
-                                                confImg.close()
+                                                NativeBridge.nativeIngestDepthMap(
+                                                    dBuf,
+                                                    dLen,
+                                                    depthImg.width,
+                                                    depthImg.height,
+                                                    dPlane.rowStride,
+                                                    dPlane.pixelStride,
+                                                    hasConf,
+                                                    cBuf,
+                                                    cLen,
+                                                    confImg?.width ?: 0,
+                                                    confImg?.height ?: 0,
+                                                    cPlane?.rowStride ?: 1,
+                                                    cPlane?.pixelStride ?: 1,
+                                                    isRawOnly,
+                                                    depthFocalBuf[0],
+                                                    depthFocalBuf[1],
+                                                    depthPpBuf[0],
+                                                    depthPpBuf[1],
+                                                    depthDimsBuf[0],
+                                                    depthDimsBuf[1],
+                                                    sensorPose.tx(),
+                                                    sensorPose.ty(),
+                                                    sensorPose.tz(),
+                                                    sensorPose.qx(),
+                                                    sensorPose.qy(),
+                                                    sensorPose.qz(),
+                                                    sensorPose.qw()
+                                                )
                                             }
                                         } finally {
+                                            try {
+                                                confImg?.close()
+                                            } catch (_: Throwable) {}
                                             depthImg.close()
                                         }
                                     } catch (_: Throwable) {
@@ -2468,10 +2541,12 @@ class MainActivity : Activity(), SensorEventListener {
                                                 relocPending = false
                                                 mainHandler.post {
                                                     relocBar.visibility = View.GONE
+                                                    scanTurbo = false
+                                                    updateScanTurboButtonUi()
                                                     NativeBridge.nativeGetPerfMetrics(metricsBuf)
                                                     val pct = metricsBuf[20].toInt()
                                                     showStereoBanner(
-                                                        "\u2705  Đã tự khớp phòng 3D (${pct}%) — tiếp tục cập nhật realtime!",
+                                                        "\u2705  Đã tự khớp phòng (${pct}%) — chuyển sang [🛡 Duy trì]!",
                                                         "#00E676",
                                                         2400L,
                                                         strokeWidth = 4

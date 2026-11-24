@@ -340,6 +340,9 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeGetPerfMetrics(
         perf.keyframe_count as f32,
         perf.reloc_status as f32,
         perf.reloc_best_pct as f32,
+        perf.depth_source_mode as f32,
+        perf.scan_turbo as f32,
+        perf.last_diff_changed as f32,
     ];
     let copy_len = env
         .get_array_length(&out_arr)
@@ -706,6 +709,106 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeSetMeshOcclusio
     if let Ok(mut state) = input_state().lock() {
         state.set_mesh_occlusion(enabled != 0);
     }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeSetScanTurbo(
+    _env: JNIEnv,
+    _class: JClass,
+    enabled: jboolean,
+) {
+    if let Ok(mut state) = input_state().lock() {
+        state.set_scan_turbo(enabled != 0);
+    }
+}
+
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeIngestDepthMap(
+    env: JNIEnv,
+    _class: JClass,
+    depth_buf: JByteBuffer,
+    depth_len: jint,
+    dw: jint,
+    dh: jint,
+    d_row_stride: jint,
+    d_pix_stride: jint,
+    has_conf: jboolean,
+    conf_buf: JByteBuffer,
+    conf_len: jint,
+    cw: jint,
+    ch: jint,
+    c_row_stride: jint,
+    c_pix_stride: jint,
+    is_raw_only: jboolean,
+    fx: jfloat,
+    fy: jfloat,
+    cx: jfloat,
+    cy: jfloat,
+    img_w: jint,
+    img_h: jint,
+    px: jfloat,
+    py: jfloat,
+    pz: jfloat,
+    qx: jfloat,
+    qy: jfloat,
+    qz: jfloat,
+    qw: jfloat,
+) -> jint {
+    if dw < 8 || dh < 8 || depth_len <= 0 || img_w <= 0 || img_h <= 0 {
+        return 0;
+    }
+    let (Ok(d_ptr), Ok(d_cap)) = (
+        env.get_direct_buffer_address(&depth_buf),
+        env.get_direct_buffer_capacity(&depth_buf),
+    ) else {
+        return 0;
+    };
+    if d_ptr.is_null() {
+        return 0;
+    }
+    let depth_slice = unsafe { std::slice::from_raw_parts(d_ptr, (depth_len as usize).min(d_cap)) };
+
+    let conf_slice = if has_conf == JNI_TRUE && conf_len > 0 && cw > 0 && ch > 0 {
+        match (
+            env.get_direct_buffer_address(&conf_buf),
+            env.get_direct_buffer_capacity(&conf_buf),
+        ) {
+            (Ok(c_ptr), Ok(c_cap)) if !c_ptr.is_null() => Some(unsafe {
+                std::slice::from_raw_parts(c_ptr, (conf_len as usize).min(c_cap))
+            }),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    let updated = if let Ok(mut state) = input_state().lock() {
+        state.on_depth_map(
+            depth_slice,
+            dw as usize,
+            dh as usize,
+            d_row_stride.max(2) as usize,
+            d_pix_stride.max(2) as usize,
+            conf_slice,
+            cw.max(0) as usize,
+            ch.max(0) as usize,
+            c_row_stride.max(1) as usize,
+            c_pix_stride.max(1) as usize,
+            is_raw_only == JNI_TRUE,
+            fx,
+            fy,
+            cx,
+            cy,
+            img_w as usize,
+            img_h as usize,
+            Vec3::new(px, py, pz),
+            Quat::from_xyzw(qx, qy, qz, qw),
+        )
+    } else {
+        0
+    };
+    updated as jint
 }
 
 #[no_mangle]

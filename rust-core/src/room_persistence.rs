@@ -1,13 +1,13 @@
 use crate::room_scanner::SurfaceKind;
 use crate::spatial_mesh::{
-    CanonicalPlane, SpatialMeshMap, CELL_SIZE, CHUNK_DIM, MAX_POLY_VERTS,
+    CanonicalPlane, SavedTsdfVoxel, SpatialMeshMap, CELL_SIZE, CHUNK_DIM, MAX_POLY_VERTS,
 };
 use crate::vision_ram::{RELOC_DESC_H, RELOC_DESC_LEN, RELOC_DESC_W};
 use glam::{Quat, Vec3};
 use std::fmt::Write as _;
 
 pub const ARROOM_MAGIC: [u8; 4] = *b"ARRM";
-pub const ARROOM_VERSION: u16 = 1;
+pub const ARROOM_VERSION: u16 = 2; // v2 stores narrow-band TSDF (idx, tsdf: i8, weight: u8); loader stays v1-compatible
 pub const MAX_KEYFRAMES: usize = 8;
 
 #[derive(Clone, Debug)]
@@ -84,7 +84,7 @@ impl KeyframeBank {
 pub struct LoadedRoomMap {
     pub floor_y: Option<f32>,
     pub planes: Vec<CanonicalPlane>,
-    pub solid_voxels_world: Vec<(Vec3, u8)>,
+    pub tsdf_voxels_world: Vec<SavedTsdfVoxel>,
     pub keyframes: Vec<RelocKeyframe>,
     pub consecutive_hits: u8,
     pub last_matched_kf: Option<usize>,
@@ -278,11 +278,11 @@ fn u8_to_kind(v: u8) -> SurfaceKind {
     }
 }
 
-/// Rule 5: Serializes canonical merged planes, sparse solid chunks, and visual relocalization
-/// keyframes into a compact `.arroom` v1 binary byte buffer.
+/// Rule 5: Serializes canonical merged planes, sparse TSDF surface chunks, and visual relocalization
+/// keyframes into a compact `.arroom` v2 binary byte buffer.
 pub fn serialize_room_arroom(map: &SpatialMeshMap, kf_bank: &KeyframeBank) -> Vec<u8> {
-    let solid_chunks = map.export_solid_chunks();
-    let mut buf = Vec::with_capacity(16 * 1024);
+    let tsdf_chunks = map.export_tsdf_chunks();
+    let mut buf = Vec::with_capacity(24 * 1024);
 
     // Header (28 bytes)
     buf.extend_from_slice(&ARROOM_MAGIC);
@@ -292,7 +292,7 @@ pub fn serialize_room_arroom(map: &SpatialMeshMap, kf_bank: &KeyframeBank) -> Ve
     let fy = map.inferred_floor_y().unwrap_or(f32::NAN);
     buf.extend_from_slice(&fy.to_le_bytes());
     buf.extend_from_slice(&(map.planes.len() as u32).to_le_bytes());
-    buf.extend_from_slice(&(solid_chunks.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&(tsdf_chunks.len() as u32).to_le_bytes());
     buf.extend_from_slice(&(kf_bank.frames.len() as u32).to_le_bytes());
 
     // Canonical merged planes
@@ -312,14 +312,15 @@ pub fn serialize_room_arroom(map: &SpatialMeshMap, kf_bank: &KeyframeBank) -> Ve
         }
     }
 
-    // Sparse solid voxel chunks (3 bytes per occupied surface voxel)
-    for (ckey, entries) in &solid_chunks {
+    // Sparse narrow-band TSDF chunks (4 bytes per surface-band voxel: idx:u16 + tsdf:i8 + weight:u8)
+    for (ckey, entries) in &tsdf_chunks {
         buf.extend_from_slice(&ckey.0.to_le_bytes());
         buf.extend_from_slice(&ckey.1.to_le_bytes());
         buf.extend_from_slice(&ckey.2.to_le_bytes());
         buf.extend_from_slice(&(entries.len() as u16).to_le_bytes());
-        for &(idx, weight) in entries {
+        for &(idx, tsdf, weight) in entries {
             buf.extend_from_slice(&idx.to_le_bytes());
+            buf.push(tsdf as u8);
             buf.push(weight);
         }
     }
@@ -387,7 +388,7 @@ impl<'a> BinReader<'a> {
     }
 }
 
-/// Deserializes a `.arroom` v1 binary buffer with strict bounds validation.
+/// Deserializes a `.arroom` v1 or v2 binary buffer with strict bounds validation.
 pub fn deserialize_room_arroom(data: &[u8]) -> Result<LoadedRoomMap, String> {
     let mut r = BinReader::new(data);
     let magic = r.read_bytes(4)?;
@@ -395,7 +396,7 @@ pub fn deserialize_room_arroom(data: &[u8]) -> Result<LoadedRoomMap, String> {
         return Err("Invalid .arroom magic header".to_string());
     }
     let version = r.read_u16()?;
-    if version != ARROOM_VERSION {
+    if version != 1 && version != ARROOM_VERSION {
         return Err(format!("Unsupported .arroom version: {}", version));
     }
     let _flags = r.read_u16()?;
@@ -409,7 +410,7 @@ pub fn deserialize_room_arroom(data: &[u8]) -> Result<LoadedRoomMap, String> {
     let chunk_count = r.read_u32()? as usize;
     let kf_count = r.read_u32()? as usize;
 
-    if plane_count > 64 || chunk_count > 256 || kf_count > 16 {
+    if plane_count > 64 || chunk_count > 384 || kf_count > 16 {
         return Err("Exceeded safety limits in .arroom file".to_string());
     }
 
@@ -462,7 +463,7 @@ pub fn deserialize_room_arroom(data: &[u8]) -> Result<LoadedRoomMap, String> {
         }
     }
 
-    let mut solid_voxels_world = Vec::new();
+    let mut tsdf_voxels_world = Vec::new();
     let d_i = CHUNK_DIM as i32;
     for _ in 0..chunk_count {
         let cx = r.read_i32()?;
@@ -477,7 +478,14 @@ pub fn deserialize_room_arroom(data: &[u8]) -> Result<LoadedRoomMap, String> {
         let base_z = cz * d_i;
         for _ in 0..entries {
             let idx = r.read_u16()? as usize;
-            let weight = r.read_u8()?;
+            let (tsdf, weight) = if version >= 2 {
+                let t = r.read_u8()? as i8;
+                let w = r.read_u8()?;
+                (t, w)
+            } else {
+                let w = r.read_u8()?;
+                (-36i8, w.max(36))
+            };
             let lx = idx % CHUNK_DIM;
             let lz = (idx / CHUNK_DIM) % CHUNK_DIM;
             let ly = idx / (CHUNK_DIM * CHUNK_DIM);
@@ -485,7 +493,11 @@ pub fn deserialize_room_arroom(data: &[u8]) -> Result<LoadedRoomMap, String> {
                 let wx = (base_x + lx as i32) as f32 * cell_size + cell_size * 0.5;
                 let wy = (base_y + ly as i32) as f32 * cell_size + cell_size * 0.5;
                 let wz = (base_z + lz as i32) as f32 * cell_size + cell_size * 0.5;
-                solid_voxels_world.push((Vec3::new(wx, wy, wz), weight));
+                tsdf_voxels_world.push(SavedTsdfVoxel {
+                    world_pos: Vec3::new(wx, wy, wz),
+                    tsdf,
+                    weight,
+                });
             }
         }
     }
@@ -512,7 +524,7 @@ pub fn deserialize_room_arroom(data: &[u8]) -> Result<LoadedRoomMap, String> {
     Ok(LoadedRoomMap {
         floor_y,
         planes,
-        solid_voxels_world,
+        tsdf_voxels_world,
         keyframes,
         consecutive_hits: 0,
         last_matched_kf: None,
@@ -614,7 +626,7 @@ mod tests {
 
         let loaded = deserialize_room_arroom(&bytes).expect("valid .arroom binary");
         assert_eq!(loaded.planes.len(), 2);
-        assert_eq!(loaded.solid_voxels_world.len(), 1);
+        assert!(loaded.tsdf_voxels_world.len() >= 2);
         assert_eq!(loaded.keyframes.len(), 2);
         assert!((loaded.floor_y.unwrap() - (-1.2)).abs() < 1e-4);
     }
@@ -675,7 +687,7 @@ mod tests {
         let mut map_s2 = SpatialMeshMap::default();
         map_s2.import_and_merge_transformed(
             &loaded.planes,
-            &loaded.solid_voxels_world,
+            &loaded.tsdf_voxels_world,
             q_align,
             t_align,
             curr_pos.y,

@@ -45,6 +45,9 @@ pub struct PerfMetrics {
     pub keyframe_count: u32,
     pub reloc_status: i32,
     pub reloc_best_pct: i32,
+    pub depth_source_mode: i32,
+    pub scan_turbo: i32,
+    pub last_diff_changed: u32,
 }
 
 /// Thread-safe input state updated by Android sensor/camera/UI threads.
@@ -85,6 +88,9 @@ pub struct SharedInputState {
 
     pub room_scan_mode: i32,
     pub mesh_occlusion_enabled: bool,
+    pub scan_turbo: bool,
+    pub depth_source_mode: i32,
+    pub last_diff_changed: u32,
     pub reticle: ReticleHit,
     pub spatial_cache: SpatialMemoryCache,
     pub spatial_mesh: SpatialMeshMap,
@@ -137,8 +143,11 @@ impl Default for SharedInputState {
             pull_closer: false,
             boost_until: None,
             palette_idx: 0,
-            room_scan_mode: 1,
+            room_scan_mode: 4,
             mesh_occlusion_enabled: true,
+            scan_turbo: true,
+            depth_source_mode: 0,
+            last_diff_changed: 0,
             reticle: ReticleHit::default(),
             spatial_cache: SpatialMemoryCache::default(),
             spatial_mesh: SpatialMeshMap::default(),
@@ -265,6 +274,8 @@ impl SharedInputState {
             self.perf.keyframe_count = 0;
             self.perf.reloc_status = 0;
             self.perf.reloc_best_pct = 0;
+            self.last_diff_changed = 0;
+            self.perf.last_diff_changed = 0;
             self.perf.reticle_hit_kind = 0;
             self.perf.reticle_surface_kind = 0;
             self.perf.reticle_dist = 0.0;
@@ -325,7 +336,7 @@ impl SharedInputState {
         );
         self.spatial_mesh.import_and_merge_transformed(
             &loaded.planes,
-            &loaded.solid_voxels_world,
+            &loaded.tsdf_voxels_world,
             q_align,
             t_align,
             curr_pos.y,
@@ -335,6 +346,9 @@ impl SharedInputState {
         if let Some(fy) = self.spatial_mesh.inferred_floor_y() {
             self.anchored_floor_y = Some(fy);
         }
+        // Automatically switch loaded room into Compare & Maintain mode (user can re-enable Turbo anytime!)
+        self.scan_turbo = false;
+        self.last_diff_changed = 0;
         self.reloc_status = if is_auto { 2 } else { 3 };
         self.reloc_best_pct = pct;
         self.perf.cached_planes = self.spatial_mesh.canonical_plane_count() as u32;
@@ -343,6 +357,9 @@ impl SharedInputState {
         self.perf.keyframe_count = self.keyframe_bank.len() as u32;
         self.perf.reloc_status = self.reloc_status;
         self.perf.reloc_best_pct = self.reloc_best_pct;
+        self.perf.depth_source_mode = self.depth_source_mode;
+        self.perf.scan_turbo = if self.scan_turbo { 1 } else { 0 };
+        self.perf.last_diff_changed = self.last_diff_changed;
         true
     }
 
@@ -354,7 +371,7 @@ impl SharedInputState {
         let loaded = deserialize_room_arroom(bytes)?;
         let summary = (
             loaded.planes.len(),
-            loaded.solid_voxels_world.len(),
+            loaded.tsdf_voxels_world.len(),
             loaded.keyframes.len(),
         );
         self.pending_room = Some(loaded);
@@ -393,6 +410,81 @@ impl SharedInputState {
 
     pub fn set_mesh_occlusion(&mut self, enabled: bool) {
         self.mesh_occlusion_enabled = enabled;
+    }
+
+    pub fn set_scan_turbo(&mut self, enabled: bool) {
+        self.scan_turbo = enabled;
+        self.perf.scan_turbo = if enabled { 1 } else { 0 };
+        if !enabled {
+            self.last_diff_changed = 0;
+            self.perf.last_diff_changed = 0;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_depth_map(
+        &mut self,
+        depth_bytes: &[u8],
+        dw: usize,
+        dh: usize,
+        d_row_stride: usize,
+        d_pix_stride: usize,
+        conf_bytes: Option<&[u8]>,
+        cw: usize,
+        ch: usize,
+        c_row_stride: usize,
+        c_pix_stride: usize,
+        is_raw_only: bool,
+        fx: f32,
+        fy: f32,
+        cx: f32,
+        cy: f32,
+        img_w: usize,
+        img_h: usize,
+        cam_pos: Vec3,
+        cam_rot: Quat,
+    ) -> u32 {
+        if self.room_scan_mode <= 0 {
+            return 0;
+        }
+        // Dynamic resolution stride: full 1x pixel density in Turbo when FPS healthy, 2x in Maintain or heavy load
+        let stride = if self.scan_turbo {
+            if self.perf.frame_ms > 11.5 { 2 } else { 1 }
+        } else {
+            2
+        };
+        let stats = self.spatial_mesh.ingest_depth_map(
+            depth_bytes,
+            dw,
+            dh,
+            d_row_stride,
+            d_pix_stride,
+            conf_bytes,
+            cw,
+            ch,
+            c_row_stride,
+            c_pix_stride,
+            is_raw_only,
+            fx,
+            fy,
+            cx,
+            cy,
+            img_w,
+            img_h,
+            cam_pos,
+            cam_rot,
+            self.scan_turbo,
+            stride,
+        );
+        if stats.valid_rays > 0 {
+            self.depth_source_mode = if is_raw_only { 1 } else { 2 };
+            self.perf.depth_source_mode = self.depth_source_mode;
+        }
+        self.last_diff_changed = stats.updated_voxels;
+        self.perf.last_diff_changed = stats.updated_voxels;
+        self.perf.voxel_count = self.spatial_mesh.confirmed_voxel_count() as u32;
+        self.perf.mesh_chunks = self.spatial_mesh.active_chunk_count() as u32;
+        stats.updated_voxels
     }
 
     fn current_cam_pose(&self) -> (Vec3, Quat) {
@@ -758,8 +850,15 @@ impl SharedInputState {
             None
         };
 
-        // Rule 3 & 4: FPS-governed budgeted incremental Greedy Meshing (1..2 dirty chunks per tick)
-        let max_dirty = if self.perf.frame_ms > 10.5 { 1 } else { 2 };
+        // Rule 3 & 4: FPS-governed budgeted incremental TSDF Surface Nets Meshing
+        // Fast 18x18x18 halo mesher handles 6 chunks/tick in Turbo Scan, or 1..2 in Maintain mode (0 when unchanged!)
+        let max_dirty = if self.scan_turbo {
+            if self.perf.frame_ms > 10.5 { 3 } else { 6 }
+        } else if self.perf.frame_ms > 10.5 {
+            1
+        } else {
+            2
+        };
         if self.room_scan_mode > 0 {
             self.spatial_mesh.step_greedy_meshing(max_dirty);
         }
@@ -845,6 +944,9 @@ impl SharedInputState {
         self.perf.keyframe_count = self.keyframe_bank.len() as u32;
         self.perf.reloc_status = self.reloc_status;
         self.perf.reloc_best_pct = self.reloc_best_pct;
+        self.perf.depth_source_mode = self.depth_source_mode;
+        self.perf.scan_turbo = if self.scan_turbo { 1 } else { 0 };
+        self.perf.last_diff_changed = self.last_diff_changed;
 
         let boost_factor = match self.boost_until {
             Some(until) if until > now => {
@@ -1397,7 +1499,7 @@ mod tests {
         let mut state = SharedInputState::default();
         assert!(!state.stereo_mode);
         assert!(!state.show_demo_scene);
-        assert_eq!(state.room_scan_mode, 1);
+        assert_eq!(state.room_scan_mode, 4);
 
         // Camera starts at y = 0.0 -> world floor anchors at -1.35
         state.on_ar_frame(
