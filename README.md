@@ -10,6 +10,9 @@
    - **120Hz Async Gyro Timewarp:** Tách vòng lặp `ArSession.update()` (~32Hz) khỏi vòng lặp vẽ `120Hz`, sử dụng cảm biến `TYPE_GAME_ROTATION_VECTOR` để bù xoay đầu tức thời giữa các khung hình camera.
 2. **2 khối 3D nổi lơ lửng (Stereoscopic 3D):**
    - 1 khối **Lập phương** đa sắc (`1.25m`) và 1 khối **Bát diện / Tinh thể** nhấp nhô (`1.65m`) tách 2 mắt chuẩn `IPD = 64mm`, neo cố định trong không gian 6DoF qua ARCore (tự động chuyển sang `Camera2` + Gyroscope 120Hz 3DoF nếu điện thoại chưa cài Google Play Services for AR).
+3. **Nhận diện bàn tay 5 ngón & Cử chỉ thông minh (MediaPipe + Rust GLES):**
+   - Chạy ngầm MediaPipe `HandLandmarker` không làm nghẽn khung hình 120Hz, tự động vẽ **5 đường xương nối 21 khớp từ cổ tay ra 5 ngón tay + lòng bàn tay** khớp lên hình camera 2 mắt.
+   - Nhận diện các thao tác tay theo tọa độ 3D thực và hiện **Popup nổi 2 mắt** khi phát hiện: **✊ Nắm đấm**, **🤏 Chụm ngón cái**, **👉 Hình cây súng**, **✌ Chữ V** (xòe bàn tay để đặt lại).
 
 ---
 

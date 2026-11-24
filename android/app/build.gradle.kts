@@ -1,3 +1,5 @@
+import java.net.URI
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -43,8 +45,33 @@ android {
             useLegacyPackaging = false
         }
     }
+
+    androidResources {
+        noCompress += "task"
+    }
 }
 
 dependencies {
     implementation("com.google.ar:core:1.45.0")
+    implementation("com.google.mediapipe:tasks-vision:1.2.3")
+}
+
+val downloadHandLandmarkerModel by tasks.registering {
+    val modelFile = layout.projectDirectory.file("src/main/assets/hand_landmarker.task").asFile
+    outputs.file(modelFile)
+    doLast {
+        if (!modelFile.exists() || modelFile.length() < 1_000_000L) {
+            modelFile.parentFile.mkdirs()
+            val url = URI(
+                "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+            ).toURL()
+            url.openStream().use { input ->
+                modelFile.outputStream().use { output -> input.copyTo(output) }
+            }
+        }
+    }
+}
+
+tasks.named("preBuild") {
+    dependsOn(downloadHandLandmarkerModel)
 }

@@ -22,6 +22,7 @@
 | **1:1 Angular Scale** | Quad at virtual distance `2.5m` sized `half_w = 2.5 * tan_half_hfov * fov_scale`, `half_h = 2.5 * tan_half_vfov * fov_scale` over `#000000` AMOLED surround. |
 | **120Hz Async Timewarp** | `ArSession.update()` throttled to ~32Hz (`31ms`); `onDrawFrame()` runs at 120Hz using `ar_rot * (gyro_at_capture.inv() * gyro_latest)`. |
 | **6DoF Stereo 3D** | Split viewport (`0..W/2` Left, `W/2..W` Right), `IPD = 64mm` (`±0.032m` along head `+X`), `85°` vertical eye FOV, two procedural lit meshes (Cube at `-1.25m`, Octahedron at `-1.65m`). |
+| **Hand Tracking & Gestures** | Async MediaPipe `HandLandmarker` (`tasks-vision:1.2.3`) on `320px` YUV worker; Rust draws 21-point 5-finger bone ribbons on passthrough plane + classifies `Fist`, `Pinch`, `FingerGun`, `Peace` with 3-frame debounce -> dual-eye stereo popup. |
 | **Automatic Fallback** | Uses ARCore 6DoF when available; seamlessly falls back to `Camera2` + 120Hz 3DoF Gyroscope if Google Play Services for AR is absent. |
 
 ## 4. Coordinate Frames & JNI Contract
@@ -38,4 +39,5 @@
 | `nativeOnFallbackCameraFrame(tanHalfH, tanHalfV, uvs)` | `Float, Float, FloatArray(8)` | `Unit` |
 | `nativeSetCalibration(fovScale, ipdMeters)` | `Float, Float` | `Unit` |
 | `nativeRecenter()` | None | `Unit` |
+| `nativeOnHandLandmarks(handCount, packedData)` | `Int, FloatArray(210)` | `Int` (gesture `0..4`) |
 | `nativeDrawFrame()` | None | `Unit` |

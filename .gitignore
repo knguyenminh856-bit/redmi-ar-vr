@@ -8,6 +8,7 @@
 /android/app/build/
 /android/local.properties
 /android/app/src/main/jniLibs/
+/android/app/src/main/assets/hand_landmarker.task
 
 # Keep Gradle Wrapper JAR tracked in Git
 !android/gradle/wrapper/gradle-wrapper.jar

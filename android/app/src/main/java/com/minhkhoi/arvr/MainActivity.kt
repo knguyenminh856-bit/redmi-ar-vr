@@ -6,7 +6,10 @@ import android.app.Activity
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.graphics.ImageFormat
 import android.graphics.SurfaceTexture
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
@@ -16,6 +19,7 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
+import android.media.ImageReader
 import android.opengl.GLSurfaceView
 import android.os.Build
 import android.os.Bundle
@@ -85,11 +89,16 @@ class MainActivity : Activity(), SensorEventListener {
     private var captureSession: CameraCaptureSession? = null
     private var fallbackSurfaceTexture: SurfaceTexture? = null
     private var fallbackPreviewSurface: Surface? = null
+    private var fallbackImageReader: ImageReader? = null
     private val fallbackFrameAvailable = AtomicBoolean(false)
     private var fallbackCameraActive = false
     private var fallbackTanHalfH = 0.67f
     private var fallbackTanHalfV = 0.50f
     private val fallbackTexMtx = FloatArray(16)
+
+    private lateinit var handTracker: HandTrackerHelper
+    private val imgBasis = floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f)
+    private val ndcBasis = FloatArray(6)
 
     // GL state synced with render thread
     @Volatile
@@ -116,15 +125,21 @@ class MainActivity : Activity(), SensorEventListener {
     private var lastArUpdateNs = 0L
     private var lastArTimestampNs = 0L
 
-    // Calibration UI state
+    // Calibration & stereo popup UI state
     private var fovPct = 78
     private var ipdMm = 64
     private lateinit var panelLayout: LinearLayout
     private var recenterRunnable: Runnable? = null
+    private lateinit var leftGesturePopup: TextView
+    private lateinit var rightGesturePopup: TextView
+    private var hidePopupRunnable: Runnable? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         NativeBridge.nativeInit()
+        handTracker = HandTrackerHelper(this, mainHandler) { gestureCode ->
+            showStereoGesturePopup(gestureCode)
+        }
 
         loadCalibration()
         configureHighRefreshDisplayAndKeepOn()
@@ -152,6 +167,7 @@ class MainActivity : Activity(), SensorEventListener {
             )
         )
 
+        addStereoGestureOverlay(root)
         addCalibrationOverlay(root)
         setContentView(root)
         applyImmersiveFullscreen()
@@ -221,6 +237,110 @@ class MainActivity : Activity(), SensorEventListener {
                     or View.SYSTEM_UI_FLAG_FULLSCREEN
                 )
         }
+    }
+
+    private fun addStereoGestureOverlay(root: FrameLayout) {
+        val stereoRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            weightSum = 2f
+            isClickable = false
+            isFocusable = false
+        }
+
+        leftGesturePopup = createPopupPill(nasalShiftPx = 8)
+        rightGesturePopup = createPopupPill(nasalShiftPx = -8)
+
+        val leftPane = FrameLayout(this).apply {
+            isClickable = false
+            isFocusable = false
+            addView(leftGesturePopup)
+        }
+        val rightPane = FrameLayout(this).apply {
+            isClickable = false
+            isFocusable = false
+            addView(rightGesturePopup)
+        }
+
+        val halfParams = LinearLayout.LayoutParams(
+            0,
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            1f
+        )
+        stereoRow.addView(leftPane, halfParams)
+        stereoRow.addView(rightPane, halfParams)
+
+        root.addView(
+            stereoRow,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+    }
+
+    private fun createPopupPill(nasalShiftPx: Int): TextView {
+        val pillBg = GradientDrawable().apply {
+            cornerRadius = 36f
+            setColor(Color.argb(224, 16, 24, 38))
+            setStroke(3, Color.parseColor("#00E5FF"))
+        }
+        return TextView(this).apply {
+            visibility = View.GONE
+            background = pillBg
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(28, 16, 28, 16)
+            gravity = Gravity.CENTER
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            ).apply {
+                topMargin = 110
+            }
+            translationX = nasalShiftPx.toFloat()
+        }
+    }
+
+    private fun showStereoGesturePopup(gestureCode: Int) {
+        val (label, accentHex) = when (gestureCode) {
+            1 -> "\u270A  Phát hiện: NẮM ĐẤM" to "#FF7043"
+            2 -> "\uD83E\uDD0F  Phát hiện: CHỤM NGÓN CÁI" to "#00E5FF"
+            3 -> "\uD83D\uDC49  Phát hiện: HÌNH CÂY SÚNG" to "#FFD54F"
+            4 -> "\u270C  Phát hiện: CHỮ V" to "#69F0AE"
+            else -> return
+        }
+        val accentColor = Color.parseColor(accentHex)
+        hidePopupRunnable?.let { mainHandler.removeCallbacks(it) }
+
+        for (pill in arrayOf(leftGesturePopup, rightGesturePopup)) {
+            pill.animate().cancel()
+            pill.text = label
+            (pill.background as? GradientDrawable)?.setStroke(3, accentColor)
+            pill.alpha = 0f
+            pill.scaleX = 0.88f
+            pill.scaleY = 0.88f
+            pill.visibility = View.VISIBLE
+            pill.animate()
+                .alpha(1f)
+                .scaleX(1f)
+                .scaleY(1f)
+                .setDuration(150L)
+                .start()
+        }
+
+        val hideTask = Runnable {
+            for (pill in arrayOf(leftGesturePopup, rightGesturePopup)) {
+                pill.animate()
+                    .alpha(0f)
+                    .setDuration(220L)
+                    .withEndAction { pill.visibility = View.GONE }
+                    .start()
+            }
+        }
+        hidePopupRunnable = hideTask
+        mainHandler.postDelayed(hideTask, 1900L)
     }
 
     private fun addCalibrationOverlay(root: FrameLayout) {
@@ -351,6 +471,7 @@ class MainActivity : Activity(), SensorEventListener {
 
     override fun onPause() {
         recenterRunnable?.let { mainHandler.removeCallbacks(it) }
+        hidePopupRunnable?.let { mainHandler.removeCallbacks(it) }
         sensorManager.unregisterListener(this)
         stopTrackingAndCamera()
         glView.onPause()
@@ -358,6 +479,7 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     override fun onDestroy() {
+        handTracker.close()
         synchronized(sessionLock) {
             arSession?.close()
             arSession = null
@@ -533,9 +655,47 @@ class MainActivity : Activity(), SensorEventListener {
             setOnFrameAvailableListener({ fallbackFrameAvailable.set(true) }, handler)
         }
         val surface = Surface(st)
+
+        val previewAspect = chosenSize.width.toFloat() / chosenSize.height.toFloat()
+        val yuvSizes = streamMap?.getOutputSizes(ImageFormat.YUV_420_888)
+        val yuvSize = yuvSizes
+            ?.filter {
+                it.width in 480..1280 &&
+                    it.height in 320..720 &&
+                    abs((it.width.toFloat() / it.height.toFloat()) - previewAspect) < 0.08f
+            }
+            ?.minByOrNull { abs(it.height - 480) }
+            ?: yuvSizes
+                ?.filter { it.width in 480..1280 && it.height in 320..720 }
+                ?.minByOrNull { abs(it.height - 480) }
+            ?: Size(640, 480)
+
+        val ir = ImageReader.newInstance(yuvSize.width, yuvSize.height, ImageFormat.YUV_420_888, 2).apply {
+            setOnImageAvailableListener({ reader ->
+                val img = try {
+                    reader.acquireLatestImage()
+                } catch (_: Throwable) {
+                    null
+                } ?: return@setOnImageAvailableListener
+                try {
+                    if (!handTracker.isBusy.get()) {
+                        val rot = displayRotation
+                        if (rot == Surface.ROTATION_270) {
+                            handTracker.submitYuvFrame(img, rot, 1f, -1f, -1f, -1f, 1f, 1f)
+                        } else {
+                            handTracker.submitYuvFrame(img, rot, -1f, 1f, 1f, 1f, -1f, -1f)
+                        }
+                    }
+                } finally {
+                    img.close()
+                }
+            }, handler)
+        }
+
         synchronized(sessionLock) {
             fallbackSurfaceTexture = st
             fallbackPreviewSurface = surface
+            fallbackImageReader = ir
         }
 
         try {
@@ -548,42 +708,7 @@ class MainActivity : Activity(), SensorEventListener {
                         }
                         cameraDevice = device
                     }
-                    try {
-                        val req = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-                            addTarget(surface)
-                            set(
-                                CaptureRequest.CONTROL_AF_MODE,
-                                CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
-                            )
-                        }
-                        @Suppress("DEPRECATION")
-                        device.createCaptureSession(
-                            listOf(surface),
-                            object : CameraCaptureSession.StateCallback() {
-                                override fun onConfigured(session: CameraCaptureSession) {
-                                    synchronized(sessionLock) {
-                                        if (!fallbackCameraActive) {
-                                            session.close()
-                                            return
-                                        }
-                                        captureSession = session
-                                    }
-                                    try {
-                                        session.setRepeatingRequest(req.build(), null, handler)
-                                    } catch (e: Exception) {
-                                        Log.e(TAG, "Camera2 preview failed: ${e.message}")
-                                    }
-                                }
-
-                                override fun onConfigureFailed(session: CameraCaptureSession) {
-                                    Log.e(TAG, "Camera2 session configure failed")
-                                }
-                            },
-                            handler
-                        )
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Camera2 createCaptureSession failed: ${e.message}")
-                    }
+                    startCamera2Session(device, surface, ir.surface, handler)
                 }
 
                 override fun onDisconnected(device: CameraDevice) {
@@ -599,6 +724,64 @@ class MainActivity : Activity(), SensorEventListener {
         }
     }
 
+    private fun startCamera2Session(
+        device: CameraDevice,
+        previewSurface: Surface,
+        analysisSurface: Surface?,
+        handler: Handler
+    ) {
+        try {
+            val targets = if (analysisSurface != null) {
+                listOf(previewSurface, analysisSurface)
+            } else {
+                listOf(previewSurface)
+            }
+            val req = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                for (t in targets) addTarget(t)
+                set(
+                    CaptureRequest.CONTROL_AF_MODE,
+                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
+                )
+            }
+            @Suppress("DEPRECATION")
+            device.createCaptureSession(
+                targets,
+                object : CameraCaptureSession.StateCallback() {
+                    override fun onConfigured(session: CameraCaptureSession) {
+                        synchronized(sessionLock) {
+                            if (!fallbackCameraActive) {
+                                session.close()
+                                return
+                            }
+                            captureSession = session
+                        }
+                        try {
+                            session.setRepeatingRequest(req.build(), null, handler)
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Camera2 preview failed: ${e.message}")
+                        }
+                    }
+
+                    override fun onConfigureFailed(session: CameraCaptureSession) {
+                        if (analysisSurface != null) {
+                            Log.w(TAG, "Camera2 dual-surface failed, retrying preview-only")
+                            startCamera2Session(device, previewSurface, null, handler)
+                        } else {
+                            Log.e(TAG, "Camera2 session configure failed")
+                        }
+                    }
+                },
+                handler
+            )
+        } catch (e: Exception) {
+            if (analysisSurface != null) {
+                startCamera2Session(device, previewSurface, null, handler)
+            } else {
+                Log.e(TAG, "Camera2 createCaptureSession failed: ${e.message}")
+            }
+        }
+    }
+
     private fun closeFallbackCameraLocked() {
         fallbackCameraActive = false
         try {
@@ -610,6 +793,11 @@ class MainActivity : Activity(), SensorEventListener {
             cameraDevice?.close()
         } catch (_: Throwable) {}
         cameraDevice = null
+
+        try {
+            fallbackImageReader?.close()
+        } catch (_: Throwable) {}
+        fallbackImageReader = null
 
         try {
             fallbackPreviewSurface?.release()
@@ -699,6 +887,30 @@ class MainActivity : Activity(), SensorEventListener {
                                     uvArray,
                                     valid
                                 )
+
+                                if (!handTracker.isBusy.get()) {
+                                    try {
+                                        frame.transformCoordinates2d(
+                                            Coordinates2d.IMAGE_NORMALIZED,
+                                            imgBasis,
+                                            Coordinates2d.OPENGL_NORMALIZED_DEVICE_COORDINATES,
+                                            ndcBasis
+                                        )
+                                        val cpuImg = frame.acquireCameraImage()
+                                        try {
+                                            handTracker.submitYuvFrame(
+                                                cpuImg,
+                                                displayRotation,
+                                                ndcBasis[0], ndcBasis[1],
+                                                ndcBasis[2], ndcBasis[3],
+                                                ndcBasis[4], ndcBasis[5]
+                                            )
+                                        } finally {
+                                            cpuImg.close()
+                                        }
+                                    } catch (_: Throwable) {
+                                    }
+                                }
                             }
                         } catch (t: Throwable) {
                             Log.w(TAG, "ARCore update exception, switching to Camera2 fallback: ${t.message}")

@@ -1,9 +1,15 @@
 use crate::gyro_predict::{predict_ar_rotation, sensor_to_head_quat};
-use crate::passthrough::PassthroughRenderer;
+use crate::hand_tracking::{
+    GestureTracker, HandData, HandGesture, HandOverlayRenderer, FLOATS_PER_LANDMARK,
+    LANDMARKS_PER_HAND, MAX_HANDS,
+};
+use crate::passthrough::{compute_quad_half_extents, PassthroughRenderer, PASSTHROUGH_DIST};
 use crate::scene_3d::Scene3D;
 use glam::{Mat4, Quat, Vec3};
 use glow::HasContext;
 use std::time::Instant;
+
+const HAND_TIMEOUT_MS: u128 = 350;
 
 /// Thread-safe input state updated by Android sensor/camera/UI threads.
 /// Contains zero OpenGL handles so `GlRenderer` stays exclusively on the GL thread.
@@ -25,6 +31,10 @@ pub struct SharedInputState {
     pub ipd_meters: f32,
     pub recenter_requested: bool,
     pub anchor_origin: Option<Mat4>,
+
+    pub hands: Vec<HandData>,
+    pub last_hand_instant: Option<Instant>,
+    pub gesture_tracker: GestureTracker,
 }
 
 impl Default for SharedInputState {
@@ -44,6 +54,9 @@ impl Default for SharedInputState {
             ipd_meters: 0.064,
             recenter_requested: false,
             anchor_origin: None,
+            hands: Vec::with_capacity(MAX_HANDS),
+            last_hand_instant: None,
+            gesture_tracker: GestureTracker::default(),
         }
     }
 }
@@ -109,6 +122,33 @@ impl SharedInputState {
         self.recenter_requested = true;
     }
 
+    pub fn on_hand_landmarks(&mut self, hand_count: usize, packed: &[f32]) -> i32 {
+        self.hands.clear();
+        let count = hand_count.min(MAX_HANDS);
+        let stride = LANDMARKS_PER_HAND * FLOATS_PER_LANDMARK;
+        for h in 0..count {
+            let start = h * stride;
+            let end = start + stride;
+            if end <= packed.len() {
+                if let Some(hand) = HandData::from_packed_slice(&packed[start..end]) {
+                    self.hands.push(hand);
+                }
+            }
+        }
+        self.last_hand_instant = Some(Instant::now());
+
+        let chosen_gesture = self
+            .hands
+            .iter()
+            .find(|h| h.gesture.is_popup_action())
+            .or_else(|| self.hands.first())
+            .map(|h| h.gesture)
+            .unwrap_or(HandGesture::None);
+
+        self.gesture_tracker
+            .update(chosen_gesture, !self.hands.is_empty())
+    }
+
     /// Snapshots all values needed for this 120Hz frame and resolves the 6DoF/3DoF anchor origin.
     pub fn snapshot_frame(&mut self) -> FrameSnapshot {
         let (cam_pos_capture, cam_rot_capture, head_rot_120hz) = if self.has_ar_pose {
@@ -134,6 +174,11 @@ impl SharedInputState {
             }
         }
 
+        let active_hands = match self.last_hand_instant {
+            Some(t) if t.elapsed().as_millis() <= HAND_TIMEOUT_MS => self.hands.clone(),
+            _ => Vec::new(),
+        };
+
         FrameSnapshot {
             cam_pos_capture,
             cam_rot_capture,
@@ -146,6 +191,7 @@ impl SharedInputState {
             uvs: self.cam_uvs,
             fov_scale: self.fov_scale,
             ipd_meters: self.ipd_meters,
+            hands: active_hands,
         }
     }
 }
@@ -162,6 +208,7 @@ pub struct FrameSnapshot {
     pub uvs: [f32; 8],
     pub fov_scale: f32,
     pub ipd_meters: f32,
+    pub hands: Vec<HandData>,
 }
 
 /// Computes a gravity-level anchor frame in front of the user's current horizontal gaze.
@@ -195,6 +242,7 @@ pub struct GlRenderer {
     gl: glow::Context,
     passthrough: PassthroughRenderer,
     scene: Scene3D,
+    hand_overlay: HandOverlayRenderer,
     width: i32,
     height: i32,
     start_time: Instant,
@@ -204,10 +252,12 @@ impl GlRenderer {
     pub fn new(gl: glow::Context) -> Result<Self, String> {
         let passthrough = PassthroughRenderer::new(&gl)?;
         let scene = Scene3D::new(&gl)?;
+        let hand_overlay = HandOverlayRenderer::new(&gl)?;
         Ok(Self {
             gl,
             passthrough,
             scene,
+            hand_overlay,
             width: 1200,
             height: 1080,
             start_time: Instant::now(),
@@ -223,7 +273,7 @@ impl GlRenderer {
         self.height = height.max(2);
     }
 
-    pub fn draw_frame(&self, snap: &FrameSnapshot) {
+    pub fn draw_frame(&mut self, snap: &FrameSnapshot) {
         let w = self.width;
         let h = self.height;
         let half_w = (w / 2).max(1);
@@ -237,6 +287,14 @@ impl GlRenderer {
             snap.fov_scale,
             snap.uvs,
         );
+        let (quad_hw, quad_hh) = compute_quad_half_extents(
+            snap.tan_half_h,
+            snap.tan_half_v,
+            PASSTHROUGH_DIST,
+            snap.fov_scale,
+        );
+        self.hand_overlay
+            .update_hands(&self.gl, &snap.hands, quad_hw, quad_hh);
 
         let proj_eye = Mat4::perspective_rh_gl(85.0_f32.to_radians(), eye_aspect, 0.05, 50.0);
         let (left_view, right_view) =
@@ -262,6 +320,7 @@ impl GlRenderer {
                 .draw(&self.gl, &left_pass_mvp, snap.has_camera_frame);
             self.scene
                 .draw(&self.gl, &left_vp, &cube_model, &octa_model);
+            self.hand_overlay.draw(&self.gl, &left_pass_mvp);
 
             // Right eye viewport
             self.gl.viewport(half_w, 0, right_w, h);
@@ -271,6 +330,7 @@ impl GlRenderer {
                 .draw(&self.gl, &right_pass_mvp, snap.has_camera_frame);
             self.scene
                 .draw(&self.gl, &right_vp, &cube_model, &octa_model);
+            self.hand_overlay.draw(&self.gl, &right_pass_mvp);
 
             // Subtle 2px VR headset center ridge alignment guide
             self.gl.enable(glow::SCISSOR_TEST);
@@ -284,6 +344,7 @@ impl GlRenderer {
     pub fn destroy(&self) {
         self.passthrough.destroy(&self.gl);
         self.scene.destroy(&self.gl);
+        self.hand_overlay.destroy(&self.gl);
     }
 }
 

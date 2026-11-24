@@ -35,5 +35,6 @@ object NativeBridge {
     )
     external fun nativeSetCalibration(fovScale: Float, ipdMeters: Float)
     external fun nativeRecenter()
+    external fun nativeOnHandLandmarks(handCount: Int, packedData: FloatArray): Int
     external fun nativeDrawFrame()
 }

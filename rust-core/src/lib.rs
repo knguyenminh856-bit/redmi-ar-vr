@@ -1,7 +1,10 @@
 pub mod gyro_predict;
+pub mod hand_tracking;
 pub mod passthrough;
 pub mod renderer;
 pub mod scene_3d;
+
+use hand_tracking::{FLOATS_PER_LANDMARK, LANDMARKS_PER_HAND, MAX_HANDS};
 
 use jni::objects::{JClass, JFloatArray};
 use jni::sys::{jboolean, jint, JNI_TRUE};
@@ -225,6 +228,31 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeRecenter(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeOnHandLandmarks(
+    env: JNIEnv,
+    _class: JClass,
+    hand_count: jint,
+    packed_arr: JFloatArray,
+) -> jint {
+    let clamped_count = (hand_count.max(0) as usize).min(MAX_HANDS);
+    let expected_len = clamped_count * LANDMARKS_PER_HAND * FLOATS_PER_LANDMARK;
+    let mut buf = [0.0f32; MAX_HANDS * LANDMARKS_PER_HAND * FLOATS_PER_LANDMARK];
+    if expected_len > 0
+        && env
+            .get_float_array_region(&packed_arr, 0, &mut buf[..expected_len])
+            .is_err()
+    {
+        return 0;
+    }
+
+    if let Ok(mut state) = input_state().lock() {
+        state.on_hand_landmarks(clamped_count, &buf[..expected_len])
+    } else {
+        0
+    }
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeDrawFrame(
     _env: JNIEnv,
     _class: JClass,
@@ -237,7 +265,7 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeDrawFrame(
     };
 
     GL_RENDERER.with(|cell| {
-        if let Some(renderer) = cell.borrow().as_ref() {
+        if let Some(renderer) = cell.borrow_mut().as_mut() {
             renderer.draw_frame(&snap);
         }
     });
