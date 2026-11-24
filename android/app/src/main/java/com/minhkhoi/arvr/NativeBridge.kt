@@ -59,6 +59,7 @@ object NativeBridge {
     external fun nativeSetStereoMode(enabled: Boolean)
     external fun nativeSetMeshOcclusion(enabled: Boolean)
     external fun nativeSetScanTurbo(enabled: Boolean)
+    external fun nativeClearSpatialMesh()
     external fun nativeIngestDepthMap(
         depthBuf: ByteBuffer,
         depthLen: Int,

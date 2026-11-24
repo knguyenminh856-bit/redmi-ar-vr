@@ -414,11 +414,36 @@ impl SharedInputState {
 
     pub fn set_scan_turbo(&mut self, enabled: bool) {
         self.scan_turbo = enabled;
+        self.spatial_mesh.clear_change_votes();
         self.perf.scan_turbo = if enabled { 1 } else { 0 };
         if !enabled {
             self.last_diff_changed = 0;
             self.perf.last_diff_changed = 0;
         }
+    }
+
+    pub fn clear_spatial_mesh(&mut self) {
+        self.spatial_mesh.clear();
+        self.spatial_cache.clear();
+        self.keyframe_bank.clear();
+        self.pending_room = None;
+        self.reloc_status = 0;
+        self.reloc_best_pct = 0;
+        self.cached_tri_mesh.clear();
+        self.cached_tri_src_gen = 0;
+        self.cached_tri_upload_gen = self.cached_tri_upload_gen.wrapping_add(1).max(1);
+        self.cached_tri_chunks = 0;
+        self.cached_tri_count = 0;
+        self.last_diff_changed = 0;
+        self.perf.active_planes = 0;
+        self.perf.cached_planes = 0;
+        self.perf.voxel_count = 0;
+        self.perf.mesh_chunks = 0;
+        self.perf.mesh_triangles = 0;
+        self.perf.keyframe_count = 0;
+        self.perf.reloc_status = 0;
+        self.perf.reloc_best_pct = 0;
+        self.perf.last_diff_changed = 0;
     }
 
     #[allow(clippy::too_many_arguments)]

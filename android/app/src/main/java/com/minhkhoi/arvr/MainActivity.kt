@@ -201,7 +201,23 @@ class MainActivity : Activity(), SensorEventListener {
     private var lastPlaneExtractNs = 0L
     private var lastPointCloudNs = 0L
     private var lastRawDepthNs = 0L
+    private var lastDepthTimestampNs = 0L
     private var lastRelocIngestNs = 0L
+    private var hasPrevArPose = false
+    private var prevArPosX = 0f
+    private var prevArPosY = 0f
+    private var prevArPosZ = 0f
+    private var prevArQx = 0f
+    private var prevArQy = 0f
+    private var prevArQz = 0f
+    private var prevArQw = 1f
+    private var prevArTsNs = 0L
+    @Volatile
+    private var camAngSpeedRadS = 0f
+    @Volatile
+    private var camLinSpeedMS = 0f
+    @Volatile
+    private var blurSkipActive = false
     @Volatile
     private var relocPending = false
     private var roomLabelRunnable: Runnable? = null
@@ -579,8 +595,8 @@ class MainActivity : Activity(), SensorEventListener {
             cycleRoomScanMode(showPopup = true)
         }
         scanTurboBtn = makeQuickButton(
-            if (scanTurbo) "\u26A1 Quét mạnh" else "\uD83D\uDEE1 Duy trì",
-            fillColor = if (scanTurbo) Color.argb(225, 217, 119, 6) else Color.argb(200, 14, 116, 144)
+            if (scanTurbo) "\u26A1 Quét mạnh" else "\uD83D\uDD12 Khóa",
+            fillColor = if (scanTurbo) Color.argb(225, 217, 119, 6) else Color.argb(210, 14, 116, 144)
         ) {
             toggleScanTurbo(showPopup = true)
         }
@@ -726,9 +742,9 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     private fun updateScanTurboButtonUi() {
-        scanTurboBtn.text = if (scanTurbo) "\u26A1 Quét mạnh" else "\uD83D\uDEE1 Duy trì"
+        scanTurboBtn.text = if (scanTurbo) "\u26A1 Quét mạnh" else "\uD83D\uDD12 Khóa"
         (scanTurboBtn.background as? GradientDrawable)?.setColor(
-            if (scanTurbo) Color.argb(225, 217, 119, 6) else Color.argb(200, 14, 116, 144)
+            if (scanTurbo) Color.argb(225, 217, 119, 6) else Color.argb(210, 14, 116, 144)
         )
     }
 
@@ -746,11 +762,11 @@ class MainActivity : Activity(), SensorEventListener {
         updateScanTurboButtonUi()
         if (showPopup) {
             val banner = if (scanTurbo) {
-                "\u26A1  QUÉT MẠNH BẬT (10Hz): Quét liên tục 3.5cm ôm sát mọi vật thể!"
+                "\u26A1  QUÉT MẠNH BẬT (9Hz): Lia chậm quanh đồ vật để bám lưới 3.5cm!"
             } else {
-                "\uD83D\uDEE1  DUY TRÌ (2.5Hz): Giữ lưới đã quét — chỉ cập nhật vùng bị thay đổi!"
+                "\uD83D\uDD12  ĐÃ KHÓA LƯỚI (2Hz): Không quét lung tung — chỉ sửa khi vật thật đổi >1.5s!"
             }
-            showStereoBanner(banner, if (scanTurbo) "#FFB300" else "#26C6DA", 1900L, strokeWidth = 4)
+            showStereoBanner(banner, if (scanTurbo) "#FFB300" else "#26C6DA", 2100L, strokeWidth = 4)
         }
     }
 
@@ -987,11 +1003,15 @@ class MainActivity : Activity(), SensorEventListener {
                 val triCount = metricsBuf[17].toInt()
                 val diffChanged = metricsBuf[23].toInt()
                 meshPrefix = if (scanTurbo) {
-                    "\u26A1 ${triCount}\u25B3 \u00B7 "
+                    if (blurSkipActive) {
+                        "\u26A1 Giữ chậm tay (${triCount}\u25B3) \u00B7 "
+                    } else {
+                        "\u26A1 Quét (${triCount}\u25B3) \u00B7 "
+                    }
                 } else if (diffChanged > 0) {
-                    "\uD83D\uDEE1 Đổi +${diffChanged} (${triCount}\u25B3) \u00B7 "
+                    "\uD83D\uDD12 Đổi +${diffChanged} (${triCount}\u25B3) \u00B7 "
                 } else {
-                    "\uD83D\uDEE1 Ổn định (${triCount}\u25B3) \u00B7 "
+                    "\uD83D\uDD12 Đã khóa (${triCount}\u25B3) \u00B7 "
                 }
             }
             if (relocPending) {
@@ -1251,11 +1271,11 @@ class MainActivity : Activity(), SensorEventListener {
             else -> "SLAM"
         }
         val scanTag = if (scanTurbo) {
-            "\u26A1Mạnh(10Hz)"
+            if (blurSkipActive) "\u26A1Mạnh(Chống mờ)" else "\u26A1Mạnh(9Hz)"
         } else if (diffChanged > 0) {
-            "\uD83D\uDEE1Duy trì(+${diffChanged})"
+            "\uD83D\uDD12Khóa(Đổi +${diffChanged})"
         } else {
-            "\uD83D\uDEE1Duy trì(0 đổi)"
+            "\uD83D\uDD12Khóa(0 đổi)"
         }
         val occTag = if (meshOcclusionEnabled) "Che:BẬT" else "Che:TẮT"
 
@@ -1446,6 +1466,15 @@ class MainActivity : Activity(), SensorEventListener {
                 }
             }
         }
+        val clearMeshBtn = makeQuickButton("\uD83E\uDDF9 Xóa lưới", fillColor = Color.argb(215, 165, 82, 24)) {
+            NativeBridge.nativeClearSpatialMesh()
+            lastDepthTimestampNs = 0L
+            scanTurbo = true
+            NativeBridge.nativeSetScanTurbo(true)
+            updateScanTurboButtonUi()
+            roomPanelLayout.visibility = View.GONE
+            showStereoBanner("\uD83E\uDDF9  Đã xóa lưới 3D cũ — bật [⚡ Quét mạnh] để quét lại!", "#FFB300", 1900L)
+        }
         val closeBtn = makeQuickButton("\u2716 Đóng", fillColor = Color.argb(200, 80, 35, 40)) {
             roomPanelLayout.visibility = View.GONE
         }
@@ -1455,6 +1484,7 @@ class MainActivity : Activity(), SensorEventListener {
         ).apply { marginEnd = dp(6f) }
         actionRow.addView(saveNewBtn, aLp)
         actionRow.addView(exportObjBtn, aLp)
+        actionRow.addView(clearMeshBtn, aLp)
         actionRow.addView(closeBtn)
 
         roomListContainer = LinearLayout(this).apply {
@@ -2225,6 +2255,36 @@ class MainActivity : Activity(), SensorEventListener {
                                 val cam = frame.camera
                                 val valid = cam.trackingState == TrackingState.TRACKING
                                 val pose = cam.displayOrientedPose
+                                val sensorPoseNow = cam.pose
+                                if (valid && hasPrevArPose && ts > prevArTsNs) {
+                                    val dtSec = ((ts - prevArTsNs) * 1e-9).toFloat().coerceIn(0.01f, 0.25f)
+                                    val dx = sensorPoseNow.tx() - prevArPosX
+                                    val dy = sensorPoseNow.ty() - prevArPosY
+                                    val dz = sensorPoseNow.tz() - prevArPosZ
+                                    camLinSpeedMS = kotlin.math.sqrt(dx * dx + dy * dy + dz * dz) / dtSec
+                                    val qDot = abs(
+                                        sensorPoseNow.qx() * prevArQx +
+                                            sensorPoseNow.qy() * prevArQy +
+                                            sensorPoseNow.qz() * prevArQz +
+                                            sensorPoseNow.qw() * prevArQw
+                                    ).coerceIn(0f, 1f)
+                                    camAngSpeedRadS = (2f * kotlin.math.acos(qDot)) / dtSec
+                                }
+                                if (valid) {
+                                    prevArPosX = sensorPoseNow.tx()
+                                    prevArPosY = sensorPoseNow.ty()
+                                    prevArPosZ = sensorPoseNow.tz()
+                                    prevArQx = sensorPoseNow.qx()
+                                    prevArQy = sensorPoseNow.qy()
+                                    prevArQz = sensorPoseNow.qz()
+                                    prevArQw = sensorPoseNow.qw()
+                                    prevArTsNs = ts
+                                    hasPrevArPose = true
+                                } else {
+                                    hasPrevArPose = false
+                                    camAngSpeedRadS = 99f
+                                    camLinSpeedMS = 99f
+                                }
 
                                 cam.getProjectionMatrix(arProjMat, 0, 0.02f, 50f)
                                 val tanH = if (abs(arProjMat[0]) > 0.01f) 1f / abs(arProjMat[0]) else 0.67f
@@ -2407,9 +2467,9 @@ class MainActivity : Activity(), SensorEventListener {
                                     }
                                 }
 
-                                // Fallback SLAM 3D PointCloud (only active before dense Depth warms up or on non-Depth devices)
+                                // Fallback SLAM 3D PointCloud (only active in Turbo scan on non-Depth devices / before Depth warms up)
                                 val pcIntervalNs = if (depthSupportLevel > 0) 500_000_000L else 200_000_000L
-                                if (roomScanMode > 0 && valid && (depthSupportLevel == 0 || scanTurbo) && nowNs - lastPointCloudNs >= pcIntervalNs) {
+                                if (roomScanMode > 0 && valid && scanTurbo && nowNs - lastPointCloudNs >= pcIntervalNs) {
                                     lastPointCloudNs = nowNs
                                     try {
                                         val pc = frame.acquirePointCloud()
@@ -2429,82 +2489,91 @@ class MainActivity : Activity(), SensorEventListener {
                                 }
 
                                 // Primary Conformal 3.5cm TSDF Depth Pipeline (Zero-Copy Direct ByteBuffer -> Rust):
-                                // - Turbo Scan ON:  ~10Hz (105ms), full dense depth continuous fusion hugging every object
-                                // - Maintain Mode:  2.5Hz (400ms), read-only diff comparison updating ONLY changed regions!
-                                val depthIntervalNs = if (scanTurbo) 105_000_000L else 400_000_000L
+                                // - Turbo Scan ON:  ~9Hz (110ms), continuous high-confidence fusion + anti-blur gate
+                                // - Locked Mode:    2.0Hz (500ms), TRUE LOCK — ignores wobble & unscanned space, 3-tick confirm!
+                                val depthIntervalNs = if (scanTurbo) 110_000_000L else 500_000_000L
                                 if (roomScanMode > 0 && valid && depthSupportLevel > 0 && nowNs - lastRawDepthNs >= depthIntervalNs) {
-                                    lastRawDepthNs = nowNs
-                                    try {
-                                        val isRawOnly = depthSupportLevel == 1
-                                        val depthImg = if (isRawOnly) {
-                                            frame.acquireRawDepthImage16Bits()
-                                        } else {
-                                            frame.acquireDepthImage16Bits()
-                                        }
-                                        var confImg: Image? = null
+                                    val maxAngVel = if (scanTurbo) 1.15f else 0.85f
+                                    val maxLinVel = if (scanTurbo) 1.10f else 0.80f
+                                    if (camAngSpeedRadS > maxAngVel || camLinSpeedMS > maxLinVel) {
+                                        // Motion-blur / fast-pan protection: skip blurred frame so mid-air ghosts NEVER spawn!
+                                        blurSkipActive = true
+                                    } else {
+                                        blurSkipActive = false
+                                        lastRawDepthNs = nowNs
                                         try {
-                                            confImg = try {
-                                                frame.acquireRawDepthConfidenceImage()
-                                            } catch (_: Throwable) {
-                                                null
-                                            }
-                                            if (isRawOnly && confImg == null) {
-                                                // RAW_DEPTH_ONLY requires confidence image to reject invalid pixels
+                                            val isRawOnly = depthSupportLevel == 1
+                                            val depthImg = if (isRawOnly) {
+                                                frame.acquireRawDepthImage16Bits()
                                             } else {
-                                                val intrinsics = cam.imageIntrinsics
-                                                intrinsics.getFocalLength(depthFocalBuf, 0)
-                                                intrinsics.getPrincipalPoint(depthPpBuf, 0)
-                                                intrinsics.getImageDimensions(depthDimsBuf, 0)
-                                                val sensorPose = cam.pose
-
-                                                val dPlane = depthImg.planes[0]
-                                                val dBuf = dPlane.buffer
-                                                dBuf.position(0)
-                                                val dLen = dBuf.remaining()
-
-                                                val hasConf = confImg != null
-                                                val cPlane = confImg?.planes?.get(0)
-                                                val cBuf = cPlane?.buffer ?: dBuf
-                                                if (hasConf) cBuf.position(0)
-                                                val cLen = if (hasConf) cBuf.remaining() else 0
-
-                                                NativeBridge.nativeIngestDepthMap(
-                                                    dBuf,
-                                                    dLen,
-                                                    depthImg.width,
-                                                    depthImg.height,
-                                                    dPlane.rowStride,
-                                                    dPlane.pixelStride,
-                                                    hasConf,
-                                                    cBuf,
-                                                    cLen,
-                                                    confImg?.width ?: 0,
-                                                    confImg?.height ?: 0,
-                                                    cPlane?.rowStride ?: 1,
-                                                    cPlane?.pixelStride ?: 1,
-                                                    isRawOnly,
-                                                    depthFocalBuf[0],
-                                                    depthFocalBuf[1],
-                                                    depthPpBuf[0],
-                                                    depthPpBuf[1],
-                                                    depthDimsBuf[0],
-                                                    depthDimsBuf[1],
-                                                    sensorPose.tx(),
-                                                    sensorPose.ty(),
-                                                    sensorPose.tz(),
-                                                    sensorPose.qx(),
-                                                    sensorPose.qy(),
-                                                    sensorPose.qz(),
-                                                    sensorPose.qw()
-                                                )
+                                                frame.acquireDepthImage16Bits()
                                             }
-                                        } finally {
+                                            var confImg: Image? = null
                                             try {
-                                                confImg?.close()
-                                            } catch (_: Throwable) {}
-                                            depthImg.close()
+                                                val dTs = depthImg.timestamp
+                                                if (dTs != lastDepthTimestampNs) {
+                                                    lastDepthTimestampNs = dTs
+                                                    confImg = try {
+                                                        frame.acquireRawDepthConfidenceImage()
+                                                    } catch (_: Throwable) {
+                                                        null
+                                                    }
+                                                    if (!(isRawOnly && confImg == null)) {
+                                                        val intrinsics = cam.imageIntrinsics
+                                                        intrinsics.getFocalLength(depthFocalBuf, 0)
+                                                        intrinsics.getPrincipalPoint(depthPpBuf, 0)
+                                                        intrinsics.getImageDimensions(depthDimsBuf, 0)
+
+                                                        val dPlane = depthImg.planes[0]
+                                                        val dBuf = dPlane.buffer
+                                                        dBuf.position(0)
+                                                        val dLen = dBuf.remaining()
+
+                                                        val hasConf = confImg != null
+                                                        val cPlane = confImg?.planes?.get(0)
+                                                        val cBuf = cPlane?.buffer ?: dBuf
+                                                        if (hasConf) cBuf.position(0)
+                                                        val cLen = if (hasConf) cBuf.remaining() else 0
+
+                                                        NativeBridge.nativeIngestDepthMap(
+                                                            dBuf,
+                                                            dLen,
+                                                            depthImg.width,
+                                                            depthImg.height,
+                                                            dPlane.rowStride,
+                                                            dPlane.pixelStride,
+                                                            hasConf,
+                                                            cBuf,
+                                                            cLen,
+                                                            confImg?.width ?: 0,
+                                                            confImg?.height ?: 0,
+                                                            cPlane?.rowStride ?: 1,
+                                                            cPlane?.pixelStride ?: 1,
+                                                            isRawOnly,
+                                                            depthFocalBuf[0],
+                                                            depthFocalBuf[1],
+                                                            depthPpBuf[0],
+                                                            depthPpBuf[1],
+                                                            depthDimsBuf[0],
+                                                            depthDimsBuf[1],
+                                                            sensorPoseNow.tx(),
+                                                            sensorPoseNow.ty(),
+                                                            sensorPoseNow.tz(),
+                                                            sensorPoseNow.qx(),
+                                                            sensorPoseNow.qy(),
+                                                            sensorPoseNow.qz(),
+                                                            sensorPoseNow.qw()
+                                                        )
+                                                    }
+                                                }
+                                            } finally {
+                                                try {
+                                                    confImg?.close()
+                                                } catch (_: Throwable) {}
+                                                depthImg.close()
+                                            }
+                                        } catch (_: Throwable) {
                                         }
-                                    } catch (_: Throwable) {
                                     }
                                 }
 

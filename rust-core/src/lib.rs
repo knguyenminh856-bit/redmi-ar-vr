@@ -723,6 +723,16 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeSetScanTurbo(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeClearSpatialMesh(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    if let Ok(mut state) = input_state().lock() {
+        state.clear_spatial_mesh();
+    }
+}
+
+#[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeIngestDepthMap(
     env: JNIEnv,

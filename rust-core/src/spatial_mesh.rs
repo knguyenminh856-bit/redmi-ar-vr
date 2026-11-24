@@ -17,7 +17,8 @@ pub const MAX_POLY_VERTS: usize = 24;
 pub const MAX_MESH_VERTICES: usize = 90_000; // 30,000 crisp conformal triangles (~4.68 MB VBO, sorted nearest-first)
 pub const MAX_RENDER_RADIUS_M: f32 = 6.0;
 
-pub const MESH_MIN_WEIGHT: u8 = 24; // Static lock: requires 2+ consistent multi-view observations so moving items never freeze in
+pub const MESH_MIN_WEIGHT: u8 = 42; // Static lock: requires 3-5 independent depth frames so blur/air ghosts never lock
+pub const LOCK_CHANGE_CONFIRM: u8 = 3; // Locked/Maintain mode requires 3 consecutive ticks (~1.5s) of real change before mutating TSDF
 
 const TRI_MESH_VERT: &str = r#"#version 300 es
 precision highp float;
@@ -151,9 +152,10 @@ pub struct SavedTsdfVoxel {
 }
 
 struct VoxelChunk {
-    tsdf: Box<[i8; CHUNK_VOLUME]>,   // Quantized [-127..127] => [-1.0..+1.0] (+ = air, 0 = surface, - = inside)
-    weight: Box<[u8; CHUNK_VOLUME]>, // Multi-view fusion confidence weight (0 = unobserved, >= MESH_MIN_WEIGHT = locked)
-    surface_count: u16,              // Approximate count of locked near-surface voxels (tsdf <= 20, weight >= MESH_MIN_WEIGHT)
+    tsdf: Box<[i8; CHUNK_VOLUME]>,        // Quantized [-127..127] => [-1.0..+1.0] (+ = air, 0 = surface, - = inside)
+    weight: Box<[u8; CHUNK_VOLUME]>,      // Multi-view fusion confidence weight (0 = unobserved, >= MESH_MIN_WEIGHT = locked)
+    change_hits: Box<[u8; CHUNK_VOLUME]>, // Consecutive diff votes in Locked/Maintain mode (must reach LOCK_CHANGE_CONFIRM)
+    surface_count: u16,                   // Approximate count of locked near-surface voxels
     dirty: bool,
     last_touched_gen: u64,
     tris: Vec<TriMeshVertex>,
@@ -165,6 +167,7 @@ impl VoxelChunk {
         Self {
             tsdf: Box::new([127i8; CHUNK_VOLUME]),
             weight: Box::new([0u8; CHUNK_VOLUME]),
+            change_hits: Box::new([0u8; CHUNK_VOLUME]),
             surface_count: 0,
             dirty: false,
             last_touched_gen: gen,
@@ -183,6 +186,32 @@ impl VoxelChunk {
         weight >= MESH_MIN_WEIGHT && (-100..=28).contains(&tsdf)
     }
 
+    /// Bit-packed consecutive-frame vote tracker in 1 byte (`[5-bit tick_tag | 3-bit vote_count]`):
+    /// - Deduplicates multiple rays hitting the same voxel within the SAME frame (`tick_tag == cur_tag`).
+    /// - Increments only across distinct consecutive frames (`diff == 1 || diff == 2`), resetting on long gaps!
+    #[inline]
+    fn vote_change(&mut self, idx: usize, gen: u64) -> u8 {
+        let cur_tag = (gen & 0x1F) as u8;
+        let entry = self.change_hits[idx];
+        let prev_cnt = entry & 0x07;
+        if prev_cnt == 0 {
+            self.change_hits[idx] = (cur_tag << 3) | 1;
+            return 1;
+        }
+        let prev_tag = entry >> 3;
+        if prev_tag == cur_tag {
+            return prev_cnt; // Already voted this frame -> never double-count adjacent rays!
+        }
+        let delta = cur_tag.wrapping_sub(prev_tag) & 0x1F;
+        let next_cnt = if delta <= 2 {
+            prev_cnt.saturating_add(1).min(7)
+        } else {
+            1
+        };
+        self.change_hits[idx] = (cur_tag << 3) | next_cnt;
+        next_cnt
+    }
+
     #[inline]
     fn fuse_voxel(&mut self, idx: usize, sdf_norm: f32, add_w: f32, gen: u64) -> bool {
         let old_t = self.tsdf[idx];
@@ -190,7 +219,7 @@ impl VoxelChunk {
         let was_surf = Self::is_near_surface(old_t, old_w);
 
         let old_wf = old_w as f32;
-        let new_wf = (old_wf + add_w).min(80.0);
+        let new_wf = (old_wf + add_w).min(100.0);
         let old_tf = old_t as f32 / 127.0;
         let fused = if old_w == 0 {
             sdf_norm
@@ -199,10 +228,11 @@ impl VoxelChunk {
         };
 
         let new_t = (fused * 127.0).round().clamp(-127.0, 127.0) as i8;
-        let new_w = new_wf.round().clamp(1.0, 80.0) as u8;
+        let new_w = new_wf.round().clamp(1.0, 100.0) as u8;
 
         self.tsdf[idx] = new_t;
         self.weight[idx] = new_w;
+        self.change_hits[idx] = 0;
         self.last_touched_gen = gen;
 
         let now_surf = Self::is_near_surface(new_t, new_w);
@@ -228,6 +258,7 @@ pub struct SpatialMeshMap {
     pub planes: Vec<CanonicalPlane>,
     chunks: HashMap<(i32, i32, i32), VoxelChunk>,
     pub has_dense_depth: bool,
+    pub has_seen_conf: bool,
     pub tick_gen: u64,
     pub mesh_gen: u64,
 }
@@ -238,6 +269,7 @@ impl Default for SpatialMeshMap {
             planes: Vec::with_capacity(MAX_CANONICAL_PLANES),
             chunks: HashMap::with_capacity(96),
             has_dense_depth: false,
+            has_seen_conf: false,
             tick_gen: 0,
             mesh_gen: 1,
         }
@@ -427,7 +459,14 @@ impl SpatialMeshMap {
         self.planes.clear();
         self.chunks.clear();
         self.has_dense_depth = false;
+        self.has_seen_conf = false;
         self.mesh_gen = self.mesh_gen.wrapping_add(1);
+    }
+
+    pub fn clear_change_votes(&mut self) {
+        for chunk in self.chunks.values_mut() {
+            chunk.change_hits.fill(0);
+        }
     }
 
     pub fn active_chunk_count(&self) -> usize {
@@ -771,18 +810,6 @@ impl SpatialMeshMap {
         )
     }
 
-    #[inline]
-    fn sample_tsdf_global(&self, gx: i32, gy: i32, gz: i32) -> (i8, u8) {
-        let (ckey, lx, ly, lz) = Self::split_cell(gx, gy, gz);
-        match self.chunks.get(&ckey) {
-            Some(c) => {
-                let idx = VoxelChunk::idx(lx, ly, lz);
-                (c.tsdf[idx], c.weight[idx])
-            }
-            None => (127, 0),
-        }
-    }
-
     fn get_or_alloc_chunk(&mut self, ckey: (i32, i32, i32), gen: u64) -> Option<&mut VoxelChunk> {
         if !self.chunks.contains_key(&ckey) {
             if self.chunks.len() >= MAX_ACTIVE_CHUNKS {
@@ -890,9 +917,71 @@ impl SpatialMeshMap {
         updated
     }
 
-    /// Free-space ray carving strictly IN FRONT of the observed surface (`t <= d_obs - 1.25 * TSDF_TRUNC`).
-    /// Uses chunk-key caching (zero HashMap lookups inside unallocated empty-air chunks) and `< CELL_SIZE` step
-    /// so moved/removed objects erode uniformly to 0 triangles with ZERO Swiss-cheese artifacts!
+    /// Checks if the observed depth `d_obs` already matches an existing locked surface within `±11cm`.
+    /// Resets `change_hits` on the matched surface so sporadic single-frame noise can never accumulate.
+    fn match_locked_surface_along_ray(&mut self, cam_pos: Vec3, dir: Vec3, d_obs: f32) -> bool {
+        let t_min = (d_obs - 0.11).max(0.20);
+        let t_max = d_obs + 0.11;
+        let step = CELL_SIZE * 0.90;
+        let mut t = t_min;
+        let mut prev_cell = (i32::MAX, i32::MAX, i32::MAX);
+        let mut miss_ckey = (i32::MAX, i32::MAX, i32::MAX);
+
+        while t <= t_max {
+            let cell = Self::world_to_cell(cam_pos + dir * t);
+            if cell != prev_cell {
+                prev_cell = cell;
+                let (ckey, lx, ly, lz) = Self::split_cell(cell.0, cell.1, cell.2);
+                if ckey != miss_ckey {
+                    if let Some(chunk) = self.chunks.get_mut(&ckey) {
+                        let idx = VoxelChunk::idx(lx, ly, lz);
+                        if chunk.weight[idx] >= MESH_MIN_WEIGHT
+                            && (-105..=40).contains(&chunk.tsdf[idx])
+                        {
+                            chunk.change_hits[idx] = 0;
+                            return true;
+                        }
+                    } else {
+                        miss_ckey = ckey;
+                    }
+                }
+            }
+            t += step;
+        }
+        false
+    }
+
+    /// Checks if a genuine locked surface exists BEHIND `d_obs` (`d_obs + 0.14m .. d_obs + 1.8m`),
+    /// proving a newly detected surface in Locked/Maintain mode is inside our mapped room rather than unscanned space.
+    fn has_locked_surface_behind(&self, cam_pos: Vec3, dir: Vec3, d_obs: f32) -> bool {
+        let t_start = d_obs + 0.14;
+        let t_end = (d_obs + 1.80).min(3.15);
+        let step = CELL_SIZE * 1.35;
+        let mut t = t_start;
+        let mut miss_ckey = (i32::MAX, i32::MAX, i32::MAX);
+
+        while t <= t_end {
+            let cell = Self::world_to_cell(cam_pos + dir * t);
+            let (ckey, lx, ly, lz) = Self::split_cell(cell.0, cell.1, cell.2);
+            if ckey != miss_ckey {
+                if let Some(chunk) = self.chunks.get(&ckey) {
+                    let idx = VoxelChunk::idx(lx, ly, lz);
+                    if chunk.weight[idx] >= MESH_MIN_WEIGHT && chunk.tsdf[idx] <= 24 {
+                        return true;
+                    }
+                } else {
+                    miss_ckey = ckey;
+                }
+            }
+            t += step;
+        }
+        false
+    }
+
+    /// Free-space ray carving strictly IN FRONT of the observed surface.
+    /// - Turbo (`diff_only = false`): carves immediately (`< CELL_SIZE` step, chunk-miss cached).
+    /// - Locked/Maintain (`diff_only = true`): increments `change_hits` and ONLY carves once a voxel
+    ///   has been persistently seen-through for `LOCK_CHANGE_CONFIRM` (3+) consecutive ticks (~1.5s)!
     #[allow(clippy::too_many_arguments)]
     fn carve_free_space_ray(
         &mut self,
@@ -904,7 +993,8 @@ impl SpatialMeshMap {
         gen: u64,
         border_flips: &mut Vec<((i32, i32, i32), usize, usize, usize)>,
     ) -> u32 {
-        let max_t = (d_obs - TSDF_TRUNC * 1.25).min(2.6);
+        let margin = if diff_only { 0.15 } else { TSDF_TRUNC * 1.30 };
+        let max_t = (d_obs - margin).min(2.6);
         if max_t <= 0.24 {
             return 0;
         }
@@ -926,17 +1016,32 @@ impl SpatialMeshMap {
                         let idx = VoxelChunk::idx(lx, ly, lz);
                         let old_w = chunk.weight[idx];
                         let old_t = chunk.tsdf[idx];
-                        let should_carve = if diff_only {
-                            // Maintain mode: only carve voxels that clearly used to be a solid/surface object
-                            old_w >= MESH_MIN_WEIGHT && old_t <= 24
-                        } else {
-                            old_w > 0 && old_t < 96
-                        };
-                        if should_carve {
-                            if chunk.weight[idx] > 32 {
-                                chunk.weight[idx] = 32;
+                        if diff_only {
+                            if old_w >= MESH_MIN_WEIGHT && old_t <= 16 {
+                                let votes = chunk.vote_change(idx, gen);
+                                if votes >= LOCK_CHANGE_CONFIRM {
+                                    if chunk.weight[idx] > 32 {
+                                        chunk.weight[idx] = 32;
+                                    }
+                                    if chunk.fuse_voxel(idx, 1.0, carve_w.max(32.0), gen) {
+                                        carved += 1;
+                                        if lx == 0
+                                            || ly == 0
+                                            || lz == 0
+                                            || lx == CHUNK_DIM - 1
+                                            || ly == CHUNK_DIM - 1
+                                            || lz == CHUNK_DIM - 1
+                                        {
+                                            border_flips.push((ckey, lx, ly, lz));
+                                        }
+                                    }
+                                }
                             }
-                            if chunk.fuse_voxel(idx, 1.0, carve_w.max(26.0), gen) {
+                        } else if old_w > 0 && old_t < 96 {
+                            if chunk.weight[idx] > 34 {
+                                chunk.weight[idx] = 34;
+                            }
+                            if chunk.fuse_voxel(idx, 1.0, carve_w.max(28.0), gen) {
                                 carved += 1;
                                 if lx == 0
                                     || ly == 0
@@ -963,9 +1068,12 @@ impl SpatialMeshMap {
     /// Primary Conformal 3D Object Scanner: ingests ARCore 16-bit Dense Depth (`AUTOMATIC` or `RAW_DEPTH_ONLY`)
     /// directly using official `cam.imageIntrinsics` + `cam.pose` sensor-space unprojection.
     ///
-    /// - **`turbo == true` (`⚡ Quét mạnh`)**: dense continuous TSDF fusion across all valid non-edge pixels.
-    /// - **`turbo == false` (`🛡 Duy trì`)**: read-only diff comparison first; unchanged surfaces stay 100%
-    ///   frozen (0 CPU meshing, 0 GPU uploads), updating ONLY voxels where real-world geometry changed!
+    /// - **Anti-Ghost Defenses:** rejects low-confidence inpainted air (`conf < 65` Turbo / `conf < 120` Locked),
+    ///   rejects `±1px` & `±2px` silhouette depth jumps & hole borders, restricts accurate range to `0.30m..2.85m`,
+    ///   and requires `MESH_MIN_WEIGHT >= 42` (3-5 independent depth frames).
+    /// - **`turbo == true` (`⚡ Quét mạnh`)**: continuous high-density 3.5cm TSDF fusion.
+    /// - **`turbo == false` (`🔒 Khóa / Duy trì`)**: TRUE LOCK — never scans unscanned space, ignores `±11cm` depth
+    ///   wobble (`0` writes!), and requires `3` consecutive confirmed change ticks before adding/removing an object.
     #[allow(clippy::too_many_arguments)]
     pub fn ingest_depth_map(
         &mut self,
@@ -1003,6 +1111,13 @@ impl SpatialMeshMap {
             return DepthIngestStats::default();
         }
 
+        if conf_bytes.is_some() {
+            self.has_seen_conf = true;
+        } else if self.has_seen_conf {
+            // Device provides confidence maps: skip unverified frames so inpainted air never leaks in
+            return DepthIngestStats::default();
+        }
+
         self.tick_gen = self.tick_gen.wrapping_add(1);
         let gen = self.tick_gen;
         let rot = cam_rot.normalize();
@@ -1015,9 +1130,16 @@ impl SpatialMeshMap {
         let cy_d = cy * sy;
 
         let step_px = stride.clamp(1, 4);
-        let pad_x = (dw / 24).max(2);
-        let pad_y = (dh / 24).max(2);
-        let max_depth_m = if turbo { 3.30f32 } else { 3.00f32 };
+        let pad_x = (dw / 20).max(3);
+        let pad_y = (dh / 20).max(3);
+        let max_depth_m = if turbo { 2.85f32 } else { 2.65f32 };
+        let min_conf: u8 = if !turbo {
+            120
+        } else if is_raw_only {
+            95
+        } else {
+            65
+        };
 
         let mut stats = DepthIngestStats::default();
         let mut border_flips: Vec<((i32, i32, i32), usize, usize, usize)> = Vec::with_capacity(256);
@@ -1027,10 +1149,9 @@ impl SpatialMeshMap {
             let mut x = pad_x;
             while x + pad_x < dw {
                 let d_mm = read_depth_mm(depth_bytes, x, y, d_row_stride, d_pix_stride);
-                if (220..=3500).contains(&d_mm) {
+                if (300..=2850).contains(&d_mm) {
                     let dm = d_mm as f32 * 0.001;
                     if dm <= max_depth_m {
-                        // Optional raw confidence lookup (if available)
                         let conf_u8 = if let Some(cb) = conf_bytes {
                             if cw > 0 && ch > 0 {
                                 let cx_i = (x * cw / dw).min(cw - 1);
@@ -1039,32 +1160,47 @@ impl SpatialMeshMap {
                                 if off < cb.len() {
                                     cb[off]
                                 } else {
-                                    128
+                                    0
                                 }
                             } else {
-                                128
+                                0
                             }
                         } else {
-                            128
+                            160
                         };
 
-                        if is_raw_only && conf_u8 < 85 {
+                        // Strict anti-ghost gate: reject low-confidence inpainted/blurred mid-air guesses!
+                        if conf_bytes.is_some() && conf_u8 < min_conf {
                             x += step_px;
                             continue;
                         }
 
-                        // Silhouette discontinuity guard: rejects "flying pixels" between foreground objects & walls
-                        let dl = read_depth_mm(depth_bytes, x - 1, y, d_row_stride, d_pix_stride);
-                        let dr = read_depth_mm(depth_bytes, x + 1, y, d_row_stride, d_pix_stride);
-                        let du = read_depth_mm(depth_bytes, x, y - 1, d_row_stride, d_pix_stride);
-                        let dd = read_depth_mm(depth_bytes, x, y + 1, d_row_stride, d_pix_stride);
-                        let max_jump_mm = ((d_mm as f32) * 0.085).clamp(45.0, 175.0) as i32;
-                        let edge_jump = (dl > 0 && (dl as i32 - d_mm as i32).abs() > max_jump_mm)
-                            || (dr > 0 && (dr as i32 - d_mm as i32).abs() > max_jump_mm)
-                            || (du > 0 && (du as i32 - d_mm as i32).abs() > max_jump_mm)
-                            || (dd > 0 && (dd as i32 - d_mm as i32).abs() > max_jump_mm);
+                        // ±1px AND ±2px silhouette discontinuity & hole-border guard (eliminates mid-air edge halos!)
+                        let dl1 = read_depth_mm(depth_bytes, x - 1, y, d_row_stride, d_pix_stride);
+                        let dr1 = read_depth_mm(depth_bytes, x + 1, y, d_row_stride, d_pix_stride);
+                        let du1 = read_depth_mm(depth_bytes, x, y - 1, d_row_stride, d_pix_stride);
+                        let dd1 = read_depth_mm(depth_bytes, x, y + 1, d_row_stride, d_pix_stride);
+                        if dl1 == 0 || dr1 == 0 || du1 == 0 || dd1 == 0 {
+                            x += step_px;
+                            continue;
+                        }
+                        let max_jump_1 = ((d_mm as f32) * 0.060).clamp(35.0, 110.0) as i32;
+                        let edge_1 = (dl1 as i32 - d_mm as i32).abs() > max_jump_1
+                            || (dr1 as i32 - d_mm as i32).abs() > max_jump_1
+                            || (du1 as i32 - d_mm as i32).abs() > max_jump_1
+                            || (dd1 as i32 - d_mm as i32).abs() > max_jump_1;
 
-                        if !edge_jump {
+                        let dl2 = read_depth_mm(depth_bytes, x - 2, y, d_row_stride, d_pix_stride);
+                        let dr2 = read_depth_mm(depth_bytes, x + 2, y, d_row_stride, d_pix_stride);
+                        let du2 = read_depth_mm(depth_bytes, x, y - 2, d_row_stride, d_pix_stride);
+                        let dd2 = read_depth_mm(depth_bytes, x, y + 2, d_row_stride, d_pix_stride);
+                        let max_jump_2 = ((d_mm as f32) * 0.105).clamp(60.0, 175.0) as i32;
+                        let edge_2 = (dl2 > 0 && (dl2 as i32 - d_mm as i32).abs() > max_jump_2)
+                            || (dr2 > 0 && (dr2 as i32 - d_mm as i32).abs() > max_jump_2)
+                            || (du2 > 0 && (du2 as i32 - d_mm as i32).abs() > max_jump_2)
+                            || (dd2 > 0 && (dd2 as i32 - d_mm as i32).abs() > max_jump_2);
+
+                        if !edge_1 && !edge_2 {
                             // Exact ARCore pinhole unprojection in `cam.pose` sensor frame (+X right, +Y up, -Z forward)
                             let p_cam = Vec3::new(
                                 (x as f32 - cx_d) / fx_d * dm,
@@ -1073,36 +1209,37 @@ impl SpatialMeshMap {
                             );
                             let world_vec = rot * p_cam;
                             let dist = world_vec.length();
-                            if dist >= 0.22 && dist.is_finite() {
+                            if dist >= 0.30 && dist.is_finite() {
                                 let dir = world_vec / dist;
                                 let hit_world = cam_pos + world_vec;
                                 stats.valid_rays += 1;
 
-                                // Hybrid weighting: smooth dense depth seals holes (w=14), high stereo confidence dominates (w=22)
                                 let base_w = if conf_bytes.is_some() {
-                                    if conf_u8 >= 150 {
-                                        22.0f32
-                                    } else if conf_u8 >= 90 {
-                                        17.0f32
+                                    if conf_u8 >= 175 {
+                                        20.0f32
+                                    } else if conf_u8 >= 120 {
+                                        14.0f32
                                     } else {
-                                        12.0f32
+                                        9.0f32
                                     }
                                 } else {
                                     16.0f32
                                 };
 
                                 if turbo {
-                                    // TURBO CONTINUOUS SCAN: fuse every valid ray into the 3.5cm TSDF volume
+                                    // TURBO CONTINUOUS SCAN: fuse high-confidence rays into the 3.5cm TSDF volume
                                     stats.changed_rays += 1;
-                                    stats.updated_voxels += self.carve_free_space_ray(
-                                        cam_pos,
-                                        dir,
-                                        dist,
-                                        26.0,
-                                        false,
-                                        gen,
-                                        &mut border_flips,
-                                    );
+                                    if conf_u8 >= 110 || conf_bytes.is_none() {
+                                        stats.updated_voxels += self.carve_free_space_ray(
+                                            cam_pos,
+                                            dir,
+                                            dist,
+                                            28.0,
+                                            false,
+                                            gen,
+                                            &mut border_flips,
+                                        );
+                                    }
                                     stats.updated_voxels += self.integrate_surface_band(
                                         cam_pos,
                                         dir,
@@ -1112,29 +1249,18 @@ impl SpatialMeshMap {
                                         &mut border_flips,
                                     );
                                 } else {
-                                    // COMPARE & MAINTAIN MODE: compare against locked TSDF first!
-                                    let (gx, gy, gz) = Self::world_to_cell(hit_world);
-                                    let (old_t, old_w) = self.sample_tsdf_global(gx, gy, gz);
-                                    let surface_changed = old_w < MESH_MIN_WEIGHT
-                                        || old_t > 44
-                                        || old_t < -54;
-                                    if surface_changed {
-                                        stats.changed_rays += 1;
-                                        stats.updated_voxels += self.integrate_surface_band(
-                                            cam_pos,
-                                            dir,
-                                            dist,
-                                            (base_w * 0.85).max(12.0),
-                                            gen,
-                                            &mut border_flips,
-                                        );
+                                    // TRUE LOCK & MAINTAIN MODE:
+                                    // 1. If depth matches an existing locked surface within ±11cm -> DO NOTHING!
+                                    if self.match_locked_surface_along_ray(cam_pos, dir, dist) {
+                                        x += step_px;
+                                        continue;
                                     }
-                                    // Uniformly carve away any old static object removed along this sightline
+                                    // 2. Check if an old locked object in front of `dist` was removed (needs 3+ ticks!)
                                     let carved = self.carve_free_space_ray(
                                         cam_pos,
                                         dir,
                                         dist,
-                                        28.0,
+                                        34.0,
                                         true,
                                         gen,
                                         &mut border_flips,
@@ -1142,6 +1268,31 @@ impl SpatialMeshMap {
                                     if carved > 0 {
                                         stats.changed_rays += 1;
                                         stats.updated_voxels += carved;
+                                    }
+                                    // 3. ONLY add a new object if a locked surface exists BEHIND it (inside mapped room)
+                                    //    AND the new object stays stationary for 3+ consecutive ticks!
+                                    if self.has_locked_surface_behind(cam_pos, dir, dist) {
+                                        let (gx, gy, gz) = Self::world_to_cell(hit_world);
+                                        let (ckey, lx, ly, lz) = Self::split_cell(gx, gy, gz);
+                                        let votes = if let Some(chunk) = self.get_or_alloc_chunk(ckey, gen) {
+                                            let idx = VoxelChunk::idx(lx, ly, lz);
+                                            let v = chunk.vote_change(idx, gen);
+                                            chunk.last_touched_gen = gen;
+                                            v
+                                        } else {
+                                            0
+                                        };
+                                        if votes >= LOCK_CHANGE_CONFIRM {
+                                            stats.changed_rays += 1;
+                                            stats.updated_voxels += self.integrate_surface_band(
+                                                cam_pos,
+                                                dir,
+                                                dist,
+                                                24.0,
+                                                gen,
+                                                &mut border_flips,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -1473,6 +1624,24 @@ impl SpatialMeshMap {
                     let hi0 = h_idx(lx + 1, ly + 1, lz + 1);
                     let w0 = h_weight[hi0];
                     if w0 < MESH_MIN_WEIGHT {
+                        continue;
+                    }
+                    // Anti-floater dust filter: strip isolated 1-voxel mid-air specks (< 2 locked surface neighbors)
+                    let mut nb_surf = 0u8;
+                    for (ox, oy, oz) in [
+                        (0usize, 1usize, 1usize),
+                        (2, 1, 1),
+                        (1, 0, 1),
+                        (1, 2, 1),
+                        (1, 1, 0),
+                        (1, 1, 2),
+                    ] {
+                        let ni = h_idx(lx + ox, ly + oy, lz + oz);
+                        if h_weight[ni] >= MESH_MIN_WEIGHT && (-105..=32).contains(&h_tsdf[ni]) {
+                            nb_surf += 1;
+                        }
+                    }
+                    if nb_surf < 2 {
                         continue;
                     }
                     let t0 = h_tsdf[hi0];
@@ -2121,12 +2290,43 @@ mod tests {
         let cx = 40.0f32;
         let cy = 30.0f32;
 
-        // Synthetic curved cylinder/mug at z = -1.0m.. -1.15m centered in view, background wall at z = -2.2m
+        // 0. Low-confidence (conf = 20) hallucinated mid-air depth must produce ZERO triangles!
+        let low_conf = vec![20u8; dw * dh];
+        let depth_ghost = make_synthetic_depth_image(dw, dh, |_, _| 750u16);
+        for _ in 0..5 {
+            map.ingest_depth_map(
+                &depth_ghost,
+                dw,
+                dh,
+                dw * 2,
+                2,
+                Some(&low_conf),
+                dw,
+                dh,
+                dw,
+                1,
+                false,
+                fx,
+                fy,
+                cx,
+                cy,
+                dw,
+                dh,
+                Vec3::ZERO,
+                Quat::IDENTITY,
+                true,
+                1,
+            );
+        }
+        map.step_greedy_meshing(16);
+        assert_eq!(map.confirmed_voxel_count(), 0, "low-confidence air ghost must never lock!");
+
+        // Synthetic curved cylinder/mug at z = -0.90m..-1.02m centered in view, background wall at z = -2.2m
+        let high_conf = vec![190u8; dw * dh];
         let depth_obj = make_synthetic_depth_image(dw, dh, |x, y| {
             let dx = x as f32 - cx;
             let dy = y as f32 - cy;
             if dx.abs() < 16.0 && dy.abs() < 14.0 {
-                // Smooth curved front surface between 0.90m (center) and 1.02m (sides)
                 let curve_mm = 900.0 + (dx * dx) * 0.45;
                 curve_mm as u16
             } else {
@@ -2134,19 +2334,19 @@ mod tests {
             }
         });
 
-        // Turbo scan for 2 frames locks the curved static object cleanly
-        for _ in 0..2 {
+        // Turbo scan for 3 independent frames locks the curved static object cleanly (weight >= 42)
+        for _ in 0..3 {
             let st = map.ingest_depth_map(
                 &depth_obj,
                 dw,
                 dh,
                 dw * 2,
                 2,
-                None,
-                0,
-                0,
-                0,
-                0,
+                Some(&high_conf),
+                dw,
+                dh,
+                dw,
+                1,
                 false,
                 fx,
                 fy,
@@ -2199,19 +2399,28 @@ mod tests {
             near_curved_obj
         );
 
-        // Now turn OFF Turbo -> Compare & Maintain mode on IDENTICAL static scene:
-        // must update near-zero voxels (unchanged scene stays frozen!)
-        let maintain_same = map.ingest_depth_map(
-            &depth_obj,
+        // Now LOCK (turbo = false) -> Compare & Maintain mode:
+        // (a) Unchanged scene with +6cm realistic monocular depth wobble MUST update EXACTLY 0 voxels!
+        let depth_wobble = make_synthetic_depth_image(dw, dh, |x, y| {
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            if dx.abs() < 16.0 && dy.abs() < 14.0 {
+                (960.0 + (dx * dx) * 0.45) as u16
+            } else {
+                2260u16
+            }
+        });
+        let maintain_wobble = map.ingest_depth_map(
+            &depth_wobble,
             dw,
             dh,
             dw * 2,
             2,
-            None,
-            0,
-            0,
-            0,
-            0,
+            Some(&high_conf),
+            dw,
+            dh,
+            dw,
+            1,
             false,
             fx,
             fy,
@@ -2224,28 +2433,81 @@ mod tests {
             false,
             2,
         );
-        assert!(
-            maintain_same.updated_voxels < 20,
-            "maintain mode should stay frozen on unchanged scene, updated={}",
-            maintain_same.updated_voxels
+        assert_eq!(
+            maintain_wobble.updated_voxels, 0,
+            "TRUE LOCK must ignore ±6cm depth wobble on unchanged room!"
         );
 
-        // Now REMOVE the foreground object (whole view sees wall at 2.2m):
-        // Maintain mode MUST detect the change and carve away the removed object!
+        // (b) Turning camera to an UNSCANNED direction (+90 deg) while LOCKED must update EXACTLY 0 voxels!
+        let maintain_unscanned = map.ingest_depth_map(
+            &depth_obj,
+            dw,
+            dh,
+            dw * 2,
+            2,
+            Some(&high_conf),
+            dw,
+            dh,
+            dw,
+            1,
+            false,
+            fx,
+            fy,
+            cx,
+            cy,
+            dw,
+            dh,
+            Vec3::ZERO,
+            Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
+            false,
+            2,
+        );
+        assert_eq!(
+            maintain_unscanned.updated_voxels, 0,
+            "TRUE LOCK must NEVER scan brand-new unscanned directions!"
+        );
+
+        // (c) Single-frame removal glitch must NOT touch locked object (0 updates on tick 1 & 2)!
         let depth_empty = make_synthetic_depth_image(dw, dh, |_, _| 2200u16);
+        let glitch_1 = map.ingest_depth_map(
+            &depth_empty,
+            dw,
+            dh,
+            dw * 2,
+            2,
+            Some(&high_conf),
+            dw,
+            dh,
+            dw,
+            1,
+            false,
+            fx,
+            fy,
+            cx,
+            cy,
+            dw,
+            dh,
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            false,
+            2,
+        );
+        assert_eq!(glitch_1.updated_voxels, 0, "1-frame glitch must not erode locked mesh");
+
+        // (d) Persistent removal across 3+ consecutive ticks MUST confirm & carve away the removed object!
         let mut total_carve_updates = 0u32;
-        for _ in 0..8 {
+        for _ in 0..10 {
             let st = map.ingest_depth_map(
                 &depth_empty,
                 dw,
                 dh,
                 dw * 2,
                 2,
-                None,
-                0,
-                0,
-                0,
-                0,
+                Some(&high_conf),
+                dw,
+                dh,
+                dw,
+                1,
                 false,
                 fx,
                 fy,
@@ -2262,7 +2524,7 @@ mod tests {
         }
         assert!(
             total_carve_updates > 20,
-            "maintain mode must carve removed object, updated={}",
+            "persistent removal must carve removed object, updated={}",
             total_carve_updates
         );
         map.step_greedy_meshing(32);
