@@ -43,6 +43,12 @@ object NativeBridge {
     external fun nativeOnHandLandmarks(handCount: Int, packedData: FloatArray): Int
     external fun nativeSetRoomScanMode(mode: Int)
     external fun nativeOnArPlanes(planeCount: Int, packedPlanes: FloatArray)
+    external fun nativeOnArPlanePolygons(
+        planeCount: Int,
+        packedMeta: FloatArray,
+        polyCounts: IntArray,
+        packedPolyXz: FloatArray
+    )
     external fun nativeOnDetectedObjects(
         objectCount: Int,
         packedObjects: FloatArray,

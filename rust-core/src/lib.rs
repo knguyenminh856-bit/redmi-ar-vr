@@ -6,15 +6,17 @@ pub mod physics_3d;
 pub mod renderer;
 pub mod room_scanner;
 pub mod scene_3d;
+pub mod spatial_mesh;
 pub mod vision_ram;
 
 use glam::{Quat, Vec3};
 use hand_tracking::{FLOATS_PER_LANDMARK, LANDMARKS_PER_HAND, MAX_HANDS};
-use jni::objects::{JByteBuffer, JClass, JFloatArray};
+use jni::objects::{JByteBuffer, JClass, JFloatArray, JIntArray};
 use jni::sys::{jboolean, jfloat, jint, jlong, jstring, JNI_TRUE};
 use jni::JNIEnv;
 use renderer::{GlRenderer, SharedInputState};
 use room_scanner::{FLOATS_PER_LABEL, FLOATS_PER_OBJECT, FLOATS_PER_PLANE, MAX_LABELS};
+use spatial_mesh::{RawArPlane, MAX_POLY_VERTS};
 use vision_ram::{convert_latest_rgba, ingest_camera_planes, init_vision_ram, CaptureMeta};
 use std::cell::RefCell;
 use std::sync::{Mutex, OnceLock};
@@ -332,11 +334,13 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeGetPerfMetrics(
         perf.reticle_hit_kind as f32,
         perf.reticle_surface_kind as f32,
         perf.reticle_dist,
+        perf.mesh_chunks as f32,
+        perf.mesh_triangles as f32,
     ];
     let copy_len = env
         .get_array_length(&out_arr)
         .map(|n| (n.max(0) as usize).min(buf.len()))
-        .unwrap_or(13);
+        .unwrap_or(16);
     let _ = env.set_float_array_region(&out_arr, 0, &buf[..copy_len]);
 }
 
@@ -542,6 +546,67 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeOnArPlanes(
     }
     if let Ok(mut state) = input_state().lock() {
         state.on_ar_planes(count, &buf);
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeOnArPlanePolygons(
+    env: JNIEnv,
+    _class: JClass,
+    plane_count: jint,
+    packed_meta: JFloatArray,
+    poly_counts: JIntArray,
+    packed_poly_xz: JFloatArray,
+) {
+    if plane_count <= 0 {
+        return;
+    }
+    let count = (plane_count as usize).min(16);
+    let mut meta = vec![0.0f32; count * FLOATS_PER_PLANE];
+    let mut counts = vec![0i32; count];
+    if env.get_float_array_region(&packed_meta, 0, &mut meta).is_err()
+        || env.get_int_array_region(&poly_counts, 0, &mut counts).is_err()
+    {
+        return;
+    }
+
+    let total_verts: usize = counts
+        .iter()
+        .map(|&c| (c.max(0) as usize).min(MAX_POLY_VERTS))
+        .sum();
+    let mut poly_floats = vec![0.0f32; total_verts * 2];
+    if total_verts > 0
+        && env
+            .get_float_array_region(&packed_poly_xz, 0, &mut poly_floats)
+            .is_err()
+    {
+        return;
+    }
+
+    let mut raw_planes = Vec::with_capacity(count);
+    let mut cursor = 0usize;
+    for i in 0..count {
+        let b = i * FLOATS_PER_PLANE;
+        let v_cnt = (counts[i].max(0) as usize).min(MAX_POLY_VERTS);
+        let mut poly_xz = Vec::with_capacity(v_cnt);
+        for _ in 0..v_cnt {
+            if cursor + 2 <= poly_floats.len() {
+                poly_xz.push([poly_floats[cursor], poly_floats[cursor + 1]]);
+            }
+            cursor += 2;
+        }
+        raw_planes.push(RawArPlane {
+            raw_type: meta[b].round() as i32,
+            pos: Vec3::new(meta[b + 1], meta[b + 2], meta[b + 3]),
+            rot: Quat::from_xyzw(meta[b + 4], meta[b + 5], meta[b + 6], meta[b + 7]),
+            extent_x: meta[b + 8].clamp(0.05, 8.0),
+            extent_z: meta[b + 9].clamp(0.05, 8.0),
+            polygon_xz: poly_xz,
+        });
+    }
+
+    if let Ok(mut state) = input_state().lock() {
+        state.on_ar_plane_polygons(raw_planes);
     }
 }
 

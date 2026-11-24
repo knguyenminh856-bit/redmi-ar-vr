@@ -182,7 +182,9 @@ class MainActivity : Activity(), SensorEventListener {
     private val leftTagTextCache = Array(6) { "" }
     private val rightTagTextCache = Array(6) { "" }
     private val roomLabelsBuf = FloatArray(36)
-    private val packedPlanesBuf = FloatArray(120)
+    private val packedPlanesBuf = FloatArray(16 * 10)
+    private val packedPolyCountsBuf = IntArray(16)
+    private val packedPolyXzBuf = FloatArray(16 * 24 * 2)
     private val pointCloudBuf = FloatArray(512 * 4)
     private val reticleInfoBuf = FloatArray(3)
     private var lastPlaneExtractNs = 0L
@@ -197,7 +199,7 @@ class MainActivity : Activity(), SensorEventListener {
     private lateinit var checkUpdateBtn: Button
     private lateinit var installUpdateBtn: Button
     private lateinit var telemetryToggleBtn: Button
-    private val metricsBuf = FloatArray(16)
+    private val metricsBuf = FloatArray(18)
     private var cachedGpuName = ""
     private var telemetryRunnable: Runnable? = null
 
@@ -398,13 +400,14 @@ class MainActivity : Activity(), SensorEventListener {
         leftRoomPane = leftPane
         rightRoomPane = rightPane
 
-        val halfParams = LinearLayout.LayoutParams(
-            0,
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            1f
+        stereoRow.addView(
+            leftPane,
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f)
         )
-        stereoRow.addView(leftPane, halfParams)
-        stereoRow.addView(rightPane, halfParams)
+        stereoRow.addView(
+            rightPane,
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f)
+        )
 
         root.addView(
             stereoRow,
@@ -450,6 +453,8 @@ class MainActivity : Activity(), SensorEventListener {
             leftGesturePopup.translationX = 8f
             leftTelemetryCard.translationX = 6f
             leftReticleHud.translationX = 4f
+            leftTelemetryCard.setTextSize(TypedValue.COMPLEX_UNIT_SP, 7.5f)
+            rightTelemetryCard.setTextSize(TypedValue.COMPLEX_UNIT_SP, 7.5f)
         } else {
             leftLp.weight = 2f
             rightLp.weight = 0f
@@ -457,6 +462,7 @@ class MainActivity : Activity(), SensorEventListener {
             leftGesturePopup.translationX = 0f
             leftTelemetryCard.translationX = 0f
             leftReticleHud.translationX = 0f
+            leftTelemetryCard.setTextSize(TypedValue.COMPLEX_UNIT_SP, 9.0f)
         }
         leftRoomPane.layoutParams = leftLp
         rightRoomPane.layoutParams = rightLp
@@ -486,7 +492,7 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun createPopupPill(nasalShiftPx: Int): TextView {
         val pillBg = GradientDrawable().apply {
-            cornerRadius = 36f
+            cornerRadius = 32f
             setColor(Color.argb(226, 14, 20, 34))
             setStroke(3, Color.parseColor("#00E5FF"))
         }
@@ -494,16 +500,16 @@ class MainActivity : Activity(), SensorEventListener {
             visibility = View.GONE
             background = pillBg
             setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
             typeface = Typeface.DEFAULT_BOLD
-            setPadding(dp(14f), dp(7f), dp(14f), dp(7f))
+            setPadding(dp(12f), dp(6f), dp(12f), dp(6f))
             gravity = Gravity.CENTER
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT,
-                Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
             ).apply {
-                topMargin = dp(52f)
+                bottomMargin = dp(42f)
             }
             translationX = nasalShiftPx.toFloat()
         }
@@ -511,25 +517,25 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun createTelemetryCard(nasalShiftPx: Int): TextView {
         val cardBg = GradientDrawable().apply {
-            cornerRadius = 18f
-            setColor(Color.argb(204, 11, 16, 27))
-            setStroke(2, Color.argb(140, 0, 229, 255))
+            cornerRadius = 14f
+            setColor(Color.argb(188, 10, 15, 25))
+            setStroke(2, Color.argb(135, 0, 229, 255))
         }
         return TextView(this).apply {
             visibility = View.GONE
             background = cardBg
             setTextColor(Color.parseColor("#E0F7FA"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 9.5f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 8.5f)
             typeface = Typeface.MONOSPACE
-            setPadding(dp(10f), dp(6f), dp(10f), dp(6f))
-            setLineSpacing(2f, 1.06f)
+            setPadding(dp(7f), dp(4f), dp(7f), dp(4f))
+            setLineSpacing(1f, 1.04f)
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 Gravity.TOP or Gravity.START
             ).apply {
-                topMargin = dp(46f)
-                leftMargin = dp(10f)
+                topMargin = dp(38f)
+                leftMargin = dp(8f)
             }
             translationX = nasalShiftPx.toFloat()
         }
@@ -541,22 +547,16 @@ class MainActivity : Activity(), SensorEventListener {
             gravity = Gravity.CENTER_VERTICAL
         }
 
-        val dropBtn = makeQuickButton("\u2B07 Thả", fillColor = Color.argb(200, 18, 120, 130)) {
-            NativeBridge.nativeDropPhysicsAtReticle()
+        roomScanToggleBtn = makeQuickButton(roomScanLabel(roomScanMode)) {
+            cycleRoomScanMode(showPopup = true)
         }
-        val throwBtn = makeQuickButton("\uD83C\uDFAF Ném", fillColor = Color.argb(200, 166, 93, 26)) {
-            NativeBridge.nativeThrowPhysicsAtReticle(2.4f)
+        eyeModeBtn = makeQuickButton(if (stereoMode) "\uD83E\uDD7D 2 Mắt" else "\uD83D\uDC41 1 Mắt") {
+            toggleStereoMode(showPopup = true)
         }
         val clearBtn = makeQuickButton("\uD83D\uDDD1") {
             NativeBridge.nativeClearDrawings()
             NativeBridge.nativeClearPhysicsBodies()
             showStereoBanner("\uD83E\uDDF9  Đã xóa vật thể vật lý & nét vẽ", "#FF5252", 1200L)
-        }
-        eyeModeBtn = makeQuickButton(if (stereoMode) "\uD83E\uDD7D 2 Mắt" else "\uD83D\uDC41 1 Mắt") {
-            toggleStereoMode(showPopup = true)
-        }
-        roomScanToggleBtn = makeQuickButton(roomScanLabel(roomScanMode)) {
-            cycleRoomScanMode(showPopup = true)
         }
         handModeBtn = makeQuickButton(handModeLabel(handMode)) {
             cycleHandMode(showPopup = true)
@@ -584,14 +584,12 @@ class MainActivity : Activity(), SensorEventListener {
             LinearLayout.LayoutParams.WRAP_CONTENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
         ).apply {
-            marginStart = dp(2.5f)
+            marginStart = dp(3f)
         }
 
-        bar.addView(dropBtn, itemParams)
-        bar.addView(throwBtn, itemParams)
-        bar.addView(clearBtn, itemParams)
-        bar.addView(eyeModeBtn, itemParams)
         bar.addView(roomScanToggleBtn, itemParams)
+        bar.addView(eyeModeBtn, itemParams)
+        bar.addView(clearBtn, itemParams)
         bar.addView(handModeBtn, itemParams)
         bar.addView(drawToggleBtn, itemParams)
         bar.addView(checkUpdateBtn, itemParams)
@@ -608,6 +606,44 @@ class MainActivity : Activity(), SensorEventListener {
             marginEnd = dp(6f)
         }
         root.addView(bar, barParams)
+
+        // Ergonomic thumb-reach bottom-right action dock for Drop & Throw
+        val actionDock = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val dropBtn = makeQuickButton("\u2B07 Thả", fillColor = Color.argb(215, 16, 130, 142)) {
+            NativeBridge.nativeDropPhysicsAtReticle()
+        }.apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(dp(12f), dp(8f), dp(12f), dp(8f))
+        }
+        val throwBtn = makeQuickButton("\uD83C\uDFAF Ném", fillColor = Color.argb(215, 184, 96, 24)) {
+            NativeBridge.nativeThrowPhysicsAtReticle(2.4f)
+        }.apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(dp(12f), dp(8f), dp(12f), dp(8f))
+        }
+        val dockItemParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            marginStart = dp(6f)
+        }
+        actionDock.addView(dropBtn, dockItemParams)
+        actionDock.addView(throwBtn, dockItemParams)
+
+        val dockParams = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.BOTTOM or Gravity.END
+        ).apply {
+            bottomMargin = dp(10f)
+            marginEnd = dp(10f)
+        }
+        root.addView(actionDock, dockParams)
     }
 
     private fun makeQuickButton(
@@ -643,6 +679,7 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun roomScanLabel(mode: Int): String = when (mode) {
         1 -> "\uD83C\uDFE0 Lưới 3D"
+        4 -> "\uD83D\uDD3A Lưới \u25B3"
         3 -> "\uD83C\uDFE0 Ẩn lưới"
         2 -> "\uD83C\uDFE0 +AI Vật"
         else -> "\uD83C\uDFE0 TẮT"
@@ -781,12 +818,17 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun cycleRoomScanMode(showPopup: Boolean) {
         roomScanMode = when (roomScanMode) {
-            1 -> 3
+            1 -> 4
+            4 -> 3
             3 -> 2
             2 -> 0
             else -> 1
         }
         roomScanToggleBtn.text = roomScanLabel(roomScanMode)
+        val btnBg = roomScanToggleBtn.background as? GradientDrawable
+        btnBg?.setColor(
+            if (roomScanMode == 4) Color.argb(215, 14, 138, 108) else Color.argb(175, 20, 24, 34)
+        )
         NativeBridge.nativeSetRoomScanMode(roomScanMode)
         if (roomScanMode == 2) {
             roomScanner.initAsync()
@@ -812,12 +854,13 @@ class MainActivity : Activity(), SensorEventListener {
 
         if (showPopup) {
             val banner = when (roomScanMode) {
-                1 -> "\uD83C\uDFE0  Không gian: LƯỚI 3D + HỒNG TÂM"
+                1 -> "\uD83C\uDFE0  Không gian: LƯỚI 3D SẠCH + HỒNG TÂM"
+                4 -> "\uD83D\uDD3A  Chế độ LƯỚI TAM GIÁC (Xem chính xác mọi vùng 3D đã dựng)"
                 3 -> "\uD83C\uDFE0  Không gian: ẨN LƯỚI (Chỉ hồng tâm + Vật lý)"
                 2 -> "\uD83C\uDFE0  Không gian: ĐẦY ĐỦ (Lưới 3D + AI Đồ vật)"
                 else -> "\uD83C\uDFE0  Đã TẮT quét không gian & hồng tâm"
             }
-            showStereoBanner(banner, "#2EE6E6", 1500L)
+            showStereoBanner(banner, if (roomScanMode == 4) "#2EE6A8" else "#2EE6E6", 1600L)
         }
     }
 
@@ -866,15 +909,22 @@ class MainActivity : Activity(), SensorEventListener {
         val hk = reticleHitKind
         val sk = reticleSurfaceKind
         val dist = reticleDistanceM
+        var meshPrefix = ""
+        if (roomScanMode == 4) {
+            NativeBridge.nativeGetPerfMetrics(metricsBuf)
+            val triCount = metricsBuf[17].toInt()
+            meshPrefix = "\uD83D\uDD3A ${triCount}\u25B3 \u00B7 "
+        }
         val (text, strokeCol) = if (hk > 0 && dist > 0.05f) {
             val sName = surfaceShortName(sk)
-            if (hk == 3) {
-                String.format(Locale.US, "\uD83C\uDFAF %s (~%.2fm)", sName, dist) to Color.argb(170, 255, 193, 7)
+            if (hk == 3 || hk == 4) {
+                val estLabel = if (hk == 4) "Ước lượng" else sName
+                String.format(Locale.US, "%s\uD83C\uDFAF %s (~%.2fm)", meshPrefix, estLabel, dist) to Color.argb(180, 255, 193, 7)
             } else {
-                String.format(Locale.US, "\uD83C\uDFAF %s \u00B7 %.2fm", sName, dist) to Color.argb(210, 46, 230, 230)
+                String.format(Locale.US, "%s\uD83C\uDFAF %s \u00B7 %.2fm", meshPrefix, sName, dist) to Color.argb(215, 46, 230, 200)
             }
         } else {
-            "\uD83D\uDD0D Hướng camera vào bàn hoặc sàn..." to Color.argb(140, 160, 180, 200)
+            "${meshPrefix}\uD83D\uDD0D Quét chậm quanh phòng..." to Color.argb(140, 160, 180, 200)
         }
 
         leftReticleHud.text = text
@@ -1034,6 +1084,8 @@ class MainActivity : Activity(), SensorEventListener {
         val hitKind = metricsBuf[13].toInt()
         val surfKind = metricsBuf[14].toInt()
         val hitDist = metricsBuf[15]
+        val meshChunks = metricsBuf[16].toInt()
+        val meshTris = metricsBuf[17].toInt()
 
         val batIntent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
         val level = batIntent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
@@ -1095,13 +1147,11 @@ class MainActivity : Activity(), SensorEventListener {
         }
 
         val summary = StringBuilder()
-            .append("Bản: v${BuildConfig.VERSION_NAME} ($shortSha) | ${Build.MODEL} ($soc)\n")
-            .append("GPU: $cachedGpuName | Chế độ: $viewLabel\n")
-            .append("Màn: ${displayModeW}x${displayModeH}@${displayHz}Hz | Pin: ${batPct}% (${String.format(Locale.US, "%.1f", tempC)}°C) | RAM: ${totalRamMb}MB\n")
-            .append(String.format(Locale.US, "Render: %d fps (%.1f ms) | %s\n", renderFps, frameMs, handAiText))
-            .append("Track: $trackMode | Hồng tâm: $reticleSummary | Vẽ: ${strokeSegs} nét\n")
-            .append("3D: $activePlanes mặt (RAM:$cachedPlanes) | $voxelCount khối | $physBodies vật lý | $objScanText\n")
-            .append("Tay ($activeHands): $gestureName | Trỏ: $tipText")
+            .append("v${BuildConfig.VERSION_NAME} ($shortSha) | $viewLabel | ${batPct}% ${String.format(Locale.US, "%.1f", tempC)}°C | ${totalRamMb}MB\n")
+            .append(String.format(Locale.US, "GPU: %d fps (%.1fms) | %s\n", renderFps, frameMs, handAiText))
+            .append("Track: $trackMode | Tâm: $reticleSummary | Vật lý: $physBodies\n")
+            .append("3D: $cachedPlanes mặt gộp | $meshChunks chunk ($voxelCount ô) | ${meshTris}\u25B3 | $objScanText\n")
+            .append("Tay ($activeHands): $gestureName | Vẽ: ${strokeSegs} nét | Trỏ: $tipText")
             .toString()
 
         leftTelemetryCard.text = summary
@@ -1748,7 +1798,7 @@ class MainActivity : Activity(), SensorEventListener {
                                 val valid = cam.trackingState == TrackingState.TRACKING
                                 val pose = cam.displayOrientedPose
 
-                                cam.getProjectionMatrix(arProjMat, 0, 0.05f, 50f)
+                                cam.getProjectionMatrix(arProjMat, 0, 0.02f, 50f)
                                 val tanH = if (abs(arProjMat[0]) > 0.01f) 1f / abs(arProjMat[0]) else 0.67f
                                 val tanV = if (abs(arProjMat[5]) > 0.01f) 1f / abs(arProjMat[5]) else 0.50f
 
@@ -1823,7 +1873,7 @@ class MainActivity : Activity(), SensorEventListener {
                                                     if (hit.trackable.trackingState == TrackingState.TRACKING &&
                                                         hit.distance in 0.15f..5.0f
                                                     ) {
-                                                        chosenKind = 2
+                                                        chosenKind = 4 // Preview-only InstantPlacement (never auto-persisted)
                                                         chosenPose = hit.hitPose
                                                         chosenDist = hit.distance
                                                         break
@@ -1872,14 +1922,15 @@ class MainActivity : Activity(), SensorEventListener {
                                     }
                                 }
 
-                                // Adaptive spatial plane sampling: 4Hz during initial discovery, 1.25Hz once mapped
+                                // Adaptive canonical polygon extraction: 4Hz during initial discovery, 1.25Hz once mapped
                                 val planeIntervalNs = if (cachedPlanesCount < 3) 250_000_000L else 800_000_000L
                                 if (roomScanMode > 0 && nowNs - lastPlaneExtractNs >= planeIntervalNs) {
                                     lastPlaneExtractNs = nowNs
                                     try {
                                         var pCount = 0
+                                        var polyCursor = 0
                                         for (plane in session.getAllTrackables(Plane::class.java)) {
-                                            if (pCount >= 12) break
+                                            if (pCount >= 16) break
                                             if (plane.trackingState != TrackingState.TRACKING || plane.subsumedBy != null) {
                                                 continue
                                             }
@@ -1900,10 +1951,30 @@ class MainActivity : Activity(), SensorEventListener {
                                             packedPlanesBuf[base + 7] = p.qw()
                                             packedPlanesBuf[base + 8] = plane.extentX
                                             packedPlanesBuf[base + 9] = plane.extentZ
+
+                                            val polyBuf = plane.polygon
+                                            val rawVerts = polyBuf.limit() / 2
+                                            val keptVerts = rawVerts.coerceAtMost(24)
+                                            packedPolyCountsBuf[pCount] = keptVerts
+                                            if (keptVerts > 0 && polyCursor + keptVerts * 2 <= packedPolyXzBuf.size) {
+                                                val step = if (rawVerts > 24) rawVerts.toFloat() / 24f else 1f
+                                                for (vi in 0 until keptVerts) {
+                                                    val srcIdx = ((vi * step).toInt()).coerceIn(0, rawVerts - 1)
+                                                    packedPolyXzBuf[polyCursor++] = polyBuf.get(srcIdx * 2)
+                                                    packedPolyXzBuf[polyCursor++] = polyBuf.get(srcIdx * 2 + 1)
+                                                }
+                                            } else {
+                                                packedPolyCountsBuf[pCount] = 0
+                                            }
                                             pCount++
                                         }
                                         cachedPlanesCount = pCount
-                                        NativeBridge.nativeOnArPlanes(pCount, packedPlanesBuf)
+                                        NativeBridge.nativeOnArPlanePolygons(
+                                            pCount,
+                                            packedPlanesBuf,
+                                            packedPolyCountsBuf,
+                                            packedPolyXzBuf
+                                        )
                                     } catch (_: Throwable) {
                                     }
                                 }

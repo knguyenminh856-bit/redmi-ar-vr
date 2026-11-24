@@ -11,6 +11,7 @@ use crate::room_scanner::{
     RoomScannerRenderer, SpatialMemoryCache, SurfaceKind, WorldObjectMarker,
 };
 use crate::scene_3d::Scene3D;
+use crate::spatial_mesh::{RawArPlane, SpatialMeshMap, TriMeshRenderer, TriMeshVertex};
 use glam::{Mat4, Quat, Vec3};
 use glow::HasContext;
 use std::time::Instant;
@@ -33,6 +34,8 @@ pub struct PerfMetrics {
     pub reticle_hit_kind: i32,
     pub reticle_surface_kind: i32,
     pub reticle_dist: f32,
+    pub mesh_chunks: u32,
+    pub mesh_triangles: u32,
 }
 
 /// Thread-safe input state updated by Android sensor/camera/UI threads.
@@ -74,6 +77,14 @@ pub struct SharedInputState {
     pub room_scan_mode: i32,
     pub reticle: ReticleHit,
     pub spatial_cache: SpatialMemoryCache,
+    pub spatial_mesh: SpatialMeshMap,
+    pub cached_tri_mesh: Vec<TriMeshVertex>,
+    pub cached_tri_src_gen: u64,
+    pub cached_tri_upload_gen: u64,
+    pub last_sent_tri_gen: u64,
+    pub cached_tri_cull_pos: Vec3,
+    pub cached_tri_chunks: u32,
+    pub cached_tri_count: u32,
     pub projected_labels: Vec<ProjectedLabel>,
 
     pub physics: PhysicsWorld,
@@ -114,6 +125,14 @@ impl Default for SharedInputState {
             room_scan_mode: 1,
             reticle: ReticleHit::default(),
             spatial_cache: SpatialMemoryCache::default(),
+            spatial_mesh: SpatialMeshMap::default(),
+            cached_tri_mesh: Vec::new(),
+            cached_tri_src_gen: 0,
+            cached_tri_upload_gen: 0,
+            last_sent_tri_gen: 0,
+            cached_tri_cull_pos: Vec3::ZERO,
+            cached_tri_chunks: 0,
+            cached_tri_count: 0,
             projected_labels: Vec::new(),
             physics: PhysicsWorld::default(),
             last_physics_step: Instant::now(),
@@ -200,15 +219,24 @@ impl SharedInputState {
     }
 
     pub fn set_room_scan_mode(&mut self, mode: i32) {
-        let clamped = mode.clamp(0, 3);
+        let clamped = mode.clamp(0, 4);
         self.room_scan_mode = clamped;
         if clamped == 0 {
             self.spatial_cache.clear();
+            self.spatial_mesh.clear();
+            self.cached_tri_mesh.clear();
+            self.cached_tri_src_gen = 0;
+            self.cached_tri_upload_gen = self.cached_tri_upload_gen.wrapping_add(1);
+            self.cached_tri_chunks = 0;
+            self.cached_tri_count = 0;
             self.projected_labels.clear();
             self.reticle = ReticleHit::default();
             self.perf.active_planes = 0;
             self.perf.active_objects = 0;
             self.perf.cached_planes = 0;
+            self.perf.voxel_count = 0;
+            self.perf.mesh_chunks = 0;
+            self.perf.mesh_triangles = 0;
             self.perf.reticle_hit_kind = 0;
             self.perf.reticle_surface_kind = 0;
             self.perf.reticle_dist = 0.0;
@@ -261,9 +289,8 @@ impl SharedInputState {
                     Vec3::Y
                 }
             };
-            let skind = self
-                .spatial_cache
-                .ingest_hit_surface(pos, n, cam_pos.y, hit_kind);
+            // Rule 2: NEVER synthesize permanent patches during camera panning (eliminates floating phantom squares!)
+            let skind = self.spatial_mesh.classify_surface_point(pos, n, cam_pos.y);
             let dist = if distance > 0.05 && distance.is_finite() {
                 distance
             } else {
@@ -286,8 +313,9 @@ impl SharedInputState {
         // Ray-floor fallback when aiming downward below eye level
         let dir = (cam_rot * -Vec3::Z).normalize_or_zero();
         let floor_y = self
-            .spatial_cache
+            .spatial_mesh
             .inferred_floor_y()
+            .or_else(|| self.spatial_cache.inferred_floor_y())
             .unwrap_or_else(|| self.anchored_floor_y.unwrap_or(cam_pos.y - 1.35));
         if dir.y < -0.08 {
             let t = (floor_y - cam_pos.y) / dir.y;
@@ -316,12 +344,34 @@ impl SharedInputState {
     }
 
     pub fn on_ar_planes(&mut self, count: usize, packed: &[f32]) {
+        if self.room_scan_mode <= 0 || count == 0 {
+            return;
+        }
+        let mut raw = Vec::with_capacity(count);
+        for i in 0..count {
+            let b = i * 10;
+            if b + 10 > packed.len() {
+                break;
+            }
+            raw.push(RawArPlane {
+                raw_type: packed[b].round() as i32,
+                pos: Vec3::new(packed[b + 1], packed[b + 2], packed[b + 3]),
+                rot: Quat::from_xyzw(packed[b + 4], packed[b + 5], packed[b + 6], packed[b + 7]),
+                extent_x: packed[b + 8].clamp(0.05, 8.0),
+                extent_z: packed[b + 9].clamp(0.05, 8.0),
+                polygon_xz: Vec::new(),
+            });
+        }
+        self.on_ar_plane_polygons(raw);
+    }
+
+    pub fn on_ar_plane_polygons(&mut self, planes: Vec<RawArPlane>) {
         if self.room_scan_mode <= 0 {
             return;
         }
-        self.spatial_cache
-            .ingest_ar_planes(count, packed, self.ar_pos.y, self.room_scan_mode);
-        self.perf.cached_planes = self.spatial_cache.cached_plane_count() as u32;
+        self.spatial_mesh
+            .ingest_ar_plane_polygons(&planes, self.ar_pos.y);
+        self.perf.cached_planes = self.spatial_mesh.canonical_plane_count() as u32;
     }
 
     pub fn on_detected_objects(
@@ -357,9 +407,9 @@ impl SharedInputState {
             return;
         }
         let cam_pos = if self.has_ar_pose { self.ar_pos } else { Vec3::ZERO };
-        self.spatial_cache
+        self.spatial_mesh
             .ingest_point_cloud(count, packed_xyzc, cam_pos);
-        self.perf.voxel_count = self.spatial_cache.confirmed_voxel_count() as u32;
+        self.perf.voxel_count = self.spatial_mesh.confirmed_voxel_count() as u32;
     }
 
     pub fn spawn_physics_from_camera(&mut self, throw_speed: f32) {
@@ -369,12 +419,20 @@ impl SharedInputState {
     pub fn drop_physics_at_reticle(&mut self) {
         let (cam_pos, cam_rot) = self.current_cam_pose();
         if self.reticle.valid && self.reticle.pos.is_finite() {
+            // Only synthesize an explicit 36cm support patch when user explicitly drops onto a real Point normal
+            if self.reticle.hit_kind == 2 {
+                self.spatial_mesh.ensure_explicit_drop_patch(
+                    self.reticle.pos,
+                    self.reticle.normal,
+                    cam_pos.y,
+                );
+            }
             self.physics
                 .spawn_drop(self.reticle.pos, self.reticle.normal, None);
         } else {
             let dir = (cam_rot * -Vec3::Z).normalize_or_zero();
             let floor_y = self
-                .spatial_cache
+                .spatial_mesh
                 .inferred_floor_y()
                 .unwrap_or_else(|| self.anchored_floor_y.unwrap_or(cam_pos.y - 1.35));
             let pos = Vec3::new(cam_pos.x + dir.x * 0.75, floor_y, cam_pos.z + dir.z * 0.75);
@@ -555,15 +613,65 @@ impl SharedInputState {
             None
         };
 
-        let (active_planes, active_objects) =
-            self.spatial_cache.snapshot_visible(self.room_scan_mode, now);
-        let blocks_25d = self
-            .spatial_cache
-            .build_25d_colliders(cam_pos_capture, self.room_scan_mode);
+        // Rule 3 & 4: FPS-governed budgeted incremental Greedy Meshing (1..2 dirty chunks per tick)
+        let max_dirty = if self.perf.frame_ms > 10.5 { 1 } else { 2 };
+        if self.room_scan_mode > 0 {
+            self.spatial_mesh.step_greedy_meshing(max_dirty);
+        }
+
+        let active_planes = if self.room_scan_mode > 0 {
+            self.spatial_mesh
+                .snapshot_plane_markers(self.room_scan_mode == 2)
+        } else {
+            Vec::new()
+        };
+        let (_, active_objects) = if self.room_scan_mode == 2 {
+            self.spatial_cache.snapshot_visible(2, now)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let mut blocks_25d = if self.room_scan_mode > 0 {
+            self.spatial_mesh.collect_physics_chunk_aabbs(cam_pos_capture)
+        } else {
+            Vec::new()
+        };
+        if self.room_scan_mode == 2 {
+            let obj_boxes = self.spatial_cache.build_25d_colliders(cam_pos_capture, 2);
+            for b in obj_boxes.into_iter().filter(|b| b.is_object_box) {
+                blocks_25d.push(b);
+            }
+        }
+
+        // Rebuild Triangle Mesh VBO snapshot ONLY when in Mode 4 (🔺 Lưới △) AND map/camera actually changed
+        let tri_mesh_mode = self.room_scan_mode == 4;
+        let tri_mesh_verts = if tri_mesh_mode {
+            let moved = (cam_pos_capture - self.cached_tri_cull_pos).length_squared() > 0.60 * 0.60;
+            if self.cached_tri_src_gen != self.spatial_mesh.mesh_gen || moved || self.cached_tri_upload_gen == 0 {
+                let cam_fwd = (head_rot_120hz * -Vec3::Z).normalize_or_zero();
+                let (chunks, tris) = self.spatial_mesh.build_triangle_mesh_buffer(
+                    cam_pos_capture,
+                    cam_fwd,
+                    &mut self.cached_tri_mesh,
+                );
+                self.cached_tri_src_gen = self.spatial_mesh.mesh_gen;
+                self.cached_tri_cull_pos = cam_pos_capture;
+                self.cached_tri_chunks = chunks;
+                self.cached_tri_count = tris;
+                self.cached_tri_upload_gen = self.cached_tri_upload_gen.wrapping_add(1).max(1);
+            }
+            if self.last_sent_tri_gen != self.cached_tri_upload_gen {
+                self.last_sent_tri_gen = self.cached_tri_upload_gen;
+                Some(self.cached_tri_mesh.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         let dt_phys = now.duration_since(self.last_physics_step).as_secs_f32();
         self.last_physics_step = now;
-        let fallback_floor_y = if let Some(inferred) = self.spatial_cache.inferred_floor_y() {
+        let fallback_floor_y = if let Some(inferred) = self.spatial_mesh.inferred_floor_y() {
             self.anchored_floor_y = Some(inferred);
             inferred
         } else {
@@ -581,9 +689,11 @@ impl SharedInputState {
 
         self.perf.active_planes = active_planes.len() as u32;
         self.perf.active_objects = active_objects.len() as u32;
-        self.perf.cached_planes = self.spatial_cache.cached_plane_count() as u32;
-        self.perf.voxel_count = self.spatial_cache.confirmed_voxel_count() as u32;
+        self.perf.cached_planes = self.spatial_mesh.canonical_plane_count() as u32;
+        self.perf.voxel_count = self.spatial_mesh.confirmed_voxel_count() as u32;
         self.perf.physics_bodies = self.physics.bodies.len() as u32;
+        self.perf.mesh_chunks = self.spatial_mesh.active_chunk_count() as u32;
+        self.perf.mesh_triangles = self.cached_tri_count;
 
         let boost_factor = match self.boost_until {
             Some(until) if until > now => {
@@ -624,6 +734,9 @@ impl SharedInputState {
                 ReticleHit::default()
             },
             show_grid: matches!(self.room_scan_mode, 1 | 2),
+            tri_mesh_mode,
+            tri_mesh_gen: self.cached_tri_upload_gen,
+            tri_mesh_verts,
             physics_bodies: self.physics.bodies.clone(),
             physics_rings: self.physics.impact_rings.clone(),
         }
@@ -655,6 +768,9 @@ pub struct FrameSnapshot {
     pub blocks_25d: Vec<AabbCollider>,
     pub reticle: ReticleHit,
     pub show_grid: bool,
+    pub tri_mesh_mode: bool,
+    pub tri_mesh_gen: u64,
+    pub tri_mesh_verts: Option<Vec<TriMeshVertex>>,
     pub physics_bodies: Vec<PhysicsBody>,
     pub physics_rings: Vec<ImpactRing>,
 }
@@ -685,7 +801,7 @@ pub fn compute_eye_projection(
     let cover_tan_v = safe_v.min(safe_h / safe_aspect);
     let fill = fov_scale.clamp(0.50, 1.15) * overscan.clamp(1.00, 1.15);
     let eye_tan_v = (cover_tan_v / fill).clamp(0.18, 2.2);
-    Mat4::perspective_rh_gl(2.0 * eye_tan_v.atan(), safe_aspect, 0.05, 50.0)
+    Mat4::perspective_rh_gl(2.0 * eye_tan_v.atan(), safe_aspect, 0.02, 50.0)
 }
 
 pub fn compute_quad_screen_bounds(
@@ -761,6 +877,7 @@ pub struct GlRenderer {
     hand_overlay: HandOverlayRenderer,
     finger_draw: FingerDrawRenderer,
     room_scanner: RoomScannerRenderer,
+    tri_mesh: TriMeshRenderer,
     physics_renderer: PhysicsRenderer,
     pub gpu_renderer_name: String,
     width: i32,
@@ -778,6 +895,7 @@ impl GlRenderer {
         let hand_overlay = HandOverlayRenderer::new(&gl)?;
         let finger_draw = FingerDrawRenderer::new(&gl)?;
         let room_scanner = RoomScannerRenderer::new(&gl)?;
+        let tri_mesh = TriMeshRenderer::new(&gl)?;
         let physics_renderer = PhysicsRenderer::new(&gl)?;
         Ok(Self {
             gl,
@@ -786,6 +904,7 @@ impl GlRenderer {
             hand_overlay,
             finger_draw,
             room_scanner,
+            tri_mesh,
             physics_renderer,
             gpu_renderer_name,
             width: 1200,
@@ -848,6 +967,12 @@ impl GlRenderer {
             snap.head_pos_120hz,
             snap.head_rot_120hz,
         );
+        if snap.tri_mesh_mode {
+            if let Some(ref verts) = snap.tri_mesh_verts {
+                self.tri_mesh
+                    .sync_if_dirty(&self.gl, verts, snap.tri_mesh_gen);
+            }
+        }
 
         let t_cam_capture =
             Mat4::from_rotation_translation(snap.cam_rot_capture, snap.cam_pos_capture);
@@ -909,6 +1034,9 @@ impl GlRenderer {
                     mono_scissor.2,
                     mono_scissor.3,
                 );
+                if snap.tri_mesh_mode {
+                    self.tri_mesh.draw(&self.gl, &vp);
+                }
                 self.room_scanner.draw_world_markers(&self.gl, &vp);
                 self.gl.disable(glow::SCISSOR_TEST);
                 self.finger_draw.draw(&self.gl, &vp);
@@ -973,6 +1101,9 @@ impl GlRenderer {
                     left_scissor.2,
                     left_scissor.3,
                 );
+                if snap.tri_mesh_mode {
+                    self.tri_mesh.draw(&self.gl, &left_vp);
+                }
                 self.room_scanner.draw_world_markers(&self.gl, &left_vp);
                 self.gl.disable(glow::SCISSOR_TEST);
                 self.finger_draw.draw(&self.gl, &left_vp);
@@ -1004,6 +1135,9 @@ impl GlRenderer {
                     right_scissor.2,
                     right_scissor.3,
                 );
+                if snap.tri_mesh_mode {
+                    self.tri_mesh.draw(&self.gl, &right_vp);
+                }
                 self.room_scanner.draw_world_markers(&self.gl, &right_vp);
                 self.gl.disable(glow::SCISSOR_TEST);
                 self.finger_draw.draw(&self.gl, &right_vp);
@@ -1042,6 +1176,7 @@ impl GlRenderer {
         self.hand_overlay.destroy(&self.gl);
         self.finger_draw.destroy(&self.gl);
         self.room_scanner.destroy(&self.gl);
+        self.tri_mesh.destroy(&self.gl);
         self.physics_renderer.destroy(&self.gl);
     }
 }

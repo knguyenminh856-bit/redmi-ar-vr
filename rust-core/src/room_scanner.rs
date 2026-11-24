@@ -1101,16 +1101,20 @@ pub fn build_reticle_vertices(reticle: &ReticleHit, cam_pos: Vec3, out: &mut Vec
     } else {
         [0.92, 0.96, 1.00]
     };
+    let is_estimate = reticle.hit_kind == 3 || reticle.hit_kind == 4;
     let ring_col = [
         rgb[0],
         rgb[1],
         rgb[2],
-        if reticle.hit_kind == 3 { 0.42 } else { 0.72 },
+        if is_estimate { 0.42 } else { 0.72 },
     ];
-    let tick_col = [1.0, 1.0, 1.0, if reticle.hit_kind == 3 { 0.40 } else { 0.70 }];
+    let tick_col = [1.0, 1.0, 1.0, if is_estimate { 0.38 } else { 0.70 }];
 
     const SEGMENTS: usize = 16;
     for i in 0..SEGMENTS {
+        if reticle.hit_kind == 4 && i % 2 == 1 {
+            continue; // Dashed preview ring for InstantPlacement estimates (never auto-persisted)
+        }
         let a0 = (i as f32) * std::f32::consts::TAU / (SEGMENTS as f32);
         let a1 = ((i + 1) as f32) * std::f32::consts::TAU / (SEGMENTS as f32);
         let d0 = tx * a0.cos() + tz * a0.sin();
@@ -1225,15 +1229,12 @@ pub fn build_room_marker_vertices(
             }
         }
 
-        for block in blocks_25d.iter().take(28) {
+        for block in blocks_25d.iter().filter(|b| b.is_object_box).take(16) {
             if out.len() + 80 > MAX_WORLD_VERTICES {
                 break;
             }
-            let (top_col, edge_col) = if block.is_object_box {
-                ([0.24, 0.94, 0.64, 0.08], [0.24, 0.94, 0.64, 0.34])
-            } else {
-                ([0.25, 0.90, 0.85, 0.12], [0.25, 0.90, 0.85, 0.34])
-            };
+            let top_col = [0.24, 0.94, 0.64, 0.08];
+            let edge_col = [0.24, 0.94, 0.64, 0.34];
             push_wire_box(out, block.min, block.max, top_col, edge_col, 0.0022);
         }
     }
