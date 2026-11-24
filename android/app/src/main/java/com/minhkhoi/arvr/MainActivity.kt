@@ -75,7 +75,7 @@ class MainActivity : Activity(), SensorEventListener {
         private const val TAG = "RedmiARVR"
         private const val REQ_CAMERA = 1001
         private const val PREFS_NAME = "vr_calibration"
-        private const val KEY_FOV_PCT = "fov_pct"
+        private const val KEY_FOV_PCT_V2 = "fov_pct_v2"
         private const val KEY_IPD_MM = "ipd_mm"
     }
 
@@ -145,14 +145,14 @@ class MainActivity : Activity(), SensorEventListener {
     private var lastArTimestampNs = 0L
 
     // Feature toggles, OTA Updater & UI
-    private var fovPct = 85
+    private var fovPct = 100
     private var ipdMm = 64
     @Volatile
     private var drawMode = 0 // 0=Off, 1=1 Finger, 2=5 Fingers
     @Volatile
     private var handMode = 1 // 1=Tự động, 2=Nhanh, 0=Tắt
     @Volatile
-    private var roomScanMode = 2 // 0=Tắt, 1=Sàn/Tường, 2=Đầy đủ (AR Plane + Đồ vật)
+    private var roomScanMode = 2 // 0=Tắt, 1=Sàn/Tường, 2=Đầy đủ (AR Plane + 2.5D + Đồ vật)
     @Volatile
     private var cachedPlanesCount = 0
     private var telemetryVisible = false
@@ -172,7 +172,9 @@ class MainActivity : Activity(), SensorEventListener {
     private val rightTagTextCache = Array(6) { "" }
     private val roomLabelsBuf = FloatArray(36)
     private val packedPlanesBuf = FloatArray(120)
+    private val pointCloudBuf = FloatArray(512 * 4)
     private var lastPlaneExtractNs = 0L
+    private var lastPointCloudNs = 0L
     private var roomLabelRunnable: Runnable? = null
     private lateinit var leftTelemetryCard: TextView
     private lateinit var rightTelemetryCard: TextView
@@ -182,7 +184,7 @@ class MainActivity : Activity(), SensorEventListener {
     private lateinit var checkUpdateBtn: Button
     private lateinit var installUpdateBtn: Button
     private lateinit var telemetryToggleBtn: Button
-    private val metricsBuf = FloatArray(11)
+    private val metricsBuf = FloatArray(13)
     private var cachedGpuName = ""
     private var telemetryRunnable: Runnable? = null
 
@@ -268,7 +270,7 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun loadCalibration() {
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        fovPct = prefs.getInt(KEY_FOV_PCT, 85).coerceIn(50, 100)
+        fovPct = prefs.getInt(KEY_FOV_PCT_V2, 100).coerceIn(55, 105)
         ipdMm = prefs.getInt(KEY_IPD_MM, 64).coerceIn(56, 72)
         NativeBridge.nativeSetCalibration(fovPct / 100f, ipdMm / 1000f)
     }
@@ -276,7 +278,7 @@ class MainActivity : Activity(), SensorEventListener {
     private fun saveCalibration() {
         getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
-            .putInt(KEY_FOV_PCT, fovPct)
+            .putInt(KEY_FOV_PCT_V2, fovPct)
             .putInt(KEY_IPD_MM, ipdMm)
             .apply()
         NativeBridge.nativeSetCalibration(fovPct / 100f, ipdMm / 1000f)
@@ -473,28 +475,32 @@ class MainActivity : Activity(), SensorEventListener {
             gravity = Gravity.CENTER_VERTICAL
         }
 
-        drawToggleBtn = makeQuickButton("\u270F Vẽ: TẮT") {
+        val dropBtn = makeQuickButton("\uD83C\uDFB2 Thả", fillColor = Color.argb(195, 18, 120, 130)) {
+            NativeBridge.nativeSpawnPhysicsBody(1.65f)
+        }
+        drawToggleBtn = makeQuickButton("\u270F TẮT") {
             cycleDrawMode(showPopup = false)
         }
-        handModeBtn = makeQuickButton("\uD83D\uDD90 Tay: T.ĐỘNG") {
+        handModeBtn = makeQuickButton("\uD83D\uDD90 T.Đ") {
             cycleHandMode(showPopup = true)
         }
         val clearBtn = makeQuickButton("\uD83D\uDDD1") {
             NativeBridge.nativeClearDrawings()
-            showStereoBanner("\uD83E\uDDF9  Đã xóa nét vẽ", "#FF5252", 1200L)
+            NativeBridge.nativeClearPhysicsBodies()
+            showStereoBanner("\uD83E\uDDF9  Đã xóa nét vẽ & vật thể vật lý", "#FF5252", 1200L)
         }
-        roomScanToggleBtn = makeQuickButton("\uD83C\uDFE0 ĐẦY ĐỦ") {
+        roomScanToggleBtn = makeQuickButton("\uD83C\uDFE0 2.5D") {
             cycleRoomScanMode(showPopup = true)
         }
-        checkUpdateBtn = makeQuickButton("\uD83D\uDD04 Check") {
+        checkUpdateBtn = makeQuickButton("\uD83D\uDD04") {
             performUpdateCheck(manual = true)
         }
-        installUpdateBtn = makeQuickButton("\u2B07 Cập nhật", fillColor = Color.argb(220, 0, 180, 80)) {
+        installUpdateBtn = makeQuickButton("\u2B07 C.Nhật", fillColor = Color.argb(220, 0, 180, 80)) {
             triggerApkDownloadAndInstall()
         }.apply {
             visibility = View.GONE
         }
-        telemetryToggleBtn = makeQuickButton("\uD83D\uDCCA Info") {
+        telemetryToggleBtn = makeQuickButton("\uD83D\uDCCA") {
             toggleTelemetryHud()
         }
         val gearBtn = makeQuickButton("\u2699") {
@@ -506,9 +512,10 @@ class MainActivity : Activity(), SensorEventListener {
             LinearLayout.LayoutParams.WRAP_CONTENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
         ).apply {
-            marginStart = dp(3.5f)
+            marginStart = dp(2.5f)
         }
 
+        bar.addView(dropBtn, itemParams)
         bar.addView(drawToggleBtn, itemParams)
         bar.addView(handModeBtn, itemParams)
         bar.addView(clearBtn, itemParams)
@@ -524,7 +531,7 @@ class MainActivity : Activity(), SensorEventListener {
             Gravity.TOP or Gravity.END
         ).apply {
             topMargin = dp(6f)
-            marginEnd = dp(8f)
+            marginEnd = dp(6f)
         }
         root.addView(bar, barParams)
     }
@@ -535,21 +542,21 @@ class MainActivity : Activity(), SensorEventListener {
         onClick: () -> Unit
     ): Button {
         val bg = GradientDrawable().apply {
-            cornerRadius = 20f
+            cornerRadius = 18f
             setColor(fillColor)
             setStroke(2, Color.argb(130, 255, 255, 255))
         }
         return Button(this).apply {
             text = label
             isAllCaps = false
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 9.5f)
             setTextColor(Color.WHITE)
             background = bg
             minHeight = 0
             minimumHeight = 0
             minWidth = 0
             minimumWidth = 0
-            setPadding(dp(7f), dp(4.5f), dp(7f), dp(4.5f))
+            setPadding(dp(5.5f), dp(4f), dp(5.5f), dp(4f))
             setOnClickListener { onClick() }
         }
     }
@@ -557,11 +564,11 @@ class MainActivity : Activity(), SensorEventListener {
     private fun performUpdateCheck(manual: Boolean) {
         if (appUpdater.isDownloading) return
         if (manual) {
-            checkUpdateBtn.text = "\uD83D\uDD04 Check..."
+            checkUpdateBtn.text = "\u23F3"
             checkUpdateBtn.isEnabled = false
         }
         appUpdater.checkForUpdate { res ->
-            checkUpdateBtn.text = "\uD83D\uDD04 Check"
+            checkUpdateBtn.text = "\uD83D\uDD04"
             checkUpdateBtn.isEnabled = true
 
             if (res.error != null) {
@@ -574,10 +581,10 @@ class MainActivity : Activity(), SensorEventListener {
             if (res.hasUpdate) {
                 availableUpdate = res
                 val tag = if (res.remoteBuildNumber > 0) "#${res.remoteBuildNumber}" else res.remoteCommit.take(7)
-                installUpdateBtn.text = "\u2B07 Cập nhật $tag"
+                installUpdateBtn.text = "\u2B07 $tag"
                 installUpdateBtn.visibility = View.VISIBLE
                 showStereoBanner(
-                    "\u2B07  Có bản cập nhật mới ($tag)! Bấm [Cập nhật] để cài",
+                    "\u2B07  Có bản cập nhật mới ($tag)! Bấm [⬇ $tag] để cài",
                     "#00E676",
                     2600L,
                     strokeWidth = 4
@@ -635,9 +642,9 @@ class MainActivity : Activity(), SensorEventListener {
     private fun cycleDrawMode(showPopup: Boolean) {
         drawMode = (drawMode + 1) % 3
         val modeLabel = when (drawMode) {
-            1 -> "\u270F Vẽ: 1 NGÓN"
-            2 -> "\u270F Vẽ: 5 NGÓN"
-            else -> "\u270F Vẽ: TẮT"
+            1 -> "\u270F 1 NGÓN"
+            2 -> "\u270F 5 NGÓN"
+            else -> "\u270F TẮT"
         }
         drawToggleBtn.text = modeLabel
         NativeBridge.nativeSetDrawMode(drawMode)
@@ -659,9 +666,9 @@ class MainActivity : Activity(), SensorEventListener {
         }
         handTracker.setMode(handMode)
         handModeBtn.text = when (handMode) {
-            2 -> "\uD83D\uDD90 Tay: NHANH"
-            0 -> "\uD83D\uDD90 Tay: TẮT"
-            else -> "\uD83D\uDD90 Tay: T.ĐỘNG"
+            2 -> "\uD83D\uDD90 NHANH"
+            0 -> "\uD83D\uDD90 TẮT"
+            else -> "\uD83D\uDD90 T.Đ"
         }
         if (showPopup) {
             val banner = when (handMode) {
@@ -676,8 +683,8 @@ class MainActivity : Activity(), SensorEventListener {
     private fun cycleRoomScanMode(showPopup: Boolean) {
         roomScanMode = (roomScanMode + 2) % 3 // Cycles 2 -> 1 -> 0 -> 2
         val modeLabel = when (roomScanMode) {
-            2 -> "\uD83C\uDFE0 ĐẦY ĐỦ"
-            1 -> "\uD83C\uDFE0 SÀN/TƯỜNG"
+            2 -> "\uD83C\uDFE0 2.5D"
+            1 -> "\uD83C\uDFE0 SÀN"
             else -> "\uD83C\uDFE0 TẮT"
         }
         roomScanToggleBtn.text = modeLabel
@@ -821,7 +828,7 @@ class MainActivity : Activity(), SensorEventListener {
         val vis = if (telemetryVisible) View.VISIBLE else View.GONE
         leftTelemetryCard.visibility = vis
         rightTelemetryCard.visibility = vis
-        telemetryToggleBtn.text = if (telemetryVisible) "\uD83D\uDCCA Ẩn" else "\uD83D\uDCCA Info"
+        telemetryToggleBtn.text = if (telemetryVisible) "\uD83D\uDCCA*" else "\uD83D\uDCCA"
         if (telemetryVisible) {
             startTelemetryLoop()
         } else {
@@ -864,6 +871,8 @@ class MainActivity : Activity(), SensorEventListener {
         val activePlanes = metricsBuf[8].toInt()
         val activeObjects = metricsBuf[9].toInt()
         val cachedPlanes = metricsBuf[10].toInt()
+        val voxelCount = metricsBuf[11].toInt()
+        val physBodies = metricsBuf[12].toInt()
 
         val batIntent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
         val level = batIntent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
@@ -924,7 +933,8 @@ class MainActivity : Activity(), SensorEventListener {
             .append("Màn: ${displayModeW}x${displayModeH}@${displayHz}Hz | Pin: ${batPct}% (${String.format(Locale.US, "%.1f", tempC)}°C) | RAM: ${totalRamMb}MB\n")
             .append(String.format(Locale.US, "Render: %d fps (%.1f ms) | %s\n", renderFps, frameMs, handAiText))
             .append("Track: $trackMode | Tay ($activeHands): $gestureName | Vẽ: ${strokeSegs} nét\n")
-            .append("Quét: $activePlanes mặt (RAM:$cachedPlanes) | $objScanText | Trỏ: $tipText")
+            .append("2.5D: $activePlanes mặt (RAM:$cachedPlanes) | $voxelCount khối | $physBodies vật lý | $objScanText\n")
+            .append("Trỏ: $tipText")
             .toString()
 
         leftTelemetryCard.text = summary
@@ -935,7 +945,7 @@ class MainActivity : Activity(), SensorEventListener {
         val (label, accentHex, durationMs) = when (code) {
             1 -> Triple("\u270A  Phát hiện: NẮM ĐẤM", "#FF7043", 1800L)
             2 -> Triple("\uD83E\uDD0F  Phát hiện: CHỤM NGÓN CÁI", "#00E5FF", 1800L)
-            3 -> Triple("\uD83D\uDC49  Phát hiện: HÌNH CÂY SÚNG", "#FFD54F", 1800L)
+            3 -> Triple("\uD83D\uDC49  CÂY SÚNG: Bắn bóng vật lý!", "#FFD54F", 1800L)
             4 -> Triple("\u270C  Phát hiện: CHỮ V", "#69F0AE", 1800L)
             6 -> Triple("\uD83D\uDC4D  Phát hiện: THÍCH (LIKE)", "#40C4FF", 1800L)
             7 -> Triple("\uD83E\uDD18  Phát hiện: ROCK / SPIDER", "#CE93D8", 1800L)
@@ -993,15 +1003,15 @@ class MainActivity : Activity(), SensorEventListener {
 
         val fovLabel = TextView(this).apply {
             setTextColor(Color.WHITE)
-            text = "Khung Camera (chống chóng mặt): $fovPct%"
+            text = "Tỷ lệ khung hình (100% = Full màn): $fovPct%"
         }
         val fovBar = SeekBar(this).apply {
             max = 50
-            progress = fovPct - 50
+            progress = fovPct - 55
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                    fovPct = 50 + p
-                    fovLabel.text = "Khung Camera (chống chóng mặt): $fovPct%"
+                    fovPct = 55 + p
+                    fovLabel.text = "Tỷ lệ khung hình (100% = Full màn): $fovPct%"
                     saveCalibration()
                 }
                 override fun onStartTrackingTouch(sb: SeekBar?) {}
@@ -1625,6 +1635,26 @@ class MainActivity : Activity(), SensorEventListener {
                                         }
                                         cachedPlanesCount = pCount
                                         NativeBridge.nativeOnArPlanes(pCount, packedPlanesBuf)
+                                    } catch (_: Throwable) {
+                                    }
+                                }
+
+                                // 5Hz ARCore SLAM 3D PointCloud ingestion for 2.5D obstacle voxels
+                                if (roomScanMode > 0 && valid && nowNs - lastPointCloudNs >= 200_000_000L) {
+                                    lastPointCloudNs = nowNs
+                                    try {
+                                        val pc = frame.acquirePointCloud()
+                                        try {
+                                            val pts = pc.points
+                                            pts.position(0)
+                                            val totalPts = (pts.remaining() / 4).coerceAtMost(512)
+                                            if (totalPts > 0) {
+                                                pts.get(pointCloudBuf, 0, totalPts * 4)
+                                                NativeBridge.nativeOnPointCloud(totalPts, pointCloudBuf)
+                                            }
+                                        } finally {
+                                            pc.close()
+                                        }
                                     } catch (_: Throwable) {
                                     }
                                 }

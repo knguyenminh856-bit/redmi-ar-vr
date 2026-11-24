@@ -1,6 +1,7 @@
 use crate::passthrough::compile_program;
 use glam::{Mat4, Quat, Vec3};
 use glow::HasContext;
+use std::collections::HashMap;
 use std::mem::size_of;
 use std::time::Instant;
 
@@ -18,7 +19,13 @@ pub const MAX_CACHED_OBJECTS: usize = 32;
 pub const PLANE_CACHE_TTL_MS: u128 = 45_000;
 pub const OBJECT_CACHE_TTL_MS: u128 = 10_000;
 
-const MAX_WORLD_VERTICES: usize = 4096;
+pub const VOXEL_SIZE: f32 = 0.06;
+pub const MAX_VOXELS: usize = 2048;
+pub const VOXEL_TTL_MS: u128 = 35_000;
+pub const VOXEL_NOISE_TTL_MS: u128 = 8_000;
+pub const MAX_POINT_CLOUD_PTS: usize = 512;
+
+const MAX_WORLD_VERTICES: usize = 8192;
 
 const SCAN_VERT: &str = r#"
 precision highp float;
@@ -86,6 +93,13 @@ pub struct WorldObjectMarker {
     pub score: f32,
 }
 
+#[derive(Copy, Clone, Debug)]
+pub struct AabbCollider {
+    pub min: Vec3,
+    pub max: Vec3,
+    pub is_object_box: bool,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct ProjectedLabel {
     pub kind_id: i32,
@@ -109,9 +123,17 @@ struct CachedObjectEntry {
     last_seen: Instant,
 }
 
+#[derive(Copy, Clone, Debug)]
+struct VoxelCell {
+    sum_pos: Vec3,
+    hits: u32,
+    last_seen: Instant,
+}
+
 pub struct SpatialMemoryCache {
     planes: Vec<CachedPlaneEntry>,
     objects: Vec<CachedObjectEntry>,
+    voxels: HashMap<(i32, i32, i32), VoxelCell>,
 }
 
 impl Default for SpatialMemoryCache {
@@ -119,6 +141,7 @@ impl Default for SpatialMemoryCache {
         Self {
             planes: Vec::with_capacity(MAX_CACHED_PLANES),
             objects: Vec::with_capacity(MAX_CACHED_OBJECTS),
+            voxels: HashMap::with_capacity(512),
         }
     }
 }
@@ -127,6 +150,7 @@ impl SpatialMemoryCache {
     pub fn clear(&mut self) {
         self.planes.clear();
         self.objects.clear();
+        self.voxels.clear();
     }
 
     pub fn clear_objects(&mut self) {
@@ -139,6 +163,18 @@ impl SpatialMemoryCache {
 
     pub fn cached_object_count(&self) -> usize {
         self.objects.len()
+    }
+
+    pub fn confirmed_voxel_count(&self) -> usize {
+        self.voxels.values().filter(|v| v.hits >= 3).count()
+    }
+
+    pub fn inferred_floor_y(&self) -> Option<f32> {
+        self.planes
+            .iter()
+            .filter(|p| p.marker.kind == SurfaceKind::Floor)
+            .map(|p| p.marker.pos.y)
+            .reduce(f32::min)
     }
 
     pub fn ingest_ar_planes(&mut self, count: usize, packed: &[f32], cam_y: f32, scan_mode: i32) {
@@ -425,6 +461,175 @@ impl SpatialMemoryCache {
 
         (planes, objects)
     }
+
+    pub fn ingest_point_cloud(&mut self, point_count: usize, packed_xyzc: &[f32], cam_pos: Vec3) {
+        self.ingest_point_cloud_at(point_count, packed_xyzc, cam_pos, Instant::now());
+    }
+
+    pub fn ingest_point_cloud_at(
+        &mut self,
+        point_count: usize,
+        packed_xyzc: &[f32],
+        cam_pos: Vec3,
+        now: Instant,
+    ) {
+        self.voxels.retain(|_, cell| {
+            let age = now.duration_since(cell.last_seen).as_millis();
+            if cell.hits < 3 {
+                age <= VOXEL_NOISE_TTL_MS
+            } else {
+                age <= VOXEL_TTL_MS
+            }
+        });
+
+        let n = point_count.min(MAX_POINT_CLOUD_PTS);
+        for i in 0..n {
+            let base = i * 4;
+            if base + 4 > packed_xyzc.len() {
+                break;
+            }
+            let conf = packed_xyzc[base + 3];
+            if !conf.is_finite() || conf < 0.35 {
+                continue;
+            }
+            let pt = Vec3::new(packed_xyzc[base], packed_xyzc[base + 1], packed_xyzc[base + 2]);
+            if !pt.is_finite() {
+                continue;
+            }
+            let dist_sq = (pt - cam_pos).length_squared();
+            if !(0.25 * 0.25..=3.5 * 3.5).contains(&dist_sq) {
+                continue;
+            }
+
+            let key = (
+                (pt.x / VOXEL_SIZE).floor() as i32,
+                (pt.y / VOXEL_SIZE).floor() as i32,
+                (pt.z / VOXEL_SIZE).floor() as i32,
+            );
+            if let Some(cell) = self.voxels.get_mut(&key) {
+                if cell.hits < 64 {
+                    cell.sum_pos += pt;
+                    cell.hits += 1;
+                } else {
+                    let avg = cell.sum_pos / (cell.hits as f32);
+                    cell.sum_pos = (avg * 0.85 + pt * 0.15) * (cell.hits as f32);
+                }
+                cell.last_seen = now;
+            } else {
+                if self.voxels.len() >= MAX_VOXELS {
+                    if let Some(&oldest_key) = self
+                        .voxels
+                        .iter()
+                        .min_by_key(|(_, c)| (c.hits >= 3, c.last_seen))
+                        .map(|(k, _)| k)
+                    {
+                        self.voxels.remove(&oldest_key);
+                    }
+                }
+                self.voxels.insert(
+                    key,
+                    VoxelCell {
+                        sum_pos: pt,
+                        hits: 1,
+                        last_seen: now,
+                    },
+                );
+            }
+        }
+    }
+
+    pub fn build_25d_colliders(&self, cam_pos: Vec3, scan_mode: i32) -> Vec<AabbCollider> {
+        if scan_mode <= 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(80);
+
+        // Extruded 2.5D object obstacle boxes from ML detections (active in Full mode)
+        if scan_mode >= 2 {
+            for entry in &self.objects {
+                let obj = entry.marker;
+                let dist = (obj.world_pos - cam_pos).length().clamp(0.4, 4.0);
+                let hw = (obj.radius_hint_ndc * 0.28 * dist).clamp(0.06, 0.30);
+
+                // Find highest horizontal supporting surface under object to extrude downward
+                let mut support_y: Option<f32> = None;
+                for p in &self.planes {
+                    if matches!(
+                        p.marker.kind,
+                        SurfaceKind::Floor | SurfaceKind::Table | SurfaceKind::Seat
+                    ) && p.marker.pos.y <= obj.world_pos.y
+                        && (obj.world_pos.y - p.marker.pos.y) <= 0.85
+                    {
+                        let rel = obj.world_pos - p.marker.pos;
+                        let dx = rel.dot(p.marker.rot * Vec3::X).abs();
+                        let dz = rel.dot(p.marker.rot * Vec3::Z).abs();
+                        if dx <= p.marker.extent_x * 0.65 + 0.15
+                            && dz <= p.marker.extent_z * 0.65 + 0.15
+                            && support_y.map(|cy| p.marker.pos.y > cy).unwrap_or(true)
+                        {
+                            support_y = Some(p.marker.pos.y);
+                        }
+                    }
+                }
+
+                let min_y = support_y.unwrap_or(obj.world_pos.y - hw);
+                let max_y = (obj.world_pos.y + hw).max(min_y + 0.08);
+                out.push(AabbCollider {
+                    min: Vec3::new(obj.world_pos.x - hw, min_y, obj.world_pos.z - hw),
+                    max: Vec3::new(obj.world_pos.x + hw, max_y, obj.world_pos.z + hw),
+                    is_object_box: true,
+                });
+            }
+        }
+
+        // Confirmed 2.5D SLAM voxels (excluding flat points flush on continuous horizontal planes)
+        let mut candidates: Vec<(f32, Vec3)> = self
+            .voxels
+            .values()
+            .filter_map(|cell| {
+                if cell.hits < 3 {
+                    return None;
+                }
+                let center = cell.sum_pos / (cell.hits as f32);
+                let d2 = (center - cam_pos).length_squared();
+                if d2 > 2.8 * 2.8 {
+                    return None;
+                }
+                let on_flat_plane = self.planes.iter().any(|p| {
+                    if !matches!(
+                        p.marker.kind,
+                        SurfaceKind::Floor | SurfaceKind::Table | SurfaceKind::Seat
+                    ) {
+                        return false;
+                    }
+                    let rel = center - p.marker.pos;
+                    if rel.y.abs() >= 0.045 {
+                        return false;
+                    }
+                    let dx = rel.dot(p.marker.rot * Vec3::X).abs();
+                    let dz = rel.dot(p.marker.rot * Vec3::Z).abs();
+                    dx <= p.marker.extent_x * 0.55 && dz <= p.marker.extent_z * 0.55
+                });
+                if on_flat_plane {
+                    None
+                } else {
+                    Some((d2, center))
+                }
+            })
+            .collect();
+
+        candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let half = Vec3::splat(0.032);
+        for (_, center) in candidates.into_iter().take(64) {
+            out.push(AabbCollider {
+                min: center - half,
+                max: center + half,
+                is_object_box: false,
+            });
+        }
+
+        out
+    }
 }
 
 /// Estimates the room floor Y elevation from tracked upward-facing horizontal ARCore planes.
@@ -613,10 +818,58 @@ fn plane_gravity_aligned_axes(plane: &PlaneMarker, cam_pos: Vec3) -> (Vec3, Vec3
     )
 }
 
-/// Builds distance-scaled, gravity-aligned world-space plane patches + world-pinned 3D object badges.
+fn push_wire_box(
+    out: &mut Vec<ScanVertex>,
+    min: Vec3,
+    max: Vec3,
+    top_col: [f32; 4],
+    edge_col: [f32; 4],
+    thick: f32,
+) {
+    // Subtle translucent top cap
+    push_quad(
+        out,
+        Vec3::new(min.x, max.y, min.z),
+        Vec3::new(max.x, max.y, min.z),
+        Vec3::new(max.x, max.y, max.z),
+        Vec3::new(min.x, max.y, max.z),
+        top_col,
+    );
+
+    let c = [
+        Vec3::new(min.x, min.y, min.z),
+        Vec3::new(max.x, min.y, min.z),
+        Vec3::new(max.x, min.y, max.z),
+        Vec3::new(min.x, min.y, max.z),
+        Vec3::new(min.x, max.y, min.z),
+        Vec3::new(max.x, max.y, min.z),
+        Vec3::new(max.x, max.y, max.z),
+        Vec3::new(min.x, max.y, max.z),
+    ];
+    let edges = [
+        (0, 1, Vec3::Y),
+        (1, 2, Vec3::Y),
+        (2, 3, Vec3::Y),
+        (3, 0, Vec3::Y),
+        (4, 5, Vec3::Z),
+        (5, 6, Vec3::X),
+        (6, 7, Vec3::Z),
+        (7, 4, Vec3::X),
+        (0, 4, Vec3::X),
+        (1, 5, Vec3::Z),
+        (2, 6, Vec3::X),
+        (3, 7, Vec3::Z),
+    ];
+    for (i0, i1, perp) in edges {
+        push_strip(out, c[i0], c[i1], perp, thick, edge_col);
+    }
+}
+
+/// Builds distance-scaled, gravity-aligned world-space plane patches, 3D object badges & faint 2.5D volume boxes.
 pub fn build_room_marker_vertices(
     planes: &[PlaneMarker],
     objects: &[WorldObjectMarker],
+    blocks_25d: &[AabbCollider],
     cam_pos: Vec3,
     cam_rot: Quat,
     out: &mut Vec<ScanVertex>,
@@ -728,6 +981,18 @@ pub fn build_room_marker_vertices(
                 tick_col,
             );
         }
+    }
+
+    for block in blocks_25d.iter().take(28) {
+        if out.len() + 80 > MAX_WORLD_VERTICES {
+            break;
+        }
+        let (top_col, edge_col) = if block.is_object_box {
+            ([0.24, 0.94, 0.64, 0.08], [0.24, 0.94, 0.64, 0.34])
+        } else {
+            ([0.25, 0.90, 0.85, 0.12], [0.25, 0.90, 0.85, 0.34])
+        };
+        push_wire_box(out, block.min, block.max, top_col, edge_col, 0.0022);
     }
 }
 
@@ -892,14 +1157,22 @@ impl RoomScannerRenderer {
         gl: &glow::Context,
         planes: &[PlaneMarker],
         objects: &[WorldObjectMarker],
+        blocks_25d: &[AabbCollider],
         cam_pos: Vec3,
         cam_rot: Quat,
     ) {
-        if planes.is_empty() && objects.is_empty() {
+        if planes.is_empty() && objects.is_empty() && blocks_25d.is_empty() {
             self.world_vert_count = 0;
             return;
         }
-        build_room_marker_vertices(planes, objects, cam_pos, cam_rot, &mut self.world_cpu);
+        build_room_marker_vertices(
+            planes,
+            objects,
+            blocks_25d,
+            cam_pos,
+            cam_rot,
+            &mut self.world_cpu,
+        );
         self.world_vert_count = self.world_cpu.len() as i32;
         if self.world_vert_count > 0 {
             unsafe {
@@ -1020,12 +1293,42 @@ mod tests {
             score: 0.82,
         }];
         let mut verts = Vec::new();
-        build_room_marker_vertices(&planes, &objs, Vec3::ZERO, Quat::IDENTITY, &mut verts);
+        build_room_marker_vertices(&planes, &objs, &[], Vec3::ZERO, Quat::IDENTITY, &mut verts);
         assert!(!verts.is_empty());
         assert_eq!(verts.len() % 3, 0);
         assert!(verts.iter().all(|v| v.color[3] <= 0.72));
         // Close wall marker (1.0m) should stay tiny (half-extent <= 0.065m)
         assert!(verts[0].pos[1].abs() <= 0.075);
+    }
+
+    #[test]
+    fn point_cloud_builds_25d_voxels_prunes_noise_and_extrudes_objects() {
+        let mut cache = SpatialMemoryCache::default();
+        let t0 = Instant::now();
+        // Confirmed obstacle cluster (3 high-confidence hits inside cell x:[0.12..0.18], y:[-0.36..-0.30], z:[-1.26..-1.20])
+        let pts_cluster = [
+            0.14, -0.33, -1.22, 0.85,
+            0.15, -0.34, -1.23, 0.80,
+            0.16, -0.32, -1.24, 0.90,
+            // Single transient noisy hit + low confidence hit
+            -0.50, -0.10, -1.40, 0.75,
+            0.00, 0.00, -1.00, 0.15,
+        ];
+        cache.ingest_point_cloud_at(5, &pts_cluster, Vec3::ZERO, t0);
+        assert_eq!(cache.confirmed_voxel_count(), 1);
+
+        // Add detected monitor above table -> extrudes to 2.5D collider
+        let packed_obj = [15.0, 0.0, 0.0, 0.35, 0.35, 0.85];
+        cache.ingest_detected_objects_at(1, &packed_obj, Vec3::ZERO, Quat::IDENTITY, 0.70, 0.55, 2, t0);
+
+        let aabbs = cache.build_25d_colliders(Vec3::ZERO, 2);
+        assert!(aabbs.len() >= 2);
+        assert!(aabbs.iter().any(|a| a.is_object_box));
+        assert!(aabbs.iter().any(|a| !a.is_object_box));
+
+        // After 10s without refresh, transient 1-hit noise prunes while confirmed cluster remains within 35s TTL
+        cache.ingest_point_cloud_at(0, &[], Vec3::ZERO, t0 + Duration::from_secs(10));
+        assert_eq!(cache.confirmed_voxel_count(), 1);
     }
 
     #[test]

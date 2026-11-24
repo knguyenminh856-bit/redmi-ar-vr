@@ -19,12 +19,12 @@
 | Mechanism | Specification |
 | :--- | :--- |
 | **Zero-Copy Camera** | ARCore `CameraConfig` picks `imageSize<=480p` (CPU) + `textureSize>=1080p` (GPU OES `0x8D65`); `DepthMode.DISABLED`; 0x MSAA EGL surface. |
-| **1:1 Angular Scale** | Quad at `2.5m` uses true metric `tan_half_h/v`; `fov_scale` adjusts VR `compute_eye_projection` (`tan(42.5°) / fov_scale`) so 3D planes & camera match 1:1. Per-eye `setDisplayGeometry(width/2, height)` & cutout `ALWAYS` center divider. |
+| **Full-Screen 1:1 Scale** | Cover-fit `compute_eye_projection` (`tan_v = min(cam_tan_v, cam_tan_h / aspect) / (fov_scale * 1.06)`) fills 100% of each eye viewport edge-to-edge at `100%` while locking world-to-camera scale 1:1. |
 | **120Hz Async Timewarp** | `ArSession.update()` throttled to ~32Hz (`31ms`); `onDrawFrame()` runs at 120Hz (`preferredRefreshRate` + `Surface.setFrameRate`) using `ar_rot * (gyro_at_capture.inv() * gyro_latest)`. |
 | **RAM Vision Ring & LUT** | Pre-allocated 2MB 3D YUV->RGBA LUT, 4KB YCbCr skin mask, 4-slot `RwLock` frame ring (`vision_ram.rs`), preloaded direct model buffers, and GPU OpenCL kernel cache. |
 | **Adaptive GPU Hand AI** | `Delegate.GPU` (`GpuOptions` cached) via `ByteBufferImageBuilder` RGBA `320x240`; 3-gear governor (`42ms` active / `85ms` skin-or-motion wake / `240ms` idle + `110ms` render brake). |
-| **Gestures, Combos & Drawing** | 8 single poses + 5 timed combos (`101..105`) + quadratic Bezier dual-layer neon strokes pinned at `0.65m` (`finger_draw.rs`). |
-| **Spatial RAM Room Scan** | Persistent cache (`64` planes @ `45s` TTL, `32` 3D raycast objects @ `10s` TTL); size-filtered Walls vs VerticalObject, gravity-aligned distance-scaled markers, scissored per-eye viewport, `ObjectDetector` CPU `256x192`. |
+| **Gestures, Combos & Drawing** | 8 single poses (`👉 FingerGun` launches physics spheres) + 5 timed combos (`101..105`) + quadratic Bezier neon strokes at `0.65m` (`finger_draw.rs`). |
+| **2.5D Voxels & Physics** | Fuses ARCore planes (`45s` TTL), `5Hz` SLAM `PointCloud` 6cm voxels (`35s` TTL, 2048 max) & raycasted 3D `ObjectDetector` boxes into `AabbCollider`s for 2x sub-stepped 120Hz rigid-body physics (`physics_3d.rs`) with contact shadows & hand slapping. |
 | **OTA Self-Updater** | Fixed `debug-fixed.keystore`, `BuildConfig.GIT_COMMIT_SHA` check vs GitHub Release `latest-apk`, streaming download + `ApkFileProvider` install intent. |
 
 ## 4. JNI Contract (`com.minhkhoi.arvr.NativeBridge`)
@@ -45,8 +45,11 @@
 | `nativeSetRoomScanMode` | `mode: Int` (`0=Off, 1=Floor/Wall, 2=Full`) | `Unit` |
 | `nativeOnArPlanes` | `planeCount: Int, packedPlanes: FloatArray(120)` | `Unit` |
 | `nativeOnDetectedObjects` | `objectCount: Int, packedObjects: FloatArray(36), poseAndTan: FloatArray(9)` | `Unit` |
+| `nativeOnPointCloud` | `pointCount: Int, packedXyzc: FloatArray(2048)` | `Unit` |
+| `nativeSpawnPhysicsBody` | `throwSpeed: Float` | `Unit` |
+| `nativeClearPhysicsBodies` | None | `Unit` |
 | `nativeGetRoomLabels` | `outArr: FloatArray(36)` | `Int` (`0..6`) |
-| `nativeGetPerfMetrics` | `outArr: FloatArray(11)` | `Unit` |
+| `nativeGetPerfMetrics` | `outArr: FloatArray(13)` | `Unit` |
 | `nativeGetRenderFrameMs` | None | `Float` |
 | `nativeIngestCameraImage` | `yBuf, uBuf, vBuf, yLen, uLen, vLen, w, h, strides, rotDeg, ndcBasis` | `Long` (`seq`) |
 | `nativeConvertLatestFrameRgba` | `outRgbaBuf, dstW, dstH, lastSeq, updateMotion, outMeta(19)` | `Long` (`seq`) |

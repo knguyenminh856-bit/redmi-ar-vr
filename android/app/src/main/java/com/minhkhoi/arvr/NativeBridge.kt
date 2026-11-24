@@ -48,6 +48,9 @@ object NativeBridge {
         packedObjects: FloatArray,
         poseAndTan: FloatArray
     )
+    external fun nativeOnPointCloud(pointCount: Int, packedXyzc: FloatArray)
+    external fun nativeSpawnPhysicsBody(throwSpeed: Float)
+    external fun nativeClearPhysicsBodies()
     external fun nativeGetRoomLabels(outArr: FloatArray): Int
     external fun nativeGetPerfMetrics(outArr: FloatArray)
     external fun nativeGetRenderFrameMs(): Float

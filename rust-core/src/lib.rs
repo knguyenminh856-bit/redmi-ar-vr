@@ -2,6 +2,7 @@ pub mod finger_draw;
 pub mod gyro_predict;
 pub mod hand_tracking;
 pub mod passthrough;
+pub mod physics_3d;
 pub mod renderer;
 pub mod room_scanner;
 pub mod scene_3d;
@@ -326,6 +327,8 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeGetPerfMetrics(
         perf.active_planes as f32,
         perf.active_objects as f32,
         perf.cached_planes as f32,
+        perf.voxel_count as f32,
+        perf.physics_bodies as f32,
     ];
     let _ = env.set_float_array_region(&out_arr, 0, &buf);
 }
@@ -573,6 +576,47 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeOnDetectedObjec
     }
     if let Ok(mut state) = input_state().lock() {
         state.on_detected_objects(count, &buf, cam_pos, cam_rot, tan_h, tan_v);
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeOnPointCloud(
+    env: JNIEnv,
+    _class: JClass,
+    point_count: jint,
+    packed_xyzc: JFloatArray,
+) {
+    if point_count <= 0 {
+        return;
+    }
+    let count = (point_count as usize).min(room_scanner::MAX_POINT_CLOUD_PTS);
+    let mut buf = vec![0.0f32; count * 4];
+    if env.get_float_array_region(&packed_xyzc, 0, &mut buf).is_err() {
+        return;
+    }
+    if let Ok(mut state) = input_state().lock() {
+        state.on_point_cloud(count, &buf);
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeSpawnPhysicsBody(
+    _env: JNIEnv,
+    _class: JClass,
+    throw_speed: jfloat,
+) {
+    if let Ok(mut state) = input_state().lock() {
+        state.spawn_physics_from_camera(throw_speed);
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeClearPhysicsBodies(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    if let Ok(mut state) = input_state().lock() {
+        state.clear_physics_bodies();
     }
 }
 
