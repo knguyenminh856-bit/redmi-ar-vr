@@ -2,8 +2,8 @@
 
 | Phase | Task | Status | Notes |
 | :--- | :--- | :--- | :--- |
-| 1. Setup | Update `ARCHITECTURE.md`, `TASKS.md`, `README.md` | [x] | Removed depth occlusion; documented OTA & GPU hands |
-| 2. Rust Core | Update `hand_tracking.rs`, `finger_draw.rs`, `scene_3d.rs`, `renderer.rs`, `lib.rs` (delete `depth_occlusion.rs`) | [x] | 12 unit tests pass |
-| 3. Android Shell | Add `debug-fixed.keystore`, `ApkFileProvider.kt`, `AppUpdater.kt`, GPU `480p` MediaPipe, Quick Bar + HUD | [x] | Verified locally |
-| 4. CI/CD APK | Update `.github/workflows/build-apk.yml` (`fetch-depth: 0` + `BuildCommit`/`BuildNumber`) | [x] | Rolling `latest-apk` release |
-| 5. Verify & Git | Run `cargo test`, `cargo check --target aarch64-linux-android`, `gradlew :app:assembleDebug`, push `main` | [x] | Verified & pushed |
+| 1. Setup | Update `ARCHITECTURE.md`, `TASKS.md`, `README.md`, `.gitignore`, `build.gradle.kts` | [x] | Documented room scanning + wired `efficientdet_lite0.tflite` |
+| 2. Rust Core | Add `room_scanner.rs` + wire `renderer.rs` & `lib.rs` | [x] | 15 unit tests + `aarch64-linux-android` check pass |
+| 3. Android Shell | Add `RoomScannerHelper.kt` (CPU `ObjectDetector`), YUV rewind, ARCore Planes, Stereo Mini-Tags, `🏠 Quét` button | [x] | Compiles cleanly with `:app:assembleDebug` |
+| 4. CI/CD APK | GitHub Actions `build-apk.yml` (`arm64-v8a` `.so` + signed `.apk`) | [x] | Rolling `latest-apk` release |
+| 5. Verify & Git | Verify tests & Gradle build, clean, commit, push `main` | [x] | Triggered Build #5 on `latest-apk` |

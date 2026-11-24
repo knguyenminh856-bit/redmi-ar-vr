@@ -9,6 +9,7 @@
 /android/local.properties
 /android/app/src/main/jniLibs/
 /android/app/src/main/assets/hand_landmarker.task
+/android/app/src/main/assets/efficientdet_lite0.tflite
 
 # Keep Gradle Wrapper JAR tracked in Git
 !android/gradle/wrapper/gradle-wrapper.jar

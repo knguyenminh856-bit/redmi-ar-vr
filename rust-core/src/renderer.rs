@@ -5,6 +5,10 @@ use crate::hand_tracking::{
     FLOATS_PER_LANDMARK, LANDMARKS_PER_HAND, MAX_HANDS,
 };
 use crate::passthrough::{compute_quad_half_extents, PassthroughRenderer, PASSTHROUGH_DIST};
+use crate::room_scanner::{
+    parse_ar_planes, parse_detected_objects, project_room_labels, ObjectMarker, PlaneMarker,
+    ProjectedLabel, RoomScannerRenderer, OBJECT_TIMEOUT_MS, PLANE_TIMEOUT_MS,
+};
 use crate::scene_3d::Scene3D;
 use glam::{Mat4, Quat, Vec3};
 use glow::HasContext;
@@ -20,6 +24,8 @@ pub struct PerfMetrics {
     pub current_gesture: i32,
     pub stroke_vertices: u32,
     pub index_tip_cam: [f32; 3],
+    pub active_planes: u32,
+    pub active_objects: u32,
 }
 
 /// Thread-safe input state updated by Android sensor/camera/UI threads.
@@ -55,6 +61,13 @@ pub struct SharedInputState {
     pub boost_until: Option<Instant>,
     pub palette_idx: u32,
 
+    pub room_scan_mode: i32,
+    pub planes: Vec<PlaneMarker>,
+    pub last_plane_instant: Option<Instant>,
+    pub objects: Vec<ObjectMarker>,
+    pub last_object_instant: Option<Instant>,
+    pub projected_labels: Vec<ProjectedLabel>,
+
     pub perf: PerfMetrics,
 }
 
@@ -84,6 +97,12 @@ impl Default for SharedInputState {
             pull_closer: false,
             boost_until: None,
             palette_idx: 0,
+            room_scan_mode: 2,
+            planes: Vec::new(),
+            last_plane_instant: None,
+            objects: Vec::new(),
+            last_object_instant: None,
+            projected_labels: Vec::new(),
             perf: PerfMetrics::default(),
         }
     }
@@ -161,6 +180,43 @@ impl SharedInputState {
 
     pub fn request_recenter(&mut self) {
         self.recenter_requested = true;
+    }
+
+    pub fn set_room_scan_mode(&mut self, mode: i32) {
+        let clamped = mode.clamp(0, 2);
+        self.room_scan_mode = clamped;
+        if clamped == 0 {
+            self.planes.clear();
+            self.objects.clear();
+            self.projected_labels.clear();
+            self.perf.active_planes = 0;
+            self.perf.active_objects = 0;
+        } else if clamped == 1 {
+            self.objects.clear();
+            self.perf.active_objects = 0;
+        }
+    }
+
+    pub fn on_ar_planes(&mut self, count: usize, packed: &[f32]) {
+        if self.room_scan_mode <= 0 {
+            self.planes.clear();
+            return;
+        }
+        self.planes = parse_ar_planes(count, packed, self.ar_pos.y, self.room_scan_mode);
+        self.last_plane_instant = Some(Instant::now());
+    }
+
+    pub fn on_detected_objects(&mut self, count: usize, packed: &[f32]) {
+        if self.room_scan_mode < 2 {
+            self.objects.clear();
+            return;
+        }
+        self.objects = parse_detected_objects(count, packed, self.room_scan_mode);
+        self.last_object_instant = Some(Instant::now());
+    }
+
+    pub fn set_projected_labels(&mut self, labels: Vec<ProjectedLabel>) {
+        self.projected_labels = labels;
     }
 
     pub fn on_hand_landmarks(&mut self, hand_count: usize, packed: &[f32]) -> i32 {
@@ -300,6 +356,35 @@ impl SharedInputState {
             self.perf.index_tip_cam = [0.0, 0.0, 0.0];
         }
 
+        let planes_fresh = self
+            .last_plane_instant
+            .map(|t| now.duration_since(t).as_millis() <= PLANE_TIMEOUT_MS)
+            .unwrap_or(false);
+        let active_planes = if self.room_scan_mode > 0 && planes_fresh {
+            self.planes.clone()
+        } else {
+            if self.room_scan_mode > 0 && !planes_fresh {
+                self.planes.clear();
+            }
+            Vec::new()
+        };
+
+        let objects_fresh = self
+            .last_object_instant
+            .map(|t| now.duration_since(t).as_millis() <= OBJECT_TIMEOUT_MS)
+            .unwrap_or(false);
+        let active_objects = if self.room_scan_mode >= 2 && objects_fresh {
+            self.objects.clone()
+        } else {
+            if !objects_fresh {
+                self.objects.clear();
+            }
+            Vec::new()
+        };
+
+        self.perf.active_planes = active_planes.len() as u32;
+        self.perf.active_objects = active_objects.len() as u32;
+
         let boost_factor = match self.boost_until {
             Some(until) if until > now => {
                 (until.duration_since(now).as_secs_f32() / 3.5).clamp(0.0, 1.0)
@@ -328,6 +413,8 @@ impl SharedInputState {
             palette_idx: self.palette_idx,
             draw_upload_gen: self.finger_canvas.upload_generation,
             draw_verts: self.finger_canvas.verts.clone(),
+            room_planes: active_planes,
+            room_objects: active_objects,
         }
     }
 }
@@ -350,6 +437,8 @@ pub struct FrameSnapshot {
     pub palette_idx: u32,
     pub draw_upload_gen: u64,
     pub draw_verts: Vec<DrawVertex>,
+    pub room_planes: Vec<PlaneMarker>,
+    pub room_objects: Vec<ObjectMarker>,
 }
 
 pub fn compute_yaw_aligned_anchor(head_pos: Vec3, head_rot: Quat) -> Mat4 {
@@ -383,6 +472,7 @@ pub struct GlRenderer {
     scene: Scene3D,
     hand_overlay: HandOverlayRenderer,
     finger_draw: FingerDrawRenderer,
+    room_scanner: RoomScannerRenderer,
     pub gpu_renderer_name: String,
     width: i32,
     height: i32,
@@ -398,12 +488,14 @@ impl GlRenderer {
         let scene = Scene3D::new(&gl)?;
         let hand_overlay = HandOverlayRenderer::new(&gl)?;
         let finger_draw = FingerDrawRenderer::new(&gl)?;
+        let room_scanner = RoomScannerRenderer::new(&gl)?;
         Ok(Self {
             gl,
             passthrough,
             scene,
             hand_overlay,
             finger_draw,
+            room_scanner,
             gpu_renderer_name,
             width: 1200,
             height: 1080,
@@ -422,7 +514,7 @@ impl GlRenderer {
         self.height = height.max(2);
     }
 
-    pub fn draw_frame(&mut self, snap: &FrameSnapshot) -> (f32, f32) {
+    pub fn draw_frame(&mut self, snap: &FrameSnapshot) -> (f32, f32, Vec<ProjectedLabel>) {
         let now = Instant::now();
         if let Some(prev) = self.last_frame_time {
             let dt_ms = (now.duration_since(prev).as_secs_f32() * 1000.0).clamp(1.0, 200.0);
@@ -458,6 +550,13 @@ impl GlRenderer {
             .update_hands(&self.gl, &snap.hands, quad_hw, quad_hh);
         self.finger_draw
             .sync_if_dirty(&self.gl, &snap.draw_verts, snap.draw_upload_gen);
+        self.room_scanner.update(
+            &self.gl,
+            &snap.room_planes,
+            &snap.room_objects,
+            quad_hw,
+            quad_hh,
+        );
 
         let proj_eye = Mat4::perspective_rh_gl(85.0_f32.to_radians(), eye_aspect, 0.05, 50.0);
         let (left_view, right_view) =
@@ -474,6 +573,11 @@ impl GlRenderer {
             snap.boost_factor,
         );
 
+        let left_vp = proj_eye * left_view;
+        let left_pass_mvp = left_vp * t_cam_capture;
+        let right_vp = proj_eye * right_view;
+        let right_pass_mvp = right_vp * t_cam_capture;
+
         unsafe {
             self.gl.viewport(0, 0, w, h);
             self.gl.clear_color(0.0, 0.0, 0.0, 1.0);
@@ -482,8 +586,6 @@ impl GlRenderer {
 
             // Left eye viewport
             self.gl.viewport(0, 0, half_w, h);
-            let left_vp = proj_eye * left_view;
-            let left_pass_mvp = left_vp * t_cam_capture;
             self.passthrough
                 .draw(&self.gl, &left_pass_mvp, snap.has_camera_frame);
             self.scene.draw(
@@ -493,13 +595,14 @@ impl GlRenderer {
                 &octa_model,
                 snap.palette_idx,
             );
+            self.room_scanner.draw_world_planes(&self.gl, &left_vp);
             self.finger_draw.draw(&self.gl, &left_vp);
+            self.room_scanner
+                .draw_object_badges(&self.gl, &left_pass_mvp);
             self.hand_overlay.draw(&self.gl, &left_pass_mvp);
 
             // Right eye viewport
             self.gl.viewport(half_w, 0, right_w, h);
-            let right_vp = proj_eye * right_view;
-            let right_pass_mvp = right_vp * t_cam_capture;
             self.passthrough
                 .draw(&self.gl, &right_pass_mvp, snap.has_camera_frame);
             self.scene.draw(
@@ -509,7 +612,10 @@ impl GlRenderer {
                 &octa_model,
                 snap.palette_idx,
             );
+            self.room_scanner.draw_world_planes(&self.gl, &right_vp);
             self.finger_draw.draw(&self.gl, &right_vp);
+            self.room_scanner
+                .draw_object_badges(&self.gl, &right_pass_mvp);
             self.hand_overlay.draw(&self.gl, &right_pass_mvp);
 
             // Subtle 2px VR headset center ridge alignment guide
@@ -520,7 +626,21 @@ impl GlRenderer {
             self.gl.disable(glow::SCISSOR_TEST);
         }
 
-        (fps, self.ema_frame_ms)
+        let labels = if snap.room_planes.is_empty() && snap.room_objects.is_empty() {
+            Vec::new()
+        } else {
+            project_room_labels(
+                &snap.room_planes,
+                &snap.room_objects,
+                &t_cam_capture,
+                quad_hw,
+                quad_hh,
+                &left_vp,
+                &right_vp,
+            )
+        };
+
+        (fps, self.ema_frame_ms, labels)
     }
 
     pub fn destroy(&self) {
@@ -528,6 +648,7 @@ impl GlRenderer {
         self.scene.destroy(&self.gl);
         self.hand_overlay.destroy(&self.gl);
         self.finger_draw.destroy(&self.gl);
+        self.room_scanner.destroy(&self.gl);
     }
 }
 

@@ -123,6 +123,9 @@ class HandTrackerHelper(
             val yBuf = planes[0].buffer
             val uBuf = planes[1].buffer
             val vBuf = planes[2].buffer
+            yBuf.position(0)
+            uBuf.position(0)
+            vBuf.position(0)
 
             val yLen = yBuf.remaining()
             val uLen = uBuf.remaining()

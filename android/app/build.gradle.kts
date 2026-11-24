@@ -81,7 +81,7 @@ android {
     }
 
     androidResources {
-        noCompress += "task"
+        noCompress += listOf("task", "tflite")
     }
 }
 
@@ -106,6 +106,22 @@ val downloadHandLandmarkerModel by tasks.registering {
     }
 }
 
+val downloadObjectDetectorModel by tasks.registering {
+    val modelFile = layout.projectDirectory.file("src/main/assets/efficientdet_lite0.tflite").asFile
+    outputs.file(modelFile)
+    doLast {
+        if (!modelFile.exists() || modelFile.length() < 1_000_000L) {
+            modelFile.parentFile.mkdirs()
+            val url = URI(
+                "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/int8/1/efficientdet_lite0.tflite"
+            ).toURL()
+            url.openStream().use { input ->
+                modelFile.outputStream().use { output -> input.copyTo(output) }
+            }
+        }
+    }
+}
+
 tasks.named("preBuild") {
-    dependsOn(downloadHandLandmarkerModel)
+    dependsOn(downloadHandLandmarkerModel, downloadObjectDetectorModel)
 }

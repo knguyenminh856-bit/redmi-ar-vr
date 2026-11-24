@@ -39,6 +39,10 @@ object NativeBridge {
     external fun nativeClearDrawings()
     external fun nativeRecenter()
     external fun nativeOnHandLandmarks(handCount: Int, packedData: FloatArray): Int
+    external fun nativeSetRoomScanMode(mode: Int)
+    external fun nativeOnArPlanes(planeCount: Int, packedPlanes: FloatArray)
+    external fun nativeOnDetectedObjects(objectCount: Int, packedObjects: FloatArray)
+    external fun nativeGetRoomLabels(outArr: FloatArray): Int
     external fun nativeGetPerfMetrics(outArr: FloatArray)
     external fun nativeDrawFrame()
 }

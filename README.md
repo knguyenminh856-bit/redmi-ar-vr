@@ -16,7 +16,10 @@
 4. **Tự động cập nhật trong app (`🔄 Check cập nhật` ➔ `⬇ Cập nhật`):**
    - App tự kiểm tra bản build mới nhất trên GitHub Releases (`latest-apk`), hiển thị nút xanh **`⬇ Cập nhật`** khi có bản mới, tải trực tiếp với % tiến độ và mở trình cài đặt đè ngay không mất dữ liệu.
 5. **Bảng thông số chi tiết của máy (`📊 Thông số`):**
-   - Hiển thị đồng bộ 2 mắt: phiên bản build, tên máy/SoC, GPU OpenGL, tần số màn hình, Render FPS/ms, AI Tay FPS/ms, tọa độ đầu ngón trỏ `(X, Y, Z)`, Pin `%`, Nhiệt độ `°C`, RAM `MB`.
+   - Hiển thị đồng bộ 2 mắt: phiên bản build, tên máy/SoC, GPU OpenGL, tần số màn hình, Render FPS/ms, AI Tay FPS/ms, số mặt phẳng & đồ vật đang quét, tọa độ đầu ngón trỏ `(X, Y, Z)`, Pin `%`, Nhiệt độ `°C`, RAM `MB`.
+6. **Nhận diện Sàn, Tường, Mặt bàn & Đồ vật (`🏠 Quét: ĐẦY ĐỦ / SÀN/TƯỜNG / TẮT`):**
+   - **ARCore Spatial Planes (4Hz):** Tự phân loại **Sàn**, **Tường**, **Mặt bàn**, **Bề mặt ghế**, **Trần nhà** và vẽ các mảng hình học mờ nhỏ (`alpha ~ 0.18`) bám đúng mặt phẳng thật.
+   - **Nhận diện đồ vật CPU (`EfficientDet-Lite0` INT8 @ ~2.6Hz):** Nhận diện bàn, ghế, sofa, giường, màn hình/TV, chai/cốc, cây xanh... kèm khung góc mờ nhỏ + nhãn nổi 2 mắt nhỏ gọn, không làm tụt FPS tay hay xuyên thấu.
 
 ---
 
