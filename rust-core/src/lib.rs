@@ -4,6 +4,7 @@ pub mod hand_tracking;
 pub mod passthrough;
 pub mod physics_3d;
 pub mod renderer;
+pub mod room_persistence;
 pub mod room_scanner;
 pub mod scene_3d;
 pub mod spatial_mesh;
@@ -11,8 +12,8 @@ pub mod vision_ram;
 
 use glam::{Quat, Vec3};
 use hand_tracking::{FLOATS_PER_LANDMARK, LANDMARKS_PER_HAND, MAX_HANDS};
-use jni::objects::{JByteBuffer, JClass, JFloatArray, JIntArray};
-use jni::sys::{jboolean, jfloat, jint, jlong, jstring, JNI_TRUE};
+use jni::objects::{JByteArray, JByteBuffer, JClass, JFloatArray, JIntArray};
+use jni::sys::{jboolean, jbyteArray, jfloat, jint, jlong, jstring, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
 use renderer::{GlRenderer, SharedInputState};
 use room_scanner::{FLOATS_PER_LABEL, FLOATS_PER_OBJECT, FLOATS_PER_PLANE, MAX_LABELS};
@@ -336,11 +337,14 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeGetPerfMetrics(
         perf.reticle_dist,
         perf.mesh_chunks as f32,
         perf.mesh_triangles as f32,
+        perf.keyframe_count as f32,
+        perf.reloc_status as f32,
+        perf.reloc_best_pct as f32,
     ];
     let copy_len = env
         .get_array_length(&out_arr)
         .map(|n| (n.max(0) as usize).min(buf.len()))
-        .unwrap_or(16);
+        .unwrap_or(18);
     let _ = env.set_float_array_region(&out_arr, 0, &buf[..copy_len]);
 }
 
@@ -783,6 +787,100 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeGetRoomLabels(
     }
     let _ = env.set_float_array_region(&out_arr, 0, &buf[..count * FLOATS_PER_LABEL]);
     count as jint
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeTickRelocalizer(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jint {
+    if let Ok(mut state) = input_state().lock() {
+        state.poll_visual_keyframes_and_reloc()
+    } else {
+        0
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeSerializeRoom(
+    env: JNIEnv,
+    _class: JClass,
+) -> jbyteArray {
+    let bytes = {
+        let Ok(state) = input_state().lock() else {
+            return std::ptr::null_mut();
+        };
+        state.serialize_current_room()
+    };
+    match env.byte_array_from_slice(&bytes) {
+        Ok(arr) => arr.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeLoadRoomBytes(
+    env: JNIEnv,
+    _class: JClass,
+    data: JByteArray,
+    out_counts: JIntArray,
+) -> jboolean {
+    let Ok(bytes) = env.convert_byte_array(data) else {
+        return JNI_FALSE;
+    };
+    let result = if let Ok(mut state) = input_state().lock() {
+        state.load_room_bytes(&bytes)
+    } else {
+        return JNI_FALSE;
+    };
+    match result {
+        Ok((planes, voxels, kfs)) => {
+            let counts = [planes as i32, voxels as i32, kfs as i32];
+            let _ = env.set_int_array_region(&out_counts, 0, &counts);
+            JNI_TRUE
+        }
+        Err(_) => JNI_FALSE,
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeForceRelocalizeNow(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jboolean {
+    let locked = if let Ok(mut state) = input_state().lock() {
+        state.force_relocalize_now()
+    } else {
+        false
+    };
+    if locked { JNI_TRUE } else { JNI_FALSE }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeCancelRelocalize(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    if let Ok(mut state) = input_state().lock() {
+        state.cancel_pending_relocalize();
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeExportRoomObj(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let obj_text = {
+        let Ok(mut state) = input_state().lock() else {
+            return std::ptr::null_mut();
+        };
+        state.export_current_room_obj()
+    };
+    match env.new_string(obj_text) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
 }
 
 #[no_mangle]

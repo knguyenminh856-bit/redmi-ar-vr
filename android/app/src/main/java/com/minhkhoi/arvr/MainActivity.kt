@@ -45,6 +45,7 @@ import android.view.WindowManager
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
@@ -111,6 +112,7 @@ class MainActivity : Activity(), SensorEventListener {
 
     private lateinit var handTracker: HandTrackerHelper
     private lateinit var roomScanner: RoomScannerHelper
+    private lateinit var roomStorage: RoomMapStorage
     private lateinit var appUpdater: AppUpdater
     private val imgBasis = floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f)
     private val ndcBasis = FloatArray(6)
@@ -189,6 +191,9 @@ class MainActivity : Activity(), SensorEventListener {
     private val reticleInfoBuf = FloatArray(3)
     private var lastPlaneExtractNs = 0L
     private var lastPointCloudNs = 0L
+    private var lastRelocIngestNs = 0L
+    @Volatile
+    private var relocPending = false
     private var roomLabelRunnable: Runnable? = null
     private lateinit var leftTelemetryCard: TextView
     private lateinit var rightTelemetryCard: TextView
@@ -199,7 +204,12 @@ class MainActivity : Activity(), SensorEventListener {
     private lateinit var checkUpdateBtn: Button
     private lateinit var installUpdateBtn: Button
     private lateinit var telemetryToggleBtn: Button
-    private val metricsBuf = FloatArray(18)
+    private lateinit var roomPanelLayout: LinearLayout
+    private lateinit var roomStatusText: TextView
+    private lateinit var roomListContainer: LinearLayout
+    private lateinit var relocBar: LinearLayout
+    private lateinit var relocStatusLabel: TextView
+    private val metricsBuf = FloatArray(21)
     private var cachedGpuName = ""
     private var telemetryRunnable: Runnable? = null
 
@@ -211,6 +221,7 @@ class MainActivity : Activity(), SensorEventListener {
         }
         handTracker.setMode(handMode)
         roomScanner = RoomScannerHelper(this)
+        roomStorage = RoomMapStorage(this, mainHandler)
         appUpdater = AppUpdater(mainHandler)
 
         loadCalibration()
@@ -255,6 +266,7 @@ class MainActivity : Activity(), SensorEventListener {
 
         addStereoHudAndPopupOverlay(root)
         addTopControlBar(root)
+        addRoomManagerOverlay(root)
         addCalibrationOverlay(root)
         setContentView(root)
         applyImmersiveFullscreen()
@@ -550,6 +562,9 @@ class MainActivity : Activity(), SensorEventListener {
         roomScanToggleBtn = makeQuickButton(roomScanLabel(roomScanMode)) {
             cycleRoomScanMode(showPopup = true)
         }
+        val roomMgrBtn = makeQuickButton("\uD83D\uDCBE Phòng", fillColor = Color.argb(195, 36, 62, 110)) {
+            toggleRoomManagerPanel()
+        }
         eyeModeBtn = makeQuickButton(if (stereoMode) "\uD83E\uDD7D 2 Mắt" else "\uD83D\uDC41 1 Mắt") {
             toggleStereoMode(showPopup = true)
         }
@@ -576,6 +591,7 @@ class MainActivity : Activity(), SensorEventListener {
             toggleTelemetryHud()
         }
         val gearBtn = makeQuickButton("\u2699") {
+            roomPanelLayout.visibility = View.GONE
             panelLayout.visibility =
                 if (panelLayout.visibility == View.VISIBLE) View.GONE else View.VISIBLE
         }
@@ -584,10 +600,11 @@ class MainActivity : Activity(), SensorEventListener {
             LinearLayout.LayoutParams.WRAP_CONTENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
         ).apply {
-            marginStart = dp(3f)
+            marginStart = dp(2.5f)
         }
 
         bar.addView(roomScanToggleBtn, itemParams)
+        bar.addView(roomMgrBtn, itemParams)
         bar.addView(eyeModeBtn, itemParams)
         bar.addView(clearBtn, itemParams)
         bar.addView(handModeBtn, itemParams)
@@ -840,6 +857,8 @@ class MainActivity : Activity(), SensorEventListener {
             reticleHitKind = 0
             reticleSurfaceKind = 0
             reticleDistanceM = 0f
+            relocPending = false
+            relocBar.visibility = View.GONE
         }
         updateArPlaneFindingMode()
 
@@ -910,10 +929,17 @@ class MainActivity : Activity(), SensorEventListener {
         val sk = reticleSurfaceKind
         val dist = reticleDistanceM
         var meshPrefix = ""
-        if (roomScanMode == 4) {
+        if (roomScanMode == 4 || relocPending) {
             NativeBridge.nativeGetPerfMetrics(metricsBuf)
-            val triCount = metricsBuf[17].toInt()
-            meshPrefix = "\uD83D\uDD3A ${triCount}\u25B3 \u00B7 "
+            if (roomScanMode == 4) {
+                val triCount = metricsBuf[17].toInt()
+                meshPrefix = "\uD83D\uDD3A ${triCount}\u25B3 \u00B7 "
+            }
+            if (relocPending) {
+                val bestPct = metricsBuf[20].toInt()
+                relocStatusLabel.text = "\u23F3 Tự khớp phòng (${bestPct}%) — lia quanh phòng hoặc bấm:"
+                relocBar.visibility = View.VISIBLE
+            }
         }
         val (text, strokeCol) = if (hk > 0 && dist > 0.05f) {
             val sName = surfaceShortName(sk)
@@ -1086,6 +1112,9 @@ class MainActivity : Activity(), SensorEventListener {
         val hitDist = metricsBuf[15]
         val meshChunks = metricsBuf[16].toInt()
         val meshTris = metricsBuf[17].toInt()
+        val kfCount = metricsBuf[18].toInt()
+        val relocSt = metricsBuf[19].toInt()
+        val relocPct = metricsBuf[20].toInt()
 
         val batIntent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
         val level = batIntent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
@@ -1146,12 +1175,19 @@ class MainActivity : Activity(), SensorEventListener {
             "Chưa khóa"
         }
 
+        val relocTag = when (relocSt) {
+            1 -> "Khớp:${relocPct}%"
+            2 -> "Tự khớp OK"
+            3 -> "Khớp tay OK"
+            else -> "Mốc:${kfCount}/8"
+        }
+
         val summary = StringBuilder()
             .append("v${BuildConfig.VERSION_NAME} ($shortSha) | $viewLabel | ${batPct}% ${String.format(Locale.US, "%.1f", tempC)}°C | ${totalRamMb}MB\n")
             .append(String.format(Locale.US, "GPU: %d fps (%.1fms) | %s\n", renderFps, frameMs, handAiText))
             .append("Track: $trackMode | Tâm: $reticleSummary | Vật lý: $physBodies\n")
-            .append("3D: $cachedPlanes mặt gộp | $meshChunks chunk ($voxelCount ô) | ${meshTris}\u25B3 | $objScanText\n")
-            .append("Tay ($activeHands): $gestureName | Vẽ: ${strokeSegs} nét | Trỏ: $tipText")
+            .append("3D: $cachedPlanes mặt gộp | $meshChunks chunk ($voxelCount ô) | ${meshTris}\u25B3 | $relocTag\n")
+            .append("Tay ($activeHands): $gestureName | Vẽ: ${strokeSegs} nét | $objScanText")
             .toString()
 
         leftTelemetryCard.text = summary
@@ -1214,6 +1250,274 @@ class MainActivity : Activity(), SensorEventListener {
         }
         hidePopupRunnable = hideTask
         mainHandler.postDelayed(hideTask, durationMs)
+    }
+
+    private fun addRoomManagerOverlay(root: FrameLayout) {
+        // Floating bottom-left relocalization control bar (visible only while aligning a loaded room)
+        val relocBg = GradientDrawable().apply {
+            cornerRadius = 22f
+            setColor(Color.argb(220, 20, 26, 40))
+            setStroke(2, Color.parseColor("#FFB300"))
+        }
+        relocBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = relocBg
+            setPadding(dp(8f), dp(5f), dp(8f), dp(5f))
+            visibility = View.GONE
+        }
+        relocStatusLabel = TextView(this).apply {
+            setTextColor(Color.parseColor("#FFE082"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 9.5f)
+            typeface = Typeface.DEFAULT_BOLD
+            text = "\u23F3 Tự khớp phòng..."
+        }
+        val lockNowBtn = makeQuickButton("\uD83D\uDCCD Khớp ngay", fillColor = Color.argb(230, 217, 119, 6)) {
+            val ok = NativeBridge.nativeForceRelocalizeNow()
+            relocPending = false
+            relocBar.visibility = View.GONE
+            if (ok) {
+                showStereoBanner("\uD83D\uDCCD  Đã khớp phòng 4-DoF — tiếp tục cập nhật 3D realtime!", "#00E676", 2200L)
+            }
+        }
+        val cancelRelocBtn = makeQuickButton("\u2716", fillColor = Color.argb(190, 90, 35, 35)) {
+            NativeBridge.nativeCancelRelocalize()
+            relocPending = false
+            relocBar.visibility = View.GONE
+            showStereoBanner("Đã hủy khớp phòng cũ", "#FFAB40", 1300L)
+        }
+        val rItemLp = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { marginStart = dp(6f) }
+        relocBar.addView(relocStatusLabel)
+        relocBar.addView(lockNowBtn, rItemLp)
+        relocBar.addView(cancelRelocBtn, rItemLp)
+
+        root.addView(
+            relocBar,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM or Gravity.START
+            ).apply {
+                bottomMargin = dp(10f)
+                marginStart = dp(10f)
+            }
+        )
+
+        // Centered Room Manager Modal Panel
+        val panelBg = GradientDrawable().apply {
+            cornerRadius = 24f
+            setColor(Color.argb(238, 14, 18, 28))
+            setStroke(2, Color.argb(180, 46, 230, 200))
+        }
+        roomPanelLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            background = panelBg
+            setPadding(dp(14f), dp(12f), dp(14f), dp(12f))
+        }
+
+        val title = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
+            typeface = Typeface.DEFAULT_BOLD
+            text = "\uD83D\uDCBE Bản đồ Phòng 3D (.arroom & .obj)"
+        }
+        roomStatusText = TextView(this).apply {
+            setTextColor(Color.parseColor("#B2EBF2"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+            setPadding(0, dp(3f), 0, dp(8f))
+            text = "Đang tải..."
+        }
+
+        val actionRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val saveNewBtn = makeQuickButton("\uD83D\uDCBE Lưu phòng mới", fillColor = Color.argb(225, 14, 138, 108)) {
+            val autoName = roomStorage.nextAutoRoomName()
+            roomStatusText.text = "Đang nén & lưu $autoName.arroom..."
+            roomStorage.saveCurrentRoom(autoName) { res ->
+                res.onSuccess { info ->
+                    showStereoBanner(
+                        "\uD83D\uDCBE  Đã lưu ${info.name}.arroom (${info.sizeKb} KB)",
+                        "#00E676",
+                        2000L
+                    )
+                    refreshSavedRoomsList()
+                }.onFailure { err ->
+                    showStereoBanner("\u26A0\uFE0F  ${err.message}", "#FF7043", 2200L)
+                    refreshSavedRoomsList()
+                }
+            }
+        }
+        val exportObjBtn = makeQuickButton("\uD83D\uDCE4 Xuất .OBJ", fillColor = Color.argb(225, 42, 92, 165)) {
+            val baseName = "phong_${System.currentTimeMillis() / 1000L}"
+            roomStatusText.text = "Đang xuất $baseName.obj..."
+            roomStorage.exportCurrentRoomObj(baseName) { res ->
+                res.onSuccess { file ->
+                    val kb = ((file.length() + 1023L) / 1024L).coerceAtLeast(1L)
+                    showStereoBanner("\uD83D\uDCE4  Đã xuất ${file.name} (${kb} KB)", "#40C4FF", 2400L)
+                    refreshSavedRoomsList()
+                }.onFailure { err ->
+                    showStereoBanner("\u26A0\uFE0F  ${err.message}", "#FF7043", 2200L)
+                    refreshSavedRoomsList()
+                }
+            }
+        }
+        val closeBtn = makeQuickButton("\u2716 Đóng", fillColor = Color.argb(200, 80, 35, 40)) {
+            roomPanelLayout.visibility = View.GONE
+        }
+        val aLp = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { marginEnd = dp(6f) }
+        actionRow.addView(saveNewBtn, aLp)
+        actionRow.addView(exportObjBtn, aLp)
+        actionRow.addView(closeBtn)
+
+        roomListContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(6f), 0, dp(2f))
+        }
+        val scroll = ScrollView(this).apply {
+            addView(roomListContainer)
+        }
+        val scrollLp = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            dp(150f)
+        ).apply { topMargin = dp(6f) }
+
+        val pathHint = TextView(this).apply {
+            setTextColor(Color.parseColor("#90A4AE"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 8.5f)
+            setPadding(0, dp(4f), 0, 0)
+            text = "Thư mục lưu: .../Android/data/${packageName}/files/rooms/"
+        }
+
+        roomPanelLayout.addView(title)
+        roomPanelLayout.addView(roomStatusText)
+        roomPanelLayout.addView(actionRow)
+        roomPanelLayout.addView(scroll, scrollLp)
+        roomPanelLayout.addView(pathHint)
+
+        root.addView(
+            roomPanelLayout,
+            FrameLayout.LayoutParams(
+                dp(430f),
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER
+            )
+        )
+    }
+
+    private fun toggleRoomManagerPanel() {
+        panelLayout.visibility = View.GONE
+        if (roomPanelLayout.visibility == View.VISIBLE) {
+            roomPanelLayout.visibility = View.GONE
+        } else {
+            roomPanelLayout.visibility = View.VISIBLE
+            refreshSavedRoomsList()
+        }
+    }
+
+    private fun refreshSavedRoomsList() {
+        NativeBridge.nativeGetPerfMetrics(metricsBuf)
+        val planes = metricsBuf[10].toInt()
+        val chunks = metricsBuf[16].toInt()
+        val kfs = metricsBuf[18].toInt()
+        roomStatusText.text = "Hiện tại: $planes mặt phẳng gộp | $chunks chunk 3D | $kfs/8 mốc ảnh định vị"
+
+        roomStorage.listRooms { rooms ->
+            roomListContainer.removeAllViews()
+            if (rooms.isEmpty()) {
+                val empty = TextView(this).apply {
+                    setTextColor(Color.LTGRAY)
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+                    setPadding(dp(4f), dp(12f), dp(4f), dp(12f))
+                    text = "Chưa có phòng nào được lưu. Quét quanh phòng rồi bấm [💾 Lưu phòng mới]."
+                }
+                roomListContainer.addView(empty)
+                return@listRooms
+            }
+
+            for (info in rooms) {
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(dp(6f), dp(4f), dp(6f), dp(4f))
+                    setBackgroundColor(Color.argb(95, 255, 255, 255))
+                }
+                val label = TextView(this).apply {
+                    setTextColor(Color.WHITE)
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+                    text = "${info.name}  (${info.sizeKb} KB · ${info.dateLabel})"
+                }
+                val labelLp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+
+                val loadBtn = makeQuickButton("\uD83D\uDCC2 Nạp", fillColor = Color.argb(215, 20, 120, 150)) {
+                    roomStorage.loadRoom(info.file) { res ->
+                        res.onSuccess { (p, v, k) ->
+                            roomPanelLayout.visibility = View.GONE
+                            if (roomScanMode == 0) {
+                                roomScanMode = 4
+                                roomScanToggleBtn.text = roomScanLabel(roomScanMode)
+                                NativeBridge.nativeSetRoomScanMode(roomScanMode)
+                                updateArPlaneFindingMode()
+                                startRoomLabelLoop()
+                            }
+                            if (k > 0) {
+                                relocPending = true
+                                relocStatusLabel.text = "\u23F3 Đang tự khớp ${info.name} ($p mặt, $v ô)..."
+                                relocBar.visibility = View.VISIBLE
+                                showStereoBanner(
+                                    "\uD83D\uDCC2  Đã nạp ${info.name}: lia quanh phòng để tự khớp hoặc bấm [📍 Khớp ngay]",
+                                    "#FFB300",
+                                    2600L
+                                )
+                            } else {
+                                NativeBridge.nativeForceRelocalizeNow()
+                                relocPending = false
+                                relocBar.visibility = View.GONE
+                                showStereoBanner("\uD83D\uDCCD  Đã nạp & khớp ${info.name} ($p mặt)", "#00E676", 2000L)
+                            }
+                        }.onFailure { err ->
+                            showStereoBanner("\u26A0\uFE0F  ${err.message}", "#FF5252", 2200L)
+                        }
+                    }
+                }
+                val overwriteBtn = makeQuickButton("\uD83D\uDCBE Đè", fillColor = Color.argb(200, 18, 110, 82)) {
+                    roomStorage.saveCurrentRoom(info.name) { res ->
+                        res.onSuccess { updated ->
+                            showStereoBanner("\uD83D\uDCBE  Đã cập nhật ${updated.name}.arroom (${updated.sizeKb} KB)", "#00E676", 1800L)
+                            refreshSavedRoomsList()
+                        }.onFailure { err ->
+                            showStereoBanner("\u26A0\uFE0F  ${err.message}", "#FF7043", 2000L)
+                        }
+                    }
+                }
+                val delBtn = makeQuickButton("\uD83D\uDDD1", fillColor = Color.argb(180, 110, 35, 35)) {
+                    roomStorage.deleteRoom(info.file) { refreshSavedRoomsList() }
+                }
+                val bLp = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { marginStart = dp(4f) }
+
+                row.addView(label, labelLp)
+                row.addView(loadBtn, bLp)
+                row.addView(overwriteBtn, bLp)
+                row.addView(delBtn, bLp)
+
+                val rowLp = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { bottomMargin = dp(4f) }
+                roomListContainer.addView(row, rowLp)
+            }
+        }
     }
 
     private fun addCalibrationOverlay(root: FrameLayout) {
@@ -1347,6 +1651,7 @@ class MainActivity : Activity(), SensorEventListener {
     override fun onDestroy() {
         handTracker.close()
         roomScanner.close()
+        roomStorage.close()
         appUpdater.close()
         synchronized(sessionLock) {
             arSession?.close()
@@ -1999,10 +2304,12 @@ class MainActivity : Activity(), SensorEventListener {
                                     }
                                 }
 
-                                // Ingest single 480p YUV frame into Rust 4-slot RAM ring (<0.08ms), then wake workers
+                                // Ingest single 480p YUV frame into Rust 4-slot RAM ring (<0.08ms), then wake workers / relocalizer
                                 val wantHand = handMode > 0 && !handTracker.isBusy.get()
                                 val wantRoom = roomScanMode == 2 && !roomScanner.isBusy.get()
-                                if (wantHand || wantRoom) {
+                                val relocIntervalNs = if (relocPending) 250_000_000L else 1_000_000_000L
+                                val wantReloc = roomScanMode > 0 && valid && (nowNs - lastRelocIngestNs >= relocIntervalNs)
+                                if (wantHand || wantRoom || wantReloc) {
                                     var ingestedSeq = 0L
                                     try {
                                         frame.transformCoordinates2d(
@@ -2023,6 +2330,24 @@ class MainActivity : Activity(), SensorEventListener {
                                     if (ingestedSeq > 0L) {
                                         if (wantHand) handTracker.notifyFrameAvailable()
                                         if (wantRoom) roomScanner.notifyFrameAvailable()
+                                        if (wantReloc) {
+                                            lastRelocIngestNs = nowNs
+                                            val rStatus = NativeBridge.nativeTickRelocalizer()
+                                            if (relocPending && rStatus == 2) {
+                                                relocPending = false
+                                                mainHandler.post {
+                                                    relocBar.visibility = View.GONE
+                                                    NativeBridge.nativeGetPerfMetrics(metricsBuf)
+                                                    val pct = metricsBuf[20].toInt()
+                                                    showStereoBanner(
+                                                        "\u2705  Đã tự khớp phòng 3D (${pct}%) — tiếp tục cập nhật realtime!",
+                                                        "#00E676",
+                                                        2400L,
+                                                        strokeWidth = 4
+                                                    )
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }

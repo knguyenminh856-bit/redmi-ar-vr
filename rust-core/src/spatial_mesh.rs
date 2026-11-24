@@ -1033,6 +1033,113 @@ impl SpatialMeshMap {
 
         (active_chunks, (out.len() / 3) as u32)
     }
+
+    /// Exports all solid voxels grouped by chunk coordinate as compact `(local_idx, weight)` pairs.
+    pub fn export_solid_chunks(&self) -> Vec<((i32, i32, i32), Vec<(u16, u8)>)> {
+        let mut out = Vec::new();
+        for (&ckey, chunk) in &self.chunks {
+            if chunk.solid_count == 0 {
+                continue;
+            }
+            let mut entries = Vec::with_capacity(chunk.solid_count as usize);
+            for idx in 0..CHUNK_VOLUME {
+                if chunk.solid_mask[idx] {
+                    entries.push((idx as u16, chunk.cells[idx]));
+                }
+            }
+            if !entries.is_empty() {
+                out.push((ckey, entries));
+            }
+        }
+        out
+    }
+
+    /// Transforms saved planes and voxels by a 4-DoF alignment `(q_align, t_align)` and merges them
+    /// cleanly into the live canonical map so old geometry and new real-time observations coexist.
+    pub fn import_and_merge_transformed(
+        &mut self,
+        saved_planes: &[CanonicalPlane],
+        saved_voxels_world: &[(Vec3, u8)],
+        q_align: Quat,
+        t_align: Vec3,
+        cam_y: f32,
+    ) {
+        let raw_planes: Vec<RawArPlane> = saved_planes
+            .iter()
+            .map(|p| RawArPlane {
+                raw_type: p.raw_type,
+                pos: q_align * p.pos + t_align,
+                rot: (q_align * p.rot).normalize(),
+                extent_x: p.extent_x,
+                extent_z: p.extent_z,
+                polygon_xz: p.polygon_xz.clone(),
+            })
+            .collect();
+        self.ingest_ar_plane_polygons(&raw_planes, cam_y);
+
+        let gen = self.tick_gen;
+        for &(w_saved, weight) in saved_voxels_world {
+            let w_curr = q_align * w_saved + t_align;
+            if !w_curr.is_finite() || self.point_flush_on_canonical_plane(w_curr) {
+                continue;
+            }
+            let (gx, gy, gz) = Self::world_to_cell(w_curr);
+            let (ckey, lx, ly, lz) = Self::split_cell(gx, gy, gz);
+            if !self.chunks.contains_key(&ckey) {
+                if self.chunks.len() >= MAX_ACTIVE_CHUNKS {
+                    continue;
+                }
+                self.chunks.insert(ckey, VoxelChunk::new(gen));
+            }
+            if let Some(chunk) = self.chunks.get_mut(&ckey) {
+                let idx = VoxelChunk::idx(lx, ly, lz);
+                // Cap restored prior weight at 96 so Free-Space Carving can cleanly erase moved furniture
+                let prior = weight.clamp(SOLID_THRESHOLD + 12, 96);
+                if chunk.cells[idx] < prior {
+                    chunk.cells[idx] = prior;
+                }
+                chunk.last_touched_gen = gen;
+                if !chunk.solid_mask[idx] && chunk.cells[idx] >= SOLID_THRESHOLD {
+                    chunk.solid_mask[idx] = true;
+                    chunk.solid_count = chunk.solid_count.saturating_add(1);
+                    chunk.dirty = true;
+                }
+            }
+        }
+        // Rebuild up to 32 restored chunks immediately so the restored room is visible right away
+        self.step_greedy_meshing(32);
+        self.mesh_gen = self.mesh_gen.wrapping_add(1);
+    }
+
+    /// Exports all reconstructed plane and obstacle triangles grouped by semantic label for `.obj` export.
+    pub fn build_obj_mesh_groups(&mut self) -> Vec<(&'static str, Vec<TriMeshVertex>)> {
+        self.step_greedy_meshing(MAX_ACTIVE_CHUNKS);
+        let mut groups: Vec<(&'static str, Vec<TriMeshVertex>)> = vec![
+            ("Floor", Vec::new()),
+            ("Table", Vec::new()),
+            ("Seat", Vec::new()),
+            ("Wall", Vec::new()),
+            ("Ceiling", Vec::new()),
+            ("Obstacles", Vec::new()),
+        ];
+        for plane in &self.planes {
+            let slot = match plane.kind {
+                SurfaceKind::Floor => 0,
+                SurfaceKind::Table => 1,
+                SurfaceKind::Seat => 2,
+                SurfaceKind::Wall | SurfaceKind::VerticalObject => 3,
+                SurfaceKind::Ceiling => 4,
+                SurfaceKind::Unknown => continue,
+            };
+            triangulate_canonical_plane(plane, &mut groups[slot].1);
+        }
+        for chunk in self.chunks.values() {
+            if !chunk.tris.is_empty() {
+                groups[5].1.extend_from_slice(&chunk.tris);
+            }
+        }
+        groups.into_iter().filter(|(_, v)| !v.is_empty()).collect()
+    }
 }
 
 /// Triangulates a convex canonical plane polygon with a 2-ring subdivision for large surfaces so

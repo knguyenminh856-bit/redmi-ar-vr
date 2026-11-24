@@ -336,6 +336,63 @@ pub fn convert_latest_rgba(
     Some((slot.meta, skin_permille, motion_permille, convert_us))
 }
 
+pub const RELOC_DESC_W: usize = 32;
+pub const RELOC_DESC_H: usize = 24;
+pub const RELOC_DESC_LEN: usize = RELOC_DESC_W * RELOC_DESC_H;
+
+/// Extracts a lightweight 32x24 upright grayscale descriptor directly from the latest RAM Y-plane
+/// slot (< 0.02ms, zero allocation) for offline visual room relocalization.
+pub fn extract_latest_luma_descriptor(last_seq: u64) -> Option<(CaptureMeta, [u8; RELOC_DESC_LEN])> {
+    let r = ring();
+    let newest_seq = r.latest_seq.load(Ordering::Acquire);
+    if newest_seq == 0 || newest_seq == last_seq {
+        return None;
+    }
+
+    let slot_idx = r.latest_slot.load(Ordering::Acquire) % MAX_RING_SLOTS;
+    let slot = r.slots[slot_idx].read().ok()?;
+    if slot.meta.seq == 0 || slot.meta.seq == last_seq || slot.width < 2 || slot.height < 2 {
+        return None;
+    }
+
+    let src_w = slot.width;
+    let src_h = slot.height;
+    let y_len = slot.y_len;
+    let y_row_stride = slot.y_row_stride;
+    let y_pixel_stride = slot.y_pixel_stride;
+    let rot180 = slot.meta.rot_deg == 180;
+    let mut out = [0u8; RELOC_DESC_LEN];
+
+    for dy in 0..RELOC_DESC_H {
+        let sy0 = (dy * src_h) / RELOC_DESC_H;
+        let sy = if rot180 { src_h - 1 - sy0 } else { sy0 };
+        let sy2 = (sy + 1).min(src_h - 1);
+        let row0 = sy * y_row_stride;
+        let row1 = sy2 * y_row_stride;
+
+        for dx in 0..RELOC_DESC_W {
+            let sx0 = (dx * src_w) / RELOC_DESC_W;
+            let sx = if rot180 { src_w - 1 - sx0 } else { sx0 };
+            let sx2 = (sx + 1).min(src_w - 1);
+
+            let i00 = row0 + sx * y_pixel_stride;
+            let i01 = row0 + sx2 * y_pixel_stride;
+            let i10 = row1 + sx * y_pixel_stride;
+            let i11 = row1 + sx2 * y_pixel_stride;
+            let sum = if i11 < y_len {
+                slot.y[i00] as u32 + slot.y[i01] as u32 + slot.y[i10] as u32 + slot.y[i11] as u32
+            } else if i00 < y_len {
+                (slot.y[i00] as u32) * 4
+            } else {
+                0
+            };
+            out[dy * RELOC_DESC_W + dx] = (sum >> 2) as u8;
+        }
+    }
+
+    Some((slot.meta, out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,5 +466,9 @@ mod tests {
 
         // Duplicate sequence returns None cleanly
         assert!(convert_latest_rgba(&mut rgba, 4, 2, seq, false).is_none());
+
+        let (d_meta, desc) = extract_latest_luma_descriptor(0).expect("descriptor should extract");
+        assert_eq!(d_meta.seq, seq);
+        assert!(desc[0] < 40 && desc[RELOC_DESC_LEN - 1] > 200);
     }
 }

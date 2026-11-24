@@ -6,12 +6,18 @@ use crate::hand_tracking::{
 };
 use crate::passthrough::{compute_quad_half_extents, PassthroughRenderer, PASSTHROUGH_DIST};
 use crate::physics_3d::{BodyShape, ImpactRing, PhysicsBody, PhysicsRenderer, PhysicsWorld};
+use crate::room_persistence::{
+    compute_4dof_alignment, deserialize_room_arroom, export_room_to_obj,
+    pick_manual_anchor_keyframe, serialize_room_arroom, try_auto_relocalize, KeyframeBank,
+    LoadedRoomMap,
+};
 use crate::room_scanner::{
     project_room_labels, AabbCollider, PlaneMarker, ProjectedLabel, ReticleHit,
     RoomScannerRenderer, SpatialMemoryCache, SurfaceKind, WorldObjectMarker,
 };
 use crate::scene_3d::Scene3D;
 use crate::spatial_mesh::{RawArPlane, SpatialMeshMap, TriMeshRenderer, TriMeshVertex};
+use crate::vision_ram::extract_latest_luma_descriptor;
 use glam::{Mat4, Quat, Vec3};
 use glow::HasContext;
 use std::time::Instant;
@@ -36,6 +42,9 @@ pub struct PerfMetrics {
     pub reticle_dist: f32,
     pub mesh_chunks: u32,
     pub mesh_triangles: u32,
+    pub keyframe_count: u32,
+    pub reloc_status: i32,
+    pub reloc_best_pct: i32,
 }
 
 /// Thread-safe input state updated by Android sensor/camera/UI threads.
@@ -85,6 +94,11 @@ pub struct SharedInputState {
     pub cached_tri_cull_pos: Vec3,
     pub cached_tri_chunks: u32,
     pub cached_tri_count: u32,
+    pub keyframe_bank: KeyframeBank,
+    pub pending_room: Option<LoadedRoomMap>,
+    pub last_reloc_desc_seq: u64,
+    pub reloc_status: i32,
+    pub reloc_best_pct: i32,
     pub projected_labels: Vec<ProjectedLabel>,
 
     pub physics: PhysicsWorld,
@@ -133,6 +147,11 @@ impl Default for SharedInputState {
             cached_tri_cull_pos: Vec3::ZERO,
             cached_tri_chunks: 0,
             cached_tri_count: 0,
+            keyframe_bank: KeyframeBank::default(),
+            pending_room: None,
+            last_reloc_desc_seq: 0,
+            reloc_status: 0,
+            reloc_best_pct: 0,
             projected_labels: Vec::new(),
             physics: PhysicsWorld::default(),
             last_physics_step: Instant::now(),
@@ -224,6 +243,10 @@ impl SharedInputState {
         if clamped == 0 {
             self.spatial_cache.clear();
             self.spatial_mesh.clear();
+            self.keyframe_bank.clear();
+            self.pending_room = None;
+            self.reloc_status = 0;
+            self.reloc_best_pct = 0;
             self.cached_tri_mesh.clear();
             self.cached_tri_src_gen = 0;
             self.cached_tri_upload_gen = self.cached_tri_upload_gen.wrapping_add(1);
@@ -237,6 +260,9 @@ impl SharedInputState {
             self.perf.voxel_count = 0;
             self.perf.mesh_chunks = 0;
             self.perf.mesh_triangles = 0;
+            self.perf.keyframe_count = 0;
+            self.perf.reloc_status = 0;
+            self.perf.reloc_best_pct = 0;
             self.perf.reticle_hit_kind = 0;
             self.perf.reticle_surface_kind = 0;
             self.perf.reticle_dist = 0.0;
@@ -244,6 +270,119 @@ impl SharedInputState {
             self.spatial_cache.clear_objects();
             self.perf.active_objects = 0;
         }
+    }
+
+    pub fn poll_visual_keyframes_and_reloc(&mut self) -> i32 {
+        let Some((meta, desc)) = extract_latest_luma_descriptor(self.last_reloc_desc_seq) else {
+            return self.reloc_status;
+        };
+        self.last_reloc_desc_seq = meta.seq;
+        let (cam_pos, cam_rot) = self.current_cam_pose();
+
+        if let Some(ref mut pending) = self.pending_room {
+            if let Some((kf_idx, score)) = try_auto_relocalize(pending, cam_rot, &desc) {
+                let pct = (score * 100.0).round().clamp(0.0, 100.0) as i32;
+                self.apply_pending_room_alignment(kf_idx, cam_pos, cam_rot, true, pct);
+                return 2;
+            }
+            self.reloc_best_pct = (pending.last_best_score * 100.0).round().clamp(0.0, 100.0) as i32;
+            self.perf.reloc_best_pct = self.reloc_best_pct;
+            return 1;
+        }
+
+        if self.room_scan_mode > 0 && self.has_ar_pose {
+            self.keyframe_bank.maybe_capture(cam_pos, cam_rot, desc);
+            self.perf.keyframe_count = self.keyframe_bank.len() as u32;
+        }
+        self.reloc_status
+    }
+
+    fn apply_pending_room_alignment(
+        &mut self,
+        kf_idx: usize,
+        curr_pos: Vec3,
+        curr_rot: Quat,
+        is_auto: bool,
+        pct: i32,
+    ) -> bool {
+        let Some(loaded) = self.pending_room.take() else {
+            return false;
+        };
+        let (saved_pos, saved_rot) = loaded
+            .keyframes
+            .get(kf_idx)
+            .map(|k| (k.cam_pos, k.cam_rot))
+            .unwrap_or((Vec3::ZERO, Quat::IDENTITY));
+        let (q_align, t_align) = compute_4dof_alignment(
+            saved_pos,
+            saved_rot,
+            curr_pos,
+            curr_rot,
+            loaded.floor_y,
+            self.spatial_mesh.inferred_floor_y(),
+        );
+        self.spatial_mesh.import_and_merge_transformed(
+            &loaded.planes,
+            &loaded.solid_voxels_world,
+            q_align,
+            t_align,
+            curr_pos.y,
+        );
+        self.keyframe_bank
+            .transform_and_merge(&loaded.keyframes, q_align, t_align);
+        if let Some(fy) = self.spatial_mesh.inferred_floor_y() {
+            self.anchored_floor_y = Some(fy);
+        }
+        self.reloc_status = if is_auto { 2 } else { 3 };
+        self.reloc_best_pct = pct;
+        self.perf.cached_planes = self.spatial_mesh.canonical_plane_count() as u32;
+        self.perf.voxel_count = self.spatial_mesh.confirmed_voxel_count() as u32;
+        self.perf.mesh_chunks = self.spatial_mesh.active_chunk_count() as u32;
+        self.perf.keyframe_count = self.keyframe_bank.len() as u32;
+        self.perf.reloc_status = self.reloc_status;
+        self.perf.reloc_best_pct = self.reloc_best_pct;
+        true
+    }
+
+    pub fn serialize_current_room(&self) -> Vec<u8> {
+        serialize_room_arroom(&self.spatial_mesh, &self.keyframe_bank)
+    }
+
+    pub fn load_room_bytes(&mut self, bytes: &[u8]) -> Result<(usize, usize, usize), String> {
+        let loaded = deserialize_room_arroom(bytes)?;
+        let summary = (
+            loaded.planes.len(),
+            loaded.solid_voxels_world.len(),
+            loaded.keyframes.len(),
+        );
+        self.pending_room = Some(loaded);
+        self.reloc_status = 1;
+        self.reloc_best_pct = 0;
+        self.perf.reloc_status = 1;
+        self.perf.reloc_best_pct = 0;
+        Ok(summary)
+    }
+
+    pub fn force_relocalize_now(&mut self) -> bool {
+        let (cam_pos, cam_rot) = self.current_cam_pose();
+        let kf_idx = self
+            .pending_room
+            .as_ref()
+            .and_then(|p| pick_manual_anchor_keyframe(p, cam_rot))
+            .unwrap_or(0);
+        self.apply_pending_room_alignment(kf_idx, cam_pos, cam_rot, false, 100)
+    }
+
+    pub fn cancel_pending_relocalize(&mut self) {
+        self.pending_room = None;
+        self.reloc_status = 0;
+        self.reloc_best_pct = 0;
+        self.perf.reloc_status = 0;
+        self.perf.reloc_best_pct = 0;
+    }
+
+    pub fn export_current_room_obj(&mut self) -> String {
+        export_room_to_obj(&mut self.spatial_mesh)
     }
 
     pub fn set_stereo_mode(&mut self, enabled: bool) {
@@ -694,6 +833,9 @@ impl SharedInputState {
         self.perf.physics_bodies = self.physics.bodies.len() as u32;
         self.perf.mesh_chunks = self.spatial_mesh.active_chunk_count() as u32;
         self.perf.mesh_triangles = self.cached_tri_count;
+        self.perf.keyframe_count = self.keyframe_bank.len() as u32;
+        self.perf.reloc_status = self.reloc_status;
+        self.perf.reloc_best_pct = self.reloc_best_pct;
 
         let boost_factor = match self.boost_until {
             Some(until) if until > now => {

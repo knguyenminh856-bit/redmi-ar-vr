@@ -21,6 +21,7 @@
 | **1-Eye Mono AR / 2-Eye VR Toggle** | Default **1 Mắt** (`stereoMode = false`, zero IPD, full `2400x1080`, `1.02` overscan, `near = 0.02m`) with independent `LayoutParams` per HUD pane; 1-tap toggle switches to **2 Mắt** cardboard stereo (`1.06` overscan) + dynamic `ARSession.setDisplayGeometry`. |
 | **Incremental 3D Fusion (`spatial_mesh.rs`)** | **Rule 1 (Single Canonical State):** ARCore true `plane.polygon` merged via Coplanar 2D Convex Hull Union (max `32` planes, zero overlap) + Sparse Hashed Chunks (`16x16x16` @ `6cm`, max `128` chunks = `512 KB` RAM, LRU eviction). **Rule 2 (Old+New Realtime):** Multi-view confidence accumulation (`>=48` solid, `<24` hysteresis) + `0.055m`-step Free-Space Ray Carving erases moved objects; `InstantPlacement` (`hit_kind=4`) stays preview-only dashed reticle and never auto-persists. **Rule 3 & 4 (Zero-Stall Hard Caps):** FPS-governed Greedy Meshing (`1..2` dirty chunks/tick), `48,000` GPU vertex cap, Frustum + `6m` radius culling. |
 | **Triangle Mesh Inspector (`🔺 Lưới △`)** | Mode `4` renders exact triangulated canonical plane sheets + Greedy-Meshed 3D chunk surface triangles via GLES 3.0 `#version 300 es` barycentric `fwidth(v_bary)` shader in 1 static VBO draw call (dirty-gen upload only). Modes: `1=Lưới 3D` (clean planes, hidden voxel physics), `4=🔺 Lưới △` (exact triangles), `3=Ẩn lưới`, `2=+AI Vật`, `0=TẮT`. |
+| **Persistent `.arroom` & 4-DoF Reloc (`room_persistence.rs`)** | **Rule 5 (Compact Persistence):** Atomic async disk I/O (`RoomMapStorage.kt`) saves merged canonical planes, sparse `(idx: u16, weight: u8)` solid voxels (3B/cell), and up to `8` `32x24` grayscale keyframes to `<app>/files/rooms/*.arroom` (~15–150 KB), plus standard Wavefront `.obj` export. **Rule 6 (4-DoF Offline Relocalization):** 1Hz keyframe capture while scanning; 4Hz brightness-invariant shifted-NCC matching (`>=0.72` x2 frames) auto-aligns `(yaw, tx, ty, tz)` + merges saved prior (`weight<=96`, carvable if furniture moved!) into live state, with instant **`📍 Khớp ngay`** 1-tap fallback. |
 | **Zero-Copy Camera** | ARCore `CameraConfig` picks `imageSize<=480p` (CPU) + `textureSize>=1080p` (GPU OES `0x8D65`); `DepthMode.DISABLED`; 0x MSAA EGL surface; ungrounded demo cube/octahedron hidden by default (`show_demo_scene = false`). |
 | **Full-Screen 1:1 Scale** | Cover-fit `compute_eye_projection` (`tan_v = min(cam_tan_v, cam_tan_h / aspect) / (fov_scale * overscan)`) fills 100% edge-to-edge at `100%` while locking world-to-camera scale 1:1. |
 | **120Hz Async Timewarp** | `ArSession.update()` throttled to ~32Hz (`31ms`); `onDrawFrame()` runs at 120Hz (`preferredRefreshRate` + `Surface.setFrameRate`) using `ar_rot * (gyro_at_capture.inv() * gyro_latest)`. |
@@ -55,8 +56,14 @@
 | `nativeThrowPhysicsAtReticle` | `throwSpeed: Float` | `Unit` |
 | `nativeClearPhysicsBodies` | None | `Unit` |
 | `nativeGetRoomLabels` | `outArr: FloatArray(36)` | `Int` (`0..6`) |
-| `nativeGetPerfMetrics` | `outArr: FloatArray(18)` (`+meshChunks, +meshTriangles`) | `Unit` |
+| `nativeGetPerfMetrics` | `outArr: FloatArray(21)` (`+chunks, +tris, +kfs, +relocState, +relocPct`) | `Unit` |
 | `nativeGetRenderFrameMs` | None | `Float` |
 | `nativeIngestCameraImage` | `yBuf, uBuf, vBuf, yLen, uLen, vLen, w, h, strides, rotDeg, ndcBasis` | `Long` (`seq`) |
 | `nativeConvertLatestFrameRgba` | `outRgbaBuf, dstW, dstH, lastSeq, updateMotion, outMeta(19)` | `Long` (`seq`) |
+| `nativeTickRelocalizer` | None (1Hz scan / 4Hz reloc NCC tick) | `Int` (`0=idle,1=match,2=auto,3=manual`) |
+| `nativeSerializeRoom` | None | `ByteArray?` (`.arroom` v1) |
+| `nativeLoadRoomBytes` | `data: ByteArray, outCounts: IntArray(3)` | `Boolean` |
+| `nativeForceRelocalizeNow` | None | `Boolean` |
+| `nativeCancelRelocalize` | None | `Unit` |
+| `nativeExportRoomObj` | None | `String` (Wavefront `.obj`) |
 | `nativeDrawFrame` | None | `Unit` |

@@ -99,5 +99,11 @@ object NativeBridge {
         updateMotion: Boolean,
         outMeta: FloatArray
     ): Long
+    external fun nativeTickRelocalizer(): Int
+    external fun nativeSerializeRoom(): ByteArray?
+    external fun nativeLoadRoomBytes(data: ByteArray, outCounts: IntArray): Boolean
+    external fun nativeForceRelocalizeNow(): Boolean
+    external fun nativeCancelRelocalize()
+    external fun nativeExportRoomObj(): String
     external fun nativeDrawFrame()
 }
