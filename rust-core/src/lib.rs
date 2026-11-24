@@ -329,8 +329,15 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeGetPerfMetrics(
         perf.cached_planes as f32,
         perf.voxel_count as f32,
         perf.physics_bodies as f32,
+        perf.reticle_hit_kind as f32,
+        perf.reticle_surface_kind as f32,
+        perf.reticle_dist,
     ];
-    let _ = env.set_float_array_region(&out_arr, 0, &buf);
+    let copy_len = env
+        .get_array_length(&out_arr)
+        .map(|n| (n.max(0) as usize).min(buf.len()))
+        .unwrap_or(13);
+    let _ = env.set_float_array_region(&out_arr, 0, &buf[..copy_len]);
 }
 
 #[no_mangle]
@@ -607,6 +614,69 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeSpawnPhysicsBod
 ) {
     if let Ok(mut state) = input_state().lock() {
         state.spawn_physics_from_camera(throw_speed);
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeSetStereoMode(
+    _env: JNIEnv,
+    _class: JClass,
+    enabled: jboolean,
+) {
+    if let Ok(mut state) = input_state().lock() {
+        state.set_stereo_mode(enabled != 0);
+    }
+}
+
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeOnSurfaceReticle(
+    env: JNIEnv,
+    _class: JClass,
+    valid: jboolean,
+    hit_kind: jint,
+    px: jfloat,
+    py: jfloat,
+    pz: jfloat,
+    nx: jfloat,
+    ny: jfloat,
+    nz: jfloat,
+    dist: jfloat,
+    out_arr: JFloatArray,
+) {
+    let res = if let Ok(mut state) = input_state().lock() {
+        state.on_surface_reticle(
+            valid != 0,
+            hit_kind,
+            Vec3::new(px, py, pz),
+            Vec3::new(nx, ny, nz),
+            dist,
+        )
+    } else {
+        (0, 0, 0.0)
+    };
+    let out = [res.0 as f32, res.1 as f32, res.2];
+    let _ = env.set_float_array_region(&out_arr, 0, &out);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeDropPhysicsAtReticle(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    if let Ok(mut state) = input_state().lock() {
+        state.drop_physics_at_reticle();
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeThrowPhysicsAtReticle(
+    _env: JNIEnv,
+    _class: JClass,
+    throw_speed: jfloat,
+) {
+    if let Ok(mut state) = input_state().lock() {
+        state.throw_physics_at_reticle(throw_speed);
     }
 }
 

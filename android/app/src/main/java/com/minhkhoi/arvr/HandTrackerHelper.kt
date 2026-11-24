@@ -38,6 +38,8 @@ class HandTrackerHelper(
 
     val isBusy = AtomicBoolean(false)
     private val isClosed = AtomicBoolean(false)
+    private val initStarted = AtomicBoolean(false)
+    private val appCtx = context.applicationContext
     private val executor = Executors.newSingleThreadExecutor { r ->
         Thread(r, "HandVisionThread").apply { priority = Thread.NORM_PRIORITY }
     }
@@ -48,7 +50,7 @@ class HandTrackerHelper(
     private var pinnedModelBuf: ByteBuffer? = null
 
     @Volatile
-    var handMode: Int = 1 // 1=TỰ ĐỘNG, 2=NHANH, 0=TẮT
+    var handMode: Int = 0 // 0=TẮT (mặc định tối ưu 3D), 1=TỰ ĐỘNG, 2=NHANH
         private set
 
     @Volatile
@@ -86,8 +88,8 @@ class HandTrackerHelper(
     private val packedFloats = FloatArray(MAX_HANDS * LANDMARKS_PER_HAND * FLOATS_PER_LANDMARK)
     private val uprightOpts = ImageProcessingOptions.builder().setRotationDegrees(0).build()
 
-    init {
-        val appCtx = context.applicationContext
+    private fun ensureInitialized() {
+        if (!initStarted.compareAndSet(false, true)) return
         executor.execute {
             if (!isClosed.get()) {
                 pinnedModelBuf = preloadAssetToDirectBuffer(appCtx, MODEL_ASSET)
@@ -104,6 +106,8 @@ class HandTrackerHelper(
             aiFps = 0f
             lastInferMs = 0
             NativeBridge.nativeOnHandLandmarks(0, packedFloats)
+        } else {
+            ensureInitialized()
         }
     }
 

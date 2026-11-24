@@ -37,6 +37,7 @@ class RoomScannerHelper(private val context: Context) {
 
     val isBusy = AtomicBoolean(false)
     private val isClosed = AtomicBoolean(false)
+    private val initStarted = AtomicBoolean(false)
 
     @Volatile
     private var objectDetector: ObjectDetector? = null
@@ -61,6 +62,7 @@ class RoomScannerHelper(private val context: Context) {
     private val uprightOpts = ImageProcessingOptions.builder().setRotationDegrees(0).build()
 
     fun initAsync() {
+        if (!initStarted.compareAndSet(false, true)) return
         val appCtx = context.applicationContext
         executor.execute {
             if (isClosed.get()) return@execute

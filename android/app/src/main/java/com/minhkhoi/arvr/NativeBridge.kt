@@ -50,6 +50,21 @@ object NativeBridge {
     )
     external fun nativeOnPointCloud(pointCount: Int, packedXyzc: FloatArray)
     external fun nativeSpawnPhysicsBody(throwSpeed: Float)
+    external fun nativeSetStereoMode(enabled: Boolean)
+    external fun nativeOnSurfaceReticle(
+        valid: Boolean,
+        hitKind: Int,
+        px: Float,
+        py: Float,
+        pz: Float,
+        nx: Float,
+        ny: Float,
+        nz: Float,
+        dist: Float,
+        outInfo: FloatArray
+    )
+    external fun nativeDropPhysicsAtReticle()
+    external fun nativeThrowPhysicsAtReticle(throwSpeed: Float)
     external fun nativeClearPhysicsBodies()
     external fun nativeGetRoomLabels(outArr: FloatArray): Int
     external fun nativeGetPerfMetrics(outArr: FloatArray)

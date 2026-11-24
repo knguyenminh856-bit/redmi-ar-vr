@@ -17,6 +17,7 @@ pub const FLOATS_PER_LABEL: usize = 6; // [kind_id, left_u, left_v, right_u, rig
 pub const MAX_CACHED_PLANES: usize = 64;
 pub const MAX_CACHED_OBJECTS: usize = 32;
 pub const PLANE_CACHE_TTL_MS: u128 = 45_000;
+pub const HIT_PATCH_TTL_MS: u128 = 20_000;
 pub const OBJECT_CACHE_TTL_MS: u128 = 10_000;
 
 pub const VOXEL_SIZE: f32 = 0.06;
@@ -25,7 +26,7 @@ pub const VOXEL_TTL_MS: u128 = 35_000;
 pub const VOXEL_NOISE_TTL_MS: u128 = 8_000;
 pub const MAX_POINT_CLOUD_PTS: usize = 512;
 
-const MAX_WORLD_VERTICES: usize = 8192;
+const MAX_WORLD_VERTICES: usize = 16384;
 
 const SCAN_VERT: &str = r#"
 precision highp float;
@@ -110,11 +111,36 @@ pub struct ProjectedLabel {
     pub score: f32,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct ReticleHit {
+    pub valid: bool,
+    pub hit_kind: i32, // 0=none, 1=Plane, 2=Point/Instant, 3=FloorFallback
+    pub surface_kind: SurfaceKind,
+    pub pos: Vec3,
+    pub normal: Vec3,
+    pub distance: f32,
+}
+
+impl Default for ReticleHit {
+    fn default() -> Self {
+        Self {
+            valid: false,
+            hit_kind: 0,
+            surface_kind: SurfaceKind::Unknown,
+            pos: Vec3::ZERO,
+            normal: Vec3::Y,
+            distance: 0.0,
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 struct CachedPlaneEntry {
     marker: PlaneMarker,
     normal: Vec3,
     last_seen: Instant,
+    ttl_ms: u128,
+    is_hit_patch: bool,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -190,7 +216,7 @@ impl SpatialMemoryCache {
         now: Instant,
     ) {
         self.planes
-            .retain(|p| now.duration_since(p.last_seen).as_millis() <= PLANE_CACHE_TTL_MS);
+            .retain(|p| now.duration_since(p.last_seen).as_millis() <= p.ttl_ms);
 
         if scan_mode <= 0 || count == 0 {
             return;
@@ -280,6 +306,8 @@ impl SpatialMemoryCache {
                 );
                 old.normal = (old.marker.rot * Vec3::Y).normalize_or_zero();
                 old.last_seen = now;
+                old.ttl_ms = PLANE_CACHE_TTL_MS;
+                old.is_hit_patch = false;
             } else {
                 if self.planes.len() >= MAX_CACHED_PLANES {
                     if let Some((oldest_idx, _)) = self
@@ -301,9 +329,128 @@ impl SpatialMemoryCache {
                     },
                     normal,
                     last_seen: now,
+                    ttl_ms: PLANE_CACHE_TTL_MS,
+                    is_hit_patch: false,
                 });
             }
         }
+    }
+
+    pub fn classify_surface_point(&self, pos: Vec3, normal: Vec3, cam_y: f32) -> SurfaceKind {
+        let n = normal.normalize_or_zero();
+        if !pos.is_finite() || n.length_squared() < 1e-4 {
+            return SurfaceKind::Unknown;
+        }
+        // Check if an existing remembered plane already covers this point
+        for existing in &self.planes {
+            if existing.normal.dot(n) < 0.78 {
+                continue;
+            }
+            let rel = pos - existing.marker.pos;
+            if rel.dot(existing.normal).abs() > 0.14 {
+                continue;
+            }
+            let ax_x = existing.marker.rot * Vec3::X;
+            let ax_z = existing.marker.rot * Vec3::Z;
+            if rel.dot(ax_x).abs() <= existing.marker.extent_x * 0.55 + 0.12
+                && rel.dot(ax_z).abs() <= existing.marker.extent_z * 0.55 + 0.12
+            {
+                return existing.marker.kind;
+            }
+        }
+        let raw_type = if n.y >= 0.65 {
+            0
+        } else if n.y <= -0.65 {
+            2
+        } else {
+            1
+        };
+        let ext = if raw_type == 1 { 0.85 } else { 0.65 };
+        classify_ar_plane(raw_type, pos.y, ext, ext, cam_y, self.inferred_floor_y())
+    }
+
+    pub fn ingest_hit_surface(
+        &mut self,
+        pos: Vec3,
+        normal: Vec3,
+        cam_y: f32,
+        hit_kind: i32,
+    ) -> SurfaceKind {
+        self.ingest_hit_surface_at(pos, normal, cam_y, hit_kind, Instant::now())
+    }
+
+    pub fn ingest_hit_surface_at(
+        &mut self,
+        pos: Vec3,
+        normal: Vec3,
+        cam_y: f32,
+        hit_kind: i32,
+        now: Instant,
+    ) -> SurfaceKind {
+        if hit_kind == 3 {
+            return SurfaceKind::Floor;
+        }
+        let n = normal.normalize_or_zero();
+        if !pos.is_finite() || n.length_squared() < 1e-4 {
+            return SurfaceKind::Unknown;
+        }
+
+        let kind = self.classify_surface_point(pos, n, cam_y);
+        if hit_kind != 2 || kind == SurfaceKind::Unknown {
+            return kind;
+        }
+
+        // Only synthesize a 0.36m x 0.36m patch if no tracked plane covers this surface yet
+        let covered = self.planes.iter_mut().any(|old| {
+            let ndot = old.normal.dot(n);
+            if ndot < 0.84 {
+                return false;
+            }
+            let rel = pos - old.marker.pos;
+            if rel.dot(old.normal).abs() > 0.12 {
+                return false;
+            }
+            let ax_x = old.marker.rot * Vec3::X;
+            let ax_z = old.marker.rot * Vec3::Z;
+            let inside = rel.dot(ax_x).abs() <= old.marker.extent_x * 0.52
+                && rel.dot(ax_z).abs() <= old.marker.extent_z * 0.52;
+            if inside && old.is_hit_patch {
+                old.marker.pos = old.marker.pos * 0.6 + pos * 0.4;
+                old.last_seen = now;
+            }
+            inside
+        });
+
+        if !covered {
+            let ref_axis = if n.z.abs() < 0.9 { Vec3::Z } else { Vec3::X };
+            let tx = ref_axis.cross(n).normalize_or_zero();
+            let tz = tx.cross(n).normalize_or_zero();
+            let rot = Quat::from_mat3(&glam::Mat3::from_cols(tx, n, tz)).normalize();
+            if self.planes.len() >= MAX_CACHED_PLANES {
+                if let Some((oldest_idx, _)) = self
+                    .planes
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, e)| e.last_seen)
+                {
+                    self.planes.swap_remove(oldest_idx);
+                }
+            }
+            self.planes.push(CachedPlaneEntry {
+                marker: PlaneMarker {
+                    kind,
+                    pos,
+                    rot,
+                    extent_x: 0.36,
+                    extent_z: 0.36,
+                },
+                normal: n,
+                last_seen: now,
+                ttl_ms: HIT_PATCH_TTL_MS,
+                is_hit_patch: true,
+            });
+        }
+        kind
     }
 
     pub fn ingest_detected_objects(
@@ -343,7 +490,7 @@ impl SpatialMemoryCache {
         self.objects
             .retain(|o| now.duration_since(o.last_seen).as_millis() <= OBJECT_CACHE_TTL_MS);
 
-        if scan_mode < 2 || count == 0 {
+        if scan_mode != 2 || count == 0 {
             return;
         }
 
@@ -428,7 +575,7 @@ impl SpatialMemoryCache {
 
     pub fn snapshot_visible(&mut self, scan_mode: i32, now: Instant) -> (Vec<PlaneMarker>, Vec<WorldObjectMarker>) {
         self.planes
-            .retain(|p| now.duration_since(p.last_seen).as_millis() <= PLANE_CACHE_TTL_MS);
+            .retain(|p| now.duration_since(p.last_seen).as_millis() <= p.ttl_ms);
         self.objects
             .retain(|o| now.duration_since(o.last_seen).as_millis() <= OBJECT_CACHE_TTL_MS);
 
@@ -440,8 +587,11 @@ impl SpatialMemoryCache {
             .planes
             .iter()
             .filter_map(|p| {
-                let include = if scan_mode == 1 {
-                    matches!(p.marker.kind, SurfaceKind::Floor | SurfaceKind::Wall)
+                let include = if scan_mode == 1 || scan_mode == 3 {
+                    matches!(
+                        p.marker.kind,
+                        SurfaceKind::Floor | SurfaceKind::Wall | SurfaceKind::Table | SurfaceKind::Seat
+                    ) || p.is_hit_patch
                 } else {
                     p.marker.kind != SurfaceKind::Unknown
                 };
@@ -453,7 +603,7 @@ impl SpatialMemoryCache {
             })
             .collect();
 
-        let objects = if scan_mode >= 2 {
+        let objects = if scan_mode == 2 {
             self.objects.iter().map(|o| o.marker).collect()
         } else {
             Vec::new()
@@ -544,8 +694,8 @@ impl SpatialMemoryCache {
         }
         let mut out = Vec::with_capacity(80);
 
-        // Extruded 2.5D object obstacle boxes from ML detections (active in Full mode)
-        if scan_mode >= 2 {
+        // Extruded 2.5D object obstacle boxes from ML detections (active in +AI Vật mode 2)
+        if scan_mode == 2 {
             for entry in &self.objects {
                 let obj = entry.marker;
                 let dist = (obj.world_pos - cam_pos).length().clamp(0.4, 4.0);
@@ -718,7 +868,7 @@ pub fn classify_ar_plane(
 }
 
 pub fn parse_detected_objects(count: usize, packed: &[f32], scan_mode: i32) -> Vec<ObjectMarker> {
-    if scan_mode < 2 || count == 0 {
+    if scan_mode != 2 || count == 0 {
         return Vec::new();
     }
     let n = count.min(MAX_OBJECTS);
@@ -865,135 +1015,230 @@ fn push_wire_box(
     }
 }
 
-/// Builds distance-scaled, gravity-aligned world-space plane patches, 3D object badges & faint 2.5D volume boxes.
+fn surface_tangent_frame(n: Vec3) -> (Vec3, Vec3) {
+    let ref_axis = if n.z.abs() < 0.9 { Vec3::Z } else { Vec3::X };
+    let tx = ref_axis.cross(n).normalize_or_zero();
+    let tz = n.cross(tx).normalize_or_zero();
+    (tx, tz)
+}
+
+fn build_plane_grid_vertices(plane: &PlaneMarker, cam_pos: Vec3, out: &mut Vec<ScanVertex>) {
+    let ax_y = (plane.rot * Vec3::Y).normalize_or_zero();
+    let ax_x = (plane.rot * Vec3::X).normalize_or_zero();
+    let ax_z = (plane.rot * Vec3::Z).normalize_or_zero();
+    let (ax_x, ax_y, ax_z) = if ax_x.length_squared() > 1e-4
+        && ax_y.length_squared() > 1e-4
+        && ax_z.length_squared() > 1e-4
+    {
+        (ax_x, ax_y, ax_z)
+    } else {
+        plane_gravity_aligned_axes(plane, cam_pos)
+    };
+
+    let rgb = kind_rgb(plane.kind as i32);
+    let fill_col = [rgb[0], rgb[1], rgb[2], 0.06];
+    let grid_col = [rgb[0], rgb[1], rgb[2], 0.22];
+    let edge_col = [rgb[0], rgb[1], rgb[2], 0.42];
+
+    let dist = (plane.pos - cam_pos).length().clamp(0.35, 6.0);
+    let hx = (plane.extent_x * 0.5).clamp(0.16, 1.30);
+    let hz = (plane.extent_z * 0.5).clamp(0.16, 1.30);
+    let center = plane.pos + ax_y * 0.003;
+
+    let c0 = center - ax_x * hx - ax_z * hz;
+    let c1 = center + ax_x * hx - ax_z * hz;
+    let c2 = center + ax_x * hx + ax_z * hz;
+    let c3 = center - ax_x * hx + ax_z * hz;
+    push_quad(out, c0, c1, c2, c3, fill_col);
+
+    let bw = (dist * 0.0022).clamp(0.0018, 0.0042);
+    push_strip(out, c0, c1, ax_z, bw, edge_col);
+    push_strip(out, c1, c2, ax_x, bw, edge_col);
+    push_strip(out, c2, c3, ax_z, bw, edge_col);
+    push_strip(out, c3, c0, ax_x, bw, edge_col);
+
+    // 20cm metric grid lines parallel to Z and X inside the outer boundary
+    let gw = (dist * 0.0011).clamp(0.0010, 0.0022);
+    let step = 0.20f32;
+    let nx = ((hx - 0.04) / step).floor().max(0.0) as i32;
+    let nz = ((hz - 0.04) / step).floor().max(0.0) as i32;
+    for ix in -nx..=nx {
+        if out.len() + 12 > MAX_WORLD_VERTICES {
+            return;
+        }
+        let ox = ax_x * (ix as f32 * step);
+        push_strip(out, center + ox - ax_z * hz, center + ox + ax_z * hz, ax_x, gw, grid_col);
+    }
+    for iz in -nz..=nz {
+        if out.len() + 12 > MAX_WORLD_VERTICES {
+            return;
+        }
+        let oz = ax_z * (iz as f32 * step);
+        push_strip(out, center - ax_x * hx + oz, center + ax_x * hx + oz, ax_z, gw, grid_col);
+    }
+}
+
+pub fn build_reticle_vertices(reticle: &ReticleHit, cam_pos: Vec3, out: &mut Vec<ScanVertex>) {
+    if !reticle.valid || !reticle.pos.is_finite() || out.len() + 160 > MAX_WORLD_VERTICES {
+        return;
+    }
+    let n = {
+        let cand = reticle.normal.normalize_or_zero();
+        if cand.length_squared() > 1e-4 {
+            cand
+        } else {
+            Vec3::Y
+        }
+    };
+    let (tx, tz) = surface_tangent_frame(n);
+    let center = reticle.pos + n * 0.005;
+    let dist = (reticle.pos - cam_pos).length().clamp(0.30, 5.0);
+    let r = (dist * 0.044).clamp(0.030, 0.072);
+    let hw = (r * 0.10).clamp(0.0026, 0.0055);
+
+    let rgb = if reticle.surface_kind != SurfaceKind::Unknown {
+        kind_rgb(reticle.surface_kind as i32)
+    } else {
+        [0.92, 0.96, 1.00]
+    };
+    let ring_col = [
+        rgb[0],
+        rgb[1],
+        rgb[2],
+        if reticle.hit_kind == 3 { 0.42 } else { 0.72 },
+    ];
+    let tick_col = [1.0, 1.0, 1.0, if reticle.hit_kind == 3 { 0.40 } else { 0.70 }];
+
+    const SEGMENTS: usize = 16;
+    for i in 0..SEGMENTS {
+        let a0 = (i as f32) * std::f32::consts::TAU / (SEGMENTS as f32);
+        let a1 = ((i + 1) as f32) * std::f32::consts::TAU / (SEGMENTS as f32);
+        let d0 = tx * a0.cos() + tz * a0.sin();
+        let d1 = tx * a1.cos() + tz * a1.sin();
+        push_quad(
+            out,
+            center + d0 * (r - hw),
+            center + d0 * (r + hw),
+            center + d1 * (r + hw),
+            center + d1 * (r - hw),
+            ring_col,
+        );
+    }
+
+    // Center drop diamond + 4 cardinal ticks
+    let cr = (r * 0.17).clamp(0.005, 0.012);
+    push_quad(
+        out,
+        center - tx * cr,
+        center - tz * cr,
+        center + tx * cr,
+        center + tz * cr,
+        tick_col,
+    );
+    let tw = (hw * 0.65).clamp(0.0018, 0.0036);
+    push_strip(out, center + tx * (r * 0.48), center + tx * (r * 0.88), tz, tw, tick_col);
+    push_strip(out, center - tx * (r * 0.48), center - tx * (r * 0.88), tz, tw, tick_col);
+    push_strip(out, center + tz * (r * 0.48), center + tz * (r * 0.88), tx, tw, tick_col);
+    push_strip(out, center - tz * (r * 0.48), center - tz * (r * 0.88), tx, tw, tick_col);
+}
+
+/// Builds subtle 20cm world-locked metric plane grids, surface-hugging 3D reticle, object badges & 2.5D boxes.
+#[allow(clippy::too_many_arguments)]
 pub fn build_room_marker_vertices(
     planes: &[PlaneMarker],
     objects: &[WorldObjectMarker],
     blocks_25d: &[AabbCollider],
+    reticle: &ReticleHit,
+    show_grid: bool,
     cam_pos: Vec3,
     cam_rot: Quat,
     out: &mut Vec<ScanVertex>,
 ) {
     out.clear();
 
-    for plane in planes.iter().take(24) {
-        if out.len() + 60 > MAX_WORLD_VERTICES {
-            break;
-        }
-        let rgb = kind_rgb(plane.kind as i32);
-        let fill_col = [rgb[0], rgb[1], rgb[2], 0.15];
-        let edge_col = [rgb[0], rgb[1], rgb[2], 0.50];
-        let cue_col = [1.0, 1.0, 1.0, 0.42];
-
-        let (ax_x, ax_y, ax_z) = plane_gravity_aligned_axes(plane, cam_pos);
-        let center = plane.pos + ax_y * 0.004;
-
-        let dist = (plane.pos - cam_pos).length().clamp(0.35, 6.0);
-        let target = (dist * 0.058).clamp(0.032, 0.105);
-        let hx = target.min(plane.extent_x * 0.32).max(0.028);
-        let hz = target.min(plane.extent_z * 0.32).max(0.028);
-
-        let c0 = center - ax_x * hx - ax_z * hz;
-        let c1 = center + ax_x * hx - ax_z * hz;
-        let c2 = center + ax_x * hx + ax_z * hz;
-        let c3 = center - ax_x * hx + ax_z * hz;
-        push_quad(out, c0, c1, c2, c3, fill_col);
-
-        let bw = (dist * 0.0028).clamp(0.0022, 0.0052);
-        push_strip(out, c0, c1, ax_z, bw, edge_col);
-        push_strip(out, c1, c2, ax_x, bw, edge_col);
-        push_strip(out, c2, c3, ax_z, bw, edge_col);
-        push_strip(out, c3, c0, ax_x, bw, edge_col);
-
-        let r = (hx.min(hz) * 0.32).clamp(0.012, 0.026);
-        match plane.kind {
-            SurfaceKind::Table | SurfaceKind::Seat => {
-                let d0 = center - ax_x * r;
-                let d1 = center - ax_z * r;
-                let d2 = center + ax_x * r;
-                let d3 = center + ax_z * r;
-                push_quad(out, d0, d1, d2, d3, [rgb[0], rgb[1], rgb[2], 0.32]);
+    if show_grid {
+        for plane in planes.iter().take(24) {
+            if out.len() + 260 > MAX_WORLD_VERTICES {
+                break;
             }
-            _ => {
-                let hw = (bw * 0.7).clamp(0.0018, 0.0036);
-                push_strip(out, center - ax_x * r, center + ax_x * r, ax_z, hw, cue_col);
-                push_strip(out, center - ax_z * r, center + ax_z * r, ax_x, hw, cue_col);
+            build_plane_grid_vertices(plane, cam_pos, out);
+        }
+
+        let cam_right = (cam_rot * Vec3::X).normalize_or_zero();
+        let cam_up = (cam_rot * Vec3::Y).normalize_or_zero();
+        let cam_fwd = (cam_rot * -Vec3::Z).normalize_or_zero();
+
+        for obj in objects.iter().take(16) {
+            if out.len() + 66 > MAX_WORLD_VERTICES {
+                break;
+            }
+            let rgb = kind_rgb(obj.kind_id);
+            let fill_col = [rgb[0], rgb[1], rgb[2], 0.15];
+            let tick_col = [rgb[0], rgb[1], rgb[2], 0.56];
+            let dot_col = [1.0, 1.0, 1.0, 0.70];
+
+            let dist = (obj.world_pos - cam_pos).length().clamp(0.35, 6.0);
+            let b = (dist * 0.055).clamp(0.030, 0.095);
+            let dr = (b * 0.40).clamp(0.014, 0.030);
+            let center = obj.world_pos;
+
+            push_quad(
+                out,
+                center + cam_up * dr,
+                center + cam_right * dr,
+                center - cam_up * dr,
+                center - cam_right * dr,
+                fill_col,
+            );
+
+            let ds = (dist * 0.0040).clamp(0.0035, 0.0075);
+            let dot_c = center - cam_fwd * 0.001;
+            push_quad(
+                out,
+                dot_c - cam_right * ds - cam_up * ds,
+                dot_c + cam_right * ds - cam_up * ds,
+                dot_c + cam_right * ds + cam_up * ds,
+                dot_c - cam_right * ds + cam_up * ds,
+                dot_col,
+            );
+
+            let leg = (b * 0.36).clamp(0.012, 0.030);
+            let thick = (dist * 0.0022).clamp(0.0020, 0.0042);
+            for (sx, sy) in [(-1.0f32, 1.0f32), (1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)] {
+                let corner = center + cam_right * (sx * b) + cam_up * (sy * b);
+                push_strip(
+                    out,
+                    corner,
+                    corner - cam_right * (sx * leg),
+                    cam_up,
+                    thick,
+                    tick_col,
+                );
+                push_strip(
+                    out,
+                    corner,
+                    corner - cam_up * (sy * leg),
+                    cam_right,
+                    thick,
+                    tick_col,
+                );
             }
         }
-    }
 
-    let cam_right = (cam_rot * Vec3::X).normalize_or_zero();
-    let cam_up = (cam_rot * Vec3::Y).normalize_or_zero();
-    let cam_fwd = (cam_rot * -Vec3::Z).normalize_or_zero();
-
-    for obj in objects.iter().take(16) {
-        if out.len() + 66 > MAX_WORLD_VERTICES {
-            break;
-        }
-        let rgb = kind_rgb(obj.kind_id);
-        let fill_col = [rgb[0], rgb[1], rgb[2], 0.15];
-        let tick_col = [rgb[0], rgb[1], rgb[2], 0.56];
-        let dot_col = [1.0, 1.0, 1.0, 0.70];
-
-        let dist = (obj.world_pos - cam_pos).length().clamp(0.35, 6.0);
-        let b = (dist * 0.055).clamp(0.030, 0.095);
-        let dr = (b * 0.40).clamp(0.014, 0.030);
-        let center = obj.world_pos;
-
-        push_quad(
-            out,
-            center + cam_up * dr,
-            center + cam_right * dr,
-            center - cam_up * dr,
-            center - cam_right * dr,
-            fill_col,
-        );
-
-        let ds = (dist * 0.0040).clamp(0.0035, 0.0075);
-        let dot_c = center - cam_fwd * 0.001;
-        push_quad(
-            out,
-            dot_c - cam_right * ds - cam_up * ds,
-            dot_c + cam_right * ds - cam_up * ds,
-            dot_c + cam_right * ds + cam_up * ds,
-            dot_c - cam_right * ds + cam_up * ds,
-            dot_col,
-        );
-
-        let leg = (b * 0.36).clamp(0.012, 0.030);
-        let thick = (dist * 0.0022).clamp(0.0020, 0.0042);
-        for (sx, sy) in [(-1.0f32, 1.0f32), (1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)] {
-            let corner = center + cam_right * (sx * b) + cam_up * (sy * b);
-            push_strip(
-                out,
-                corner,
-                corner - cam_right * (sx * leg),
-                cam_up,
-                thick,
-                tick_col,
-            );
-            push_strip(
-                out,
-                corner,
-                corner - cam_up * (sy * leg),
-                cam_right,
-                thick,
-                tick_col,
-            );
+        for block in blocks_25d.iter().take(28) {
+            if out.len() + 80 > MAX_WORLD_VERTICES {
+                break;
+            }
+            let (top_col, edge_col) = if block.is_object_box {
+                ([0.24, 0.94, 0.64, 0.08], [0.24, 0.94, 0.64, 0.34])
+            } else {
+                ([0.25, 0.90, 0.85, 0.12], [0.25, 0.90, 0.85, 0.34])
+            };
+            push_wire_box(out, block.min, block.max, top_col, edge_col, 0.0022);
         }
     }
 
-    for block in blocks_25d.iter().take(28) {
-        if out.len() + 80 > MAX_WORLD_VERTICES {
-            break;
-        }
-        let (top_col, edge_col) = if block.is_object_box {
-            ([0.24, 0.94, 0.64, 0.08], [0.24, 0.94, 0.64, 0.34])
-        } else {
-            ([0.25, 0.90, 0.85, 0.12], [0.25, 0.90, 0.85, 0.34])
-        };
-        push_wire_box(out, block.min, block.max, top_col, edge_col, 0.0022);
-    }
+    build_reticle_vertices(reticle, cam_pos, out);
 }
 
 fn project_point_to_uv(
@@ -1152,16 +1397,21 @@ impl RoomScannerRenderer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn update(
         &mut self,
         gl: &glow::Context,
         planes: &[PlaneMarker],
         objects: &[WorldObjectMarker],
         blocks_25d: &[AabbCollider],
+        reticle: &ReticleHit,
+        show_grid: bool,
         cam_pos: Vec3,
         cam_rot: Quat,
     ) {
-        if planes.is_empty() && objects.is_empty() && blocks_25d.is_empty() {
+        if (!show_grid || (planes.is_empty() && objects.is_empty() && blocks_25d.is_empty()))
+            && !reticle.valid
+        {
             self.world_vert_count = 0;
             return;
         }
@@ -1169,6 +1419,8 @@ impl RoomScannerRenderer {
             planes,
             objects,
             blocks_25d,
+            reticle,
+            show_grid,
             cam_pos,
             cam_rot,
             &mut self.world_cpu,
@@ -1276,29 +1528,84 @@ mod tests {
     }
 
     #[test]
-    fn markers_stay_small_faint_and_gravity_aligned() {
-        // Wall tilted in local X-Z rotation should still generate vertical edges aligned to Vec3::Y
+    fn metric_grid_stays_faint_world_locked_and_reticle_renders_when_grid_hidden() {
         let tilted_rot = Quat::from_rotation_x(std::f32::consts::FRAC_PI_2) * Quat::from_rotation_y(0.7);
         let planes = vec![PlaneMarker {
+            kind: SurfaceKind::Table,
+            pos: Vec3::new(0.0, -0.4, -1.0),
+            rot: Quat::IDENTITY,
+            extent_x: 1.4,
+            extent_z: 1.0,
+        }, PlaneMarker {
             kind: SurfaceKind::Wall,
-            pos: Vec3::new(0.0, 0.0, -1.0),
+            pos: Vec3::new(0.0, 0.2, -1.8),
             rot: tilted_rot,
-            extent_x: 2.0,
-            extent_z: 2.0,
+            extent_x: 4.0,
+            extent_z: 4.0,
         }];
-        let objs = vec![WorldObjectMarker {
-            kind_id: 12,
-            world_pos: Vec3::new(0.3, -0.2, -1.5),
-            radius_hint_ndc: 0.3,
-            score: 0.82,
-        }];
+        let reticle = ReticleHit {
+            valid: true,
+            hit_kind: 1,
+            surface_kind: SurfaceKind::Table,
+            pos: Vec3::new(0.0, -0.4, -0.8),
+            normal: Vec3::Y,
+            distance: 0.89,
+        };
         let mut verts = Vec::new();
-        build_room_marker_vertices(&planes, &objs, &[], Vec3::ZERO, Quat::IDENTITY, &mut verts);
+        build_room_marker_vertices(
+            &planes,
+            &[],
+            &[],
+            &reticle,
+            true,
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            &mut verts,
+        );
         assert!(!verts.is_empty());
         assert_eq!(verts.len() % 3, 0);
         assert!(verts.iter().all(|v| v.color[3] <= 0.72));
-        // Close wall marker (1.0m) should stay tiny (half-extent <= 0.065m)
-        assert!(verts[0].pos[1].abs() <= 0.075);
+        // Clamped half-extents (<= 1.30m) prevent runaway vertices even on 4m x 4m walls
+        assert!(verts.len() < MAX_WORLD_VERTICES);
+
+        // Mode 3 (show_grid = false): only surface-hugging reticle vertices are emitted
+        let mut reticle_only = Vec::new();
+        build_room_marker_vertices(
+            &planes,
+            &[],
+            &[],
+            &reticle,
+            false,
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            &mut reticle_only,
+        );
+        assert!(!reticle_only.is_empty());
+        assert!(reticle_only.len() < 160);
+        assert!(reticle_only.iter().all(|v| (v.pos[1] - (-0.4 + 0.005)).abs() < 1e-4));
+    }
+
+    #[test]
+    fn ingest_hit_surface_synthesizes_patch_and_expires_after_20s() {
+        let mut cache = SpatialMemoryCache::default();
+        let t0 = Instant::now();
+        let table_pos = Vec3::new(0.1, -0.55, -0.75);
+        let kind = cache.ingest_hit_surface_at(table_pos, Vec3::Y, 0.0, 2, t0);
+        assert_eq!(kind, SurfaceKind::Table);
+        assert_eq!(cache.cached_plane_count(), 1);
+
+        let (planes_now, _) = cache.snapshot_visible(1, t0 + Duration::from_secs(5));
+        assert_eq!(planes_now.len(), 1);
+        assert!((planes_now[0].extent_x - 0.36).abs() < 1e-4);
+
+        // Hitting nearby refreshes without duplicating
+        let kind2 = cache.ingest_hit_surface_at(table_pos + Vec3::new(0.05, 0.0, 0.04), Vec3::Y, 0.0, 2, t0 + Duration::from_secs(6));
+        assert_eq!(kind2, SurfaceKind::Table);
+        assert_eq!(cache.cached_plane_count(), 1);
+
+        // Expires after 21s without refresh
+        let (planes_expired, _) = cache.snapshot_visible(1, t0 + Duration::from_secs(28));
+        assert_eq!(planes_expired.len(), 0);
     }
 
     #[test]

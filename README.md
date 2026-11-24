@@ -2,17 +2,18 @@
 
 Ứng dụng thực tế hỗn hợp (Passthrough AR/VR) tối ưu cho **Xiaomi Redmi Note 14 4G** (`arm64-v8a`, Helio G99-Ultra, GPU Mali-G57 MC2, AMOLED 120Hz `2400×1080`), viết bằng **Rust + OpenGL ES 3.0 (`glow`) + ARCore + MediaPipe GPU**.
 
-## Tính năng chính
+## Tính năng chính (Build #8 — Hoàn thiện Không gian 3D & Vật lý thực)
 
-1. **Nhìn xuyên thấu Full Màn Hình 120Hz & Khóa khớp 1:1:**
-   - **Full-Screen Cover-Fit + Cutout ALWAYS:** Khung camera tự phủ kín 100% khung hình hai mắt (`1200×1080`) không còn viền đen xung quanh (kèm 6% overscan chống hở mép), trong khi vẫn giữ tỷ lệ 3D khớp 1:1 với vật thật.
-   - **Tối ưu RAM + Bảng LUT 2MB:** Khởi tạo sẵn bảng tra YUV→RGBA trong RAM + bộ đệm xoay vòng 4 khung hình (`vision_ram.rs`) và nạp sẵn model AI vào RAM giúp không cấp phát rác (`Bitmap`), giải phóng tối đa GPU `Mali-G57 MC2`.
-2. **Nhận diện tay 5 ngón thông minh (`🖐 T.Đ / NHANH / TẮT` & `✏ Vẽ`):**
-   - MediaPipe `HandLandmarker` dùng **`Delegate.GPU` kèm Kernel Cache** đọc `ByteBuffer` RGBA đã xoay thẳng góc từ Rust. Tự động hạ về 4Hz khi không có tay, đánh thức nhanh ~12Hz khi thấy màu da/chuyển động, và tăng tốc ~24Hz khi thấy tay.
-   - **Cử chỉ 👉 Cây súng & Đánh tay:** Giơ tay hình **👉 Cây súng** để bắn bóng nảy vật lý; vung ngón tay hất/đẩy các khối đang nằm trong phòng!
-3. **Bản đồ 2.5D SLAM + Vật lý 120Hz (`🎲 Thả` & `🏠 2.5D`):**
-   - **Tái tạo khối 2.5D không cần Depth GPU:** Kết hợp mặt phẳng ARCore + đám mây điểm `PointCloud` 5Hz thành khối Voxel `6cm` + hộp đồ vật `EfficientDet` (`room_scanner.rs`).
-   - **Vật lý thực (`physics_3d.rs`):** Bấm **`🎲 Thả`** để ném khối lập phương / bóng có trọng lực (`9.81 m/s²`), bóng đổ tiếp xúc dưới sàn, **tự rơi đậu lên mặt bàn/sàn** và **bị tường / vật thể 2.5D cản lại hoặc bật nảy**. Bấm **`🗑`** để xóa cả nét vẽ lẫn vật thể vật lý.
+1. **Chế độ 1 Mắt / 2 Mắt & Toàn màn hình 120Hz (`👁 1 Mắt` / `🥽 2 Mắt`):**
+   - **Mặc định `👁 1 Mắt` AR toàn màn (`2400×1080`, zero-IPD):** Loại bỏ hiện tượng lệch thị sai 64mm khi đưa điện thoại sát bàn/đồ vật để đo khoảng cách & test vật lý chính xác tuyệt đối; bấm 1 chạm chuyển sang **`🥽 2 Mắt`** cho hộp kính VR Stereo.
+   - **Tạm tắt AI Tay mặc định (`🖐 TẮT`):** Chỉ nạp TFLite/GPU khi người dùng chủ động bật, giữ Render mượt ~120fps.
+2. **Hồng tâm ARCore 3D & Lưới kích thước thực (`🎯 Mặt bàn · 0.64m` & `🏠 Lưới 3D`):**
+   - Bắn tia `frame.hitTest` / `InstantPlacement (LOCAL_Y_UP)` theo thời gian thực để vẽ vòng hồng tâm ôm sát độ nghiêng mặt phẳng thực, hiển thị khoảng cách mét ở cạnh dưới và tự tổng hợp mảnh mặt phẳng `36cm` tức thì tại điểm chạm.
+   - **Lưới 20cm khóa cứng thế giới:** Phủ lưới góc phối cảnh mảnh (`20cm/ô`) lên sàn, mặt bàn, ghế và tường; hỗ trợ 4 chế độ (`Lưới 3D` ➔ `Ẩn lưới` ➔ `+AI Vật` ➔ `TẮT`).
+3. **Vật lý thực tế 4x Substeps (`⬇ Thả`, `🎯 Ném`, `🗑`):**
+   - **Khóa sàn thế giới thực (`anchored_floor_y`):** Không bị tụt sàn hay trôi xa ra khi cúi người/đưa camera lại gần vật thể.
+   - **`⬇ Thả` & `🎯 Ném`:** `⬇ Thả` thả rơi tự do vuông góc ngay phía trên điểm hồng tâm; `🎯 Ném` phóng vật theo cung parabol bù trọng lực tới đúng điểm đích đang nhắm.
+   - **Hành vi thực:** Khối lập phương tự xoay cân bằng mặt đáy nằm phẳng khi đáp lên bàn, phanh ma sát tĩnh chống trượt vô tận, lăn qua mép bàn là rơi xuống sàn bên dưới, bóng đổ 2 lớp (`umbra + penumbra`) và vòng sóng gợn khi va chạm mạnh.
 4. **Tự động cập nhật trong app (`🔄 Check` ➔ `⬇ Cập nhật`):**
    - App tự kiểm tra bản build mới nhất trên GitHub Releases (`latest-apk`), hiển thị nút xanh **`⬇ Cập nhật`** khi có bản mới, tải trực tiếp với % tiến độ và mở trình cài đặt đè ngay không mất dữ liệu.
 5. **Bảng thông số chi tiết của máy (`📊 Info`):**

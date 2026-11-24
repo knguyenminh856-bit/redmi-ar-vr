@@ -53,6 +53,7 @@ import com.google.ar.core.CameraConfigFilter
 import com.google.ar.core.Config
 import com.google.ar.core.Coordinates2d
 import com.google.ar.core.Plane
+import com.google.ar.core.Point
 import com.google.ar.core.Session
 import com.google.ar.core.TrackingState
 import java.nio.ByteBuffer
@@ -148,13 +149,21 @@ class MainActivity : Activity(), SensorEventListener {
     private var fovPct = 100
     private var ipdMm = 64
     @Volatile
+    private var stereoMode = false // false=1 Mắt (Full màn zero-IPD), true=2 Mắt (VR Stereo)
+    @Volatile
     private var drawMode = 0 // 0=Off, 1=1 Finger, 2=5 Fingers
     @Volatile
-    private var handMode = 1 // 1=Tự động, 2=Nhanh, 0=Tắt
+    private var handMode = 0 // 0=Tắt (mặc định tối ưu 3D), 1=Tự động, 2=Nhanh
     @Volatile
-    private var roomScanMode = 2 // 0=Tắt, 1=Sàn/Tường, 2=Đầy đủ (AR Plane + 2.5D + Đồ vật)
+    private var roomScanMode = 1 // 1=Lưới 3D, 3=Ẩn lưới (vẫn có vật lý + hồng tâm), 2=+AI Vật, 0=TẮT
     @Volatile
     private var cachedPlanesCount = 0
+    @Volatile
+    private var reticleHitKind = 0
+    @Volatile
+    private var reticleSurfaceKind = 0
+    @Volatile
+    private var reticleDistanceM = 0f
     private var telemetryVisible = false
     private var availableUpdate: UpdateCheckResult? = null
     private var pendingInstallPermissionResume = false
@@ -163,6 +172,8 @@ class MainActivity : Activity(), SensorEventListener {
     private var recenterRunnable: Runnable? = null
     private lateinit var leftGesturePopup: TextView
     private lateinit var rightGesturePopup: TextView
+    private lateinit var leftReticleHud: TextView
+    private lateinit var rightReticleHud: TextView
     private var hidePopupRunnable: Runnable? = null
     private lateinit var leftRoomPane: FrameLayout
     private lateinit var rightRoomPane: FrameLayout
@@ -173,18 +184,20 @@ class MainActivity : Activity(), SensorEventListener {
     private val roomLabelsBuf = FloatArray(36)
     private val packedPlanesBuf = FloatArray(120)
     private val pointCloudBuf = FloatArray(512 * 4)
+    private val reticleInfoBuf = FloatArray(3)
     private var lastPlaneExtractNs = 0L
     private var lastPointCloudNs = 0L
     private var roomLabelRunnable: Runnable? = null
     private lateinit var leftTelemetryCard: TextView
     private lateinit var rightTelemetryCard: TextView
+    private lateinit var eyeModeBtn: Button
     private lateinit var drawToggleBtn: Button
     private lateinit var handModeBtn: Button
     private lateinit var roomScanToggleBtn: Button
     private lateinit var checkUpdateBtn: Button
     private lateinit var installUpdateBtn: Button
     private lateinit var telemetryToggleBtn: Button
-    private val metricsBuf = FloatArray(13)
+    private val metricsBuf = FloatArray(16)
     private var cachedGpuName = ""
     private var telemetryRunnable: Runnable? = null
 
@@ -194,11 +207,12 @@ class MainActivity : Activity(), SensorEventListener {
         handTracker = HandTrackerHelper(this, mainHandler) { code ->
             showStereoGesturePopup(code)
         }
+        handTracker.setMode(handMode)
         roomScanner = RoomScannerHelper(this)
-        roomScanner.initAsync()
         appUpdater = AppUpdater(mainHandler)
 
         loadCalibration()
+        NativeBridge.nativeSetStereoMode(stereoMode)
         NativeBridge.nativeSetDrawMode(drawMode)
         NativeBridge.nativeSetRoomScanMode(roomScanMode)
         configureHighRefreshDisplayAndKeepOn()
@@ -354,6 +368,8 @@ class MainActivity : Activity(), SensorEventListener {
         rightGesturePopup = createPopupPill(nasalShiftPx = -8)
         leftTelemetryCard = createTelemetryCard(nasalShiftPx = 6)
         rightTelemetryCard = createTelemetryCard(nasalShiftPx = -6)
+        leftReticleHud = createReticleHudPill(nasalShiftPx = 4)
+        rightReticleHud = createReticleHudPill(nasalShiftPx = -4)
 
         val leftPane = FrameLayout(this).apply {
             isClickable = false
@@ -365,6 +381,7 @@ class MainActivity : Activity(), SensorEventListener {
             }
             addView(leftTelemetryCard)
             addView(leftGesturePopup)
+            addView(leftReticleHud)
         }
         val rightPane = FrameLayout(this).apply {
             isClickable = false
@@ -376,6 +393,7 @@ class MainActivity : Activity(), SensorEventListener {
             }
             addView(rightTelemetryCard)
             addView(rightGesturePopup)
+            addView(rightReticleHud)
         }
         leftRoomPane = leftPane
         rightRoomPane = rightPane
@@ -395,6 +413,54 @@ class MainActivity : Activity(), SensorEventListener {
                 FrameLayout.LayoutParams.MATCH_PARENT
             )
         )
+        applyStereoUiLayout()
+    }
+
+    private fun createReticleHudPill(nasalShiftPx: Int): TextView {
+        val bg = GradientDrawable().apply {
+            cornerRadius = 24f
+            setColor(Color.argb(170, 10, 16, 26))
+            setStroke(2, Color.argb(170, 46, 230, 230))
+        }
+        return TextView(this).apply {
+            visibility = View.GONE
+            background = bg
+            setTextColor(Color.parseColor("#E0F7FA"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(dp(10f), dp(4f), dp(10f), dp(4f))
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            ).apply {
+                bottomMargin = dp(10f)
+            }
+            translationX = nasalShiftPx.toFloat()
+        }
+    }
+
+    private fun applyStereoUiLayout() {
+        val leftLp = leftRoomPane.layoutParams as LinearLayout.LayoutParams
+        val rightLp = rightRoomPane.layoutParams as LinearLayout.LayoutParams
+        if (stereoMode) {
+            leftLp.weight = 1f
+            rightLp.weight = 1f
+            rightRoomPane.visibility = View.VISIBLE
+            leftGesturePopup.translationX = 8f
+            leftTelemetryCard.translationX = 6f
+            leftReticleHud.translationX = 4f
+        } else {
+            leftLp.weight = 2f
+            rightLp.weight = 0f
+            rightRoomPane.visibility = View.GONE
+            leftGesturePopup.translationX = 0f
+            leftTelemetryCard.translationX = 0f
+            leftReticleHud.translationX = 0f
+        }
+        leftRoomPane.layoutParams = leftLp
+        rightRoomPane.layoutParams = rightLp
+        rightTelemetryCard.visibility = if (stereoMode && telemetryVisible) View.VISIBLE else View.GONE
     }
 
     private fun createRoomTagView(): TextView {
@@ -475,22 +541,28 @@ class MainActivity : Activity(), SensorEventListener {
             gravity = Gravity.CENTER_VERTICAL
         }
 
-        val dropBtn = makeQuickButton("\uD83C\uDFB2 Thả", fillColor = Color.argb(195, 18, 120, 130)) {
-            NativeBridge.nativeSpawnPhysicsBody(1.65f)
+        val dropBtn = makeQuickButton("\u2B07 Thả", fillColor = Color.argb(200, 18, 120, 130)) {
+            NativeBridge.nativeDropPhysicsAtReticle()
         }
-        drawToggleBtn = makeQuickButton("\u270F TẮT") {
-            cycleDrawMode(showPopup = false)
-        }
-        handModeBtn = makeQuickButton("\uD83D\uDD90 T.Đ") {
-            cycleHandMode(showPopup = true)
+        val throwBtn = makeQuickButton("\uD83C\uDFAF Ném", fillColor = Color.argb(200, 166, 93, 26)) {
+            NativeBridge.nativeThrowPhysicsAtReticle(2.4f)
         }
         val clearBtn = makeQuickButton("\uD83D\uDDD1") {
             NativeBridge.nativeClearDrawings()
             NativeBridge.nativeClearPhysicsBodies()
-            showStereoBanner("\uD83E\uDDF9  Đã xóa nét vẽ & vật thể vật lý", "#FF5252", 1200L)
+            showStereoBanner("\uD83E\uDDF9  Đã xóa vật thể vật lý & nét vẽ", "#FF5252", 1200L)
         }
-        roomScanToggleBtn = makeQuickButton("\uD83C\uDFE0 2.5D") {
+        eyeModeBtn = makeQuickButton(if (stereoMode) "\uD83E\uDD7D 2 Mắt" else "\uD83D\uDC41 1 Mắt") {
+            toggleStereoMode(showPopup = true)
+        }
+        roomScanToggleBtn = makeQuickButton(roomScanLabel(roomScanMode)) {
             cycleRoomScanMode(showPopup = true)
+        }
+        handModeBtn = makeQuickButton(handModeLabel(handMode)) {
+            cycleHandMode(showPopup = true)
+        }
+        drawToggleBtn = makeQuickButton("\u270F TẮT") {
+            cycleDrawMode(showPopup = false)
         }
         checkUpdateBtn = makeQuickButton("\uD83D\uDD04") {
             performUpdateCheck(manual = true)
@@ -516,10 +588,12 @@ class MainActivity : Activity(), SensorEventListener {
         }
 
         bar.addView(dropBtn, itemParams)
-        bar.addView(drawToggleBtn, itemParams)
-        bar.addView(handModeBtn, itemParams)
+        bar.addView(throwBtn, itemParams)
         bar.addView(clearBtn, itemParams)
+        bar.addView(eyeModeBtn, itemParams)
         bar.addView(roomScanToggleBtn, itemParams)
+        bar.addView(handModeBtn, itemParams)
+        bar.addView(drawToggleBtn, itemParams)
         bar.addView(checkUpdateBtn, itemParams)
         bar.addView(installUpdateBtn, itemParams)
         bar.addView(telemetryToggleBtn, itemParams)
@@ -549,15 +623,44 @@ class MainActivity : Activity(), SensorEventListener {
         return Button(this).apply {
             text = label
             isAllCaps = false
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 9.5f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 9.0f)
             setTextColor(Color.WHITE)
             background = bg
             minHeight = 0
             minimumHeight = 0
             minWidth = 0
             minimumWidth = 0
-            setPadding(dp(5.5f), dp(4f), dp(5.5f), dp(4f))
+            setPadding(dp(4.5f), dp(3.5f), dp(4.5f), dp(3.5f))
             setOnClickListener { onClick() }
+        }
+    }
+
+    private fun handModeLabel(mode: Int): String = when (mode) {
+        2 -> "\uD83D\uDD90 NHANH"
+        1 -> "\uD83D\uDD90 T.Đ"
+        else -> "\uD83D\uDD90 TẮT"
+    }
+
+    private fun roomScanLabel(mode: Int): String = when (mode) {
+        1 -> "\uD83C\uDFE0 Lưới 3D"
+        3 -> "\uD83C\uDFE0 Ẩn lưới"
+        2 -> "\uD83C\uDFE0 +AI Vật"
+        else -> "\uD83C\uDFE0 TẮT"
+    }
+
+    private fun toggleStereoMode(showPopup: Boolean) {
+        stereoMode = !stereoMode
+        viewportDirty = true
+        NativeBridge.nativeSetStereoMode(stereoMode)
+        eyeModeBtn.text = if (stereoMode) "\uD83E\uDD7D 2 Mắt" else "\uD83D\uDC41 1 Mắt"
+        applyStereoUiLayout()
+        if (showPopup) {
+            val banner = if (stereoMode) {
+                "\uD83E\uDD7D  Chế độ 2 MẮT (VR Hộp Stereo)"
+            } else {
+                "\uD83D\uDC41  Chế độ 1 MẮT (Full màn AR chuẩn khoảng cách)"
+            }
+            showStereoBanner(banner, "#00E5FF", 1400L)
         }
     }
 
@@ -660,16 +763,12 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun cycleHandMode(showPopup: Boolean) {
         handMode = when (handMode) {
+            0 -> 1
             1 -> 2
-            2 -> 0
-            else -> 1
+            else -> 0
         }
         handTracker.setMode(handMode)
-        handModeBtn.text = when (handMode) {
-            2 -> "\uD83D\uDD90 NHANH"
-            0 -> "\uD83D\uDD90 TẮT"
-            else -> "\uD83D\uDD90 T.Đ"
-        }
+        handModeBtn.text = handModeLabel(handMode)
         if (showPopup) {
             val banner = when (handMode) {
                 2 -> "\uD83D\uDD90  AI Tay: NHANH (24Hz liên tục)"
@@ -681,19 +780,24 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     private fun cycleRoomScanMode(showPopup: Boolean) {
-        roomScanMode = (roomScanMode + 2) % 3 // Cycles 2 -> 1 -> 0 -> 2
-        val modeLabel = when (roomScanMode) {
-            2 -> "\uD83C\uDFE0 2.5D"
-            1 -> "\uD83C\uDFE0 SÀN"
-            else -> "\uD83C\uDFE0 TẮT"
+        roomScanMode = when (roomScanMode) {
+            1 -> 3
+            3 -> 2
+            2 -> 0
+            else -> 1
         }
-        roomScanToggleBtn.text = modeLabel
+        roomScanToggleBtn.text = roomScanLabel(roomScanMode)
         NativeBridge.nativeSetRoomScanMode(roomScanMode)
-        if (roomScanMode < 2) {
+        if (roomScanMode == 2) {
+            roomScanner.initAsync()
+        } else {
             roomScanner.resetMetrics()
         }
         if (roomScanMode == 0) {
             cachedPlanesCount = 0
+            reticleHitKind = 0
+            reticleSurfaceKind = 0
+            reticleDistanceM = 0f
         }
         updateArPlaneFindingMode()
 
@@ -702,13 +806,16 @@ class MainActivity : Activity(), SensorEventListener {
         } else {
             stopRoomLabelLoop()
             hideAllRoomTags()
+            leftReticleHud.visibility = View.GONE
+            rightReticleHud.visibility = View.GONE
         }
 
         if (showPopup) {
             val banner = when (roomScanMode) {
-                2 -> "\uD83C\uDFE0  Quét không gian: ĐẦY ĐỦ (Mặt phẳng + Đồ vật)"
-                1 -> "\uD83E\uDDF1  Quét không gian: CHỈ SÀN & TƯỜNG (Siêu nhẹ)"
-                else -> "\uD83C\uDFE0  Đã TẮT quét mặt phẳng & đồ vật"
+                1 -> "\uD83C\uDFE0  Không gian: LƯỚI 3D + HỒNG TÂM"
+                3 -> "\uD83C\uDFE0  Không gian: ẨN LƯỚI (Chỉ hồng tâm + Vật lý)"
+                2 -> "\uD83C\uDFE0  Không gian: ĐẦY ĐỦ (Lưới 3D + AI Đồ vật)"
+                else -> "\uD83C\uDFE0  Đã TẮT quét không gian & hồng tâm"
             }
             showStereoBanner(banner, "#2EE6E6", 1500L)
         }
@@ -740,12 +847,60 @@ class MainActivity : Activity(), SensorEventListener {
         }
     }
 
+    private fun surfaceShortName(kindId: Int): String = when (kindId) {
+        1 -> "Sàn"
+        2 -> "Tường"
+        3 -> "Mặt bàn"
+        4 -> "Ghế"
+        5 -> "Trần"
+        6 -> "Mặt đứng"
+        else -> "Bề mặt"
+    }
+
+    private fun updateReticleHudPills() {
+        if (roomScanMode <= 0) {
+            leftReticleHud.visibility = View.GONE
+            rightReticleHud.visibility = View.GONE
+            return
+        }
+        val hk = reticleHitKind
+        val sk = reticleSurfaceKind
+        val dist = reticleDistanceM
+        val (text, strokeCol) = if (hk > 0 && dist > 0.05f) {
+            val sName = surfaceShortName(sk)
+            if (hk == 3) {
+                String.format(Locale.US, "\uD83C\uDFAF %s (~%.2fm)", sName, dist) to Color.argb(170, 255, 193, 7)
+            } else {
+                String.format(Locale.US, "\uD83C\uDFAF %s \u00B7 %.2fm", sName, dist) to Color.argb(210, 46, 230, 230)
+            }
+        } else {
+            "\uD83D\uDD0D Hướng camera vào bàn hoặc sàn..." to Color.argb(140, 160, 180, 200)
+        }
+
+        leftReticleHud.text = text
+        (leftReticleHud.background as? GradientDrawable)?.setStroke(2, strokeCol)
+        leftReticleHud.visibility = View.VISIBLE
+
+        if (stereoMode) {
+            rightReticleHud.text = text
+            (rightReticleHud.background as? GradientDrawable)?.setStroke(2, strokeCol)
+            rightReticleHud.visibility = View.VISIBLE
+        } else {
+            rightReticleHud.visibility = View.GONE
+        }
+    }
+
     private fun updateRoomLabels() {
+        updateReticleHudPills()
+        if (roomScanMode == 3) {
+            hideAllRoomTags()
+            return
+        }
         val lw = leftRoomPane.width
         val lh = leftRoomPane.height
         val rw = rightRoomPane.width
         val rh = rightRoomPane.height
-        if (lw <= 0 || lh <= 0 || rw <= 0 || rh <= 0) {
+        if (lw <= 0 || lh <= 0 || (stereoMode && (rw <= 0 || rh <= 0))) {
             hideAllRoomTags()
             return
         }
@@ -768,7 +923,11 @@ class MainActivity : Activity(), SensorEventListener {
             val (labelText, accentColor) = resolveRoomTagStyle(kindId, pct)
 
             applyRoomTag(leftRoomTags[i], leftTagTextCache, i, labelText, accentColor, lu, lv, lw, lh)
-            applyRoomTag(rightRoomTags[i], rightTagTextCache, i, labelText, accentColor, ru, rv, rw, rh)
+            if (stereoMode) {
+                applyRoomTag(rightRoomTags[i], rightTagTextCache, i, labelText, accentColor, ru, rv, rw, rh)
+            } else {
+                rightRoomTags[i].visibility = View.GONE
+            }
         }
     }
 
@@ -825,9 +984,8 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun toggleTelemetryHud() {
         telemetryVisible = !telemetryVisible
-        val vis = if (telemetryVisible) View.VISIBLE else View.GONE
-        leftTelemetryCard.visibility = vis
-        rightTelemetryCard.visibility = vis
+        leftTelemetryCard.visibility = if (telemetryVisible) View.VISIBLE else View.GONE
+        rightTelemetryCard.visibility = if (telemetryVisible && stereoMode) View.VISIBLE else View.GONE
         telemetryToggleBtn.text = if (telemetryVisible) "\uD83D\uDCCA*" else "\uD83D\uDCCA"
         if (telemetryVisible) {
             startTelemetryLoop()
@@ -873,6 +1031,9 @@ class MainActivity : Activity(), SensorEventListener {
         val cachedPlanes = metricsBuf[10].toInt()
         val voxelCount = metricsBuf[11].toInt()
         val physBodies = metricsBuf[12].toInt()
+        val hitKind = metricsBuf[13].toInt()
+        val surfKind = metricsBuf[14].toInt()
+        val hitDist = metricsBuf[15]
 
         val batIntent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
         val level = batIntent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
@@ -921,24 +1082,32 @@ class MainActivity : Activity(), SensorEventListener {
         } else {
             "AI Tay (${handTracker.delegateLabel}): $aiFps fps (${inferMs}ms | LUT ${yuvUs}µs)"
         }
-        val objScanText = if (roomScanMode < 2) {
+        val objScanText = if (roomScanMode != 2) {
             "Đồ vật: TẮT"
         } else {
             "$activeObjects đồ vật (${scanInferMs}ms CPU)"
         }
+        val viewLabel = if (stereoMode) "2 Mắt VR" else "1 Mắt AR"
+        val reticleSummary = if (hitKind > 0 && hitDist > 0.05f) {
+            String.format(Locale.US, "%s %.2fm", surfaceShortName(surfKind), hitDist)
+        } else {
+            "Chưa khóa"
+        }
 
         val summary = StringBuilder()
             .append("Bản: v${BuildConfig.VERSION_NAME} ($shortSha) | ${Build.MODEL} ($soc)\n")
-            .append("GPU: $cachedGpuName\n")
+            .append("GPU: $cachedGpuName | Chế độ: $viewLabel\n")
             .append("Màn: ${displayModeW}x${displayModeH}@${displayHz}Hz | Pin: ${batPct}% (${String.format(Locale.US, "%.1f", tempC)}°C) | RAM: ${totalRamMb}MB\n")
             .append(String.format(Locale.US, "Render: %d fps (%.1f ms) | %s\n", renderFps, frameMs, handAiText))
-            .append("Track: $trackMode | Tay ($activeHands): $gestureName | Vẽ: ${strokeSegs} nét\n")
-            .append("2.5D: $activePlanes mặt (RAM:$cachedPlanes) | $voxelCount khối | $physBodies vật lý | $objScanText\n")
-            .append("Trỏ: $tipText")
+            .append("Track: $trackMode | Hồng tâm: $reticleSummary | Vẽ: ${strokeSegs} nét\n")
+            .append("3D: $activePlanes mặt (RAM:$cachedPlanes) | $voxelCount khối | $physBodies vật lý | $objScanText\n")
+            .append("Tay ($activeHands): $gestureName | Trỏ: $tipText")
             .toString()
 
         leftTelemetryCard.text = summary
-        rightTelemetryCard.text = summary
+        if (stereoMode) {
+            rightTelemetryCard.text = summary
+        }
     }
 
     private fun showStereoGesturePopup(code: Int) {
@@ -966,6 +1135,10 @@ class MainActivity : Activity(), SensorEventListener {
 
         for (pill in arrayOf(leftGesturePopup, rightGesturePopup)) {
             pill.animate().cancel()
+            if (pill === rightGesturePopup && !stereoMode) {
+                pill.visibility = View.GONE
+                continue
+            }
             pill.text = label
             (pill.background as? GradientDrawable)?.setStroke(strokeWidth, accentColor)
             pill.alpha = 0f
@@ -1056,7 +1229,7 @@ class MainActivity : Activity(), SensorEventListener {
             setTextColor(Color.LTGRAY)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
             setPadding(0, 12, 0, 0)
-            text = "Mẹo hộp VR: Volume+ = Đặt lại khối 3D | Volume- = Đổi chế độ Vẽ tay (Tắt / 1 ngón / 5 ngón)\nCombo: Chụm➔Nắm (Hút/Đẩy), Nắm➔Xòe (Sóng), Chụm➔Súng (Đổi màu), V➔Nắm (Xóa nét vẽ)"
+            text = "Điều khiển AR/VR 3D: [⬇ Thả] thả thẳng xuống hồng tâm | [🎯 Ném] ném theo quỹ đạo | [👁 1 Mắt / 🥽 2 Mắt]\nMẹo VR: Volume+ = Định tâm 3D | Volume- = Chuyển chế độ vẽ tay"
         }
 
         panelLayout.addView(fovLabel)
@@ -1227,6 +1400,7 @@ class MainActivity : Activity(), SensorEventListener {
                             Config.PlaneFindingMode.DISABLED
                         }
                         lightEstimationMode = Config.LightEstimationMode.DISABLED
+                        instantPlacementMode = Config.InstantPlacementMode.LOCAL_Y_UP
                         depthMode = Config.DepthMode.DISABLED
                         updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
                     }
@@ -1558,9 +1732,9 @@ class MainActivity : Activity(), SensorEventListener {
                         session.setCameraTextureName(cameraTexId)
                         arNeedsTextureBind = false
                     }
+                    val geomW = if (stereoMode) (viewWidth / 2).coerceAtLeast(1) else viewWidth.coerceAtLeast(1)
                     if (viewportDirty) {
-                        val eyeWidth = (viewWidth / 2).coerceAtLeast(1)
-                        session.setDisplayGeometry(displayRotation, eyeWidth, viewHeight)
+                        session.setDisplayGeometry(displayRotation, geomW, viewHeight)
                         viewportDirty = false
                     }
                     if (nowNs - lastArUpdateNs >= 31_000_000L) {
@@ -1602,6 +1776,101 @@ class MainActivity : Activity(), SensorEventListener {
                                     uvArray,
                                     valid
                                 )
+
+                                // Live ARCore center HitTest -> 3D surface reticle + patch synthesis
+                                if (roomScanMode > 0) {
+                                    var hitMatched = false
+                                    if (valid) {
+                                        try {
+                                            val hitX = geomW * 0.5f
+                                            val hitY = viewHeight * 0.5f
+                                            var chosenKind = 0
+                                            var chosenPose: com.google.ar.core.Pose? = null
+                                            var chosenDist = 0f
+
+                                            val hits = frame.hitTest(hitX, hitY)
+                                            for (hit in hits) {
+                                                val tr = hit.trackable
+                                                if (tr is Plane &&
+                                                    tr.trackingState == TrackingState.TRACKING &&
+                                                    tr.isPoseInPolygon(hit.hitPose) &&
+                                                    hit.distance in 0.15f..8.0f
+                                                ) {
+                                                    chosenKind = 1
+                                                    chosenPose = hit.hitPose
+                                                    chosenDist = hit.distance
+                                                    break
+                                                }
+                                            }
+                                            if (chosenPose == null) {
+                                                for (hit in hits) {
+                                                    val tr = hit.trackable
+                                                    if (tr is Point &&
+                                                        tr.trackingState == TrackingState.TRACKING &&
+                                                        tr.orientationMode == Point.OrientationMode.ESTIMATED_SURFACE_NORMAL &&
+                                                        hit.distance in 0.15f..6.0f
+                                                    ) {
+                                                        chosenKind = 2
+                                                        chosenPose = hit.hitPose
+                                                        chosenDist = hit.distance
+                                                        break
+                                                    }
+                                                }
+                                            }
+                                            if (chosenPose == null) {
+                                                val instHits = frame.hitTestInstantPlacement(hitX, hitY, 1.1f)
+                                                for (hit in instHits) {
+                                                    if (hit.trackable.trackingState == TrackingState.TRACKING &&
+                                                        hit.distance in 0.15f..5.0f
+                                                    ) {
+                                                        chosenKind = 2
+                                                        chosenPose = hit.hitPose
+                                                        chosenDist = hit.distance
+                                                        break
+                                                    }
+                                                }
+                                            }
+
+                                            if (chosenPose != null) {
+                                                val yAxis = chosenPose.yAxis
+                                                NativeBridge.nativeOnSurfaceReticle(
+                                                    true,
+                                                    chosenKind,
+                                                    chosenPose.tx(),
+                                                    chosenPose.ty(),
+                                                    chosenPose.tz(),
+                                                    yAxis[0],
+                                                    yAxis[1],
+                                                    yAxis[2],
+                                                    chosenDist,
+                                                    reticleInfoBuf
+                                                )
+                                                reticleHitKind = reticleInfoBuf[0].toInt()
+                                                reticleSurfaceKind = reticleInfoBuf[1].toInt()
+                                                reticleDistanceM = reticleInfoBuf[2]
+                                                hitMatched = true
+                                            }
+                                        } catch (_: Throwable) {
+                                        }
+                                    }
+                                    if (!hitMatched) {
+                                        NativeBridge.nativeOnSurfaceReticle(
+                                            false,
+                                            0,
+                                            0f,
+                                            0f,
+                                            0f,
+                                            0f,
+                                            1f,
+                                            0f,
+                                            0f,
+                                            reticleInfoBuf
+                                        )
+                                        reticleHitKind = reticleInfoBuf[0].toInt()
+                                        reticleSurfaceKind = reticleInfoBuf[1].toInt()
+                                        reticleDistanceM = reticleInfoBuf[2]
+                                    }
+                                }
 
                                 // Adaptive spatial plane sampling: 4Hz during initial discovery, 1.25Hz once mapped
                                 val planeIntervalNs = if (cachedPlanesCount < 3) 250_000_000L else 800_000_000L
@@ -1708,6 +1977,23 @@ class MainActivity : Activity(), SensorEventListener {
                                 fallbackTanHalfV,
                                 uvArray
                             )
+                            if (roomScanMode > 0) {
+                                NativeBridge.nativeOnSurfaceReticle(
+                                    false,
+                                    0,
+                                    0f,
+                                    0f,
+                                    0f,
+                                    0f,
+                                    1f,
+                                    0f,
+                                    0f,
+                                    reticleInfoBuf
+                                )
+                                reticleHitKind = reticleInfoBuf[0].toInt()
+                                reticleSurfaceKind = reticleInfoBuf[1].toInt()
+                                reticleDistanceM = reticleInfoBuf[2]
+                            }
                         } catch (t: Throwable) {
                             Log.w(TAG, "Fallback texture update warning: ${t.message}")
                         }

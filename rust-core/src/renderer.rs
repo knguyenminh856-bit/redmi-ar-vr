@@ -5,10 +5,10 @@ use crate::hand_tracking::{
     FLOATS_PER_LANDMARK, LANDMARKS_PER_HAND, MAX_HANDS,
 };
 use crate::passthrough::{compute_quad_half_extents, PassthroughRenderer, PASSTHROUGH_DIST};
-use crate::physics_3d::{BodyShape, PhysicsBody, PhysicsRenderer, PhysicsWorld};
+use crate::physics_3d::{BodyShape, ImpactRing, PhysicsBody, PhysicsRenderer, PhysicsWorld};
 use crate::room_scanner::{
-    project_room_labels, AabbCollider, PlaneMarker, ProjectedLabel, RoomScannerRenderer,
-    SpatialMemoryCache, WorldObjectMarker,
+    project_room_labels, AabbCollider, PlaneMarker, ProjectedLabel, ReticleHit,
+    RoomScannerRenderer, SpatialMemoryCache, SurfaceKind, WorldObjectMarker,
 };
 use crate::scene_3d::Scene3D;
 use glam::{Mat4, Quat, Vec3};
@@ -30,6 +30,9 @@ pub struct PerfMetrics {
     pub cached_planes: u32,
     pub voxel_count: u32,
     pub physics_bodies: u32,
+    pub reticle_hit_kind: i32,
+    pub reticle_surface_kind: i32,
+    pub reticle_dist: f32,
 }
 
 /// Thread-safe input state updated by Android sensor/camera/UI threads.
@@ -50,8 +53,11 @@ pub struct SharedInputState {
 
     pub fov_scale: f32,
     pub ipd_meters: f32,
+    pub stereo_mode: bool,
+    pub show_demo_scene: bool,
     pub recenter_requested: bool,
     pub anchor_origin: Option<Mat4>,
+    pub anchored_floor_y: Option<f32>,
 
     pub hands: [Option<HandData>; MAX_HANDS],
     pub last_hand_instant: Option<Instant>,
@@ -66,6 +72,7 @@ pub struct SharedInputState {
     pub palette_idx: u32,
 
     pub room_scan_mode: i32,
+    pub reticle: ReticleHit,
     pub spatial_cache: SpatialMemoryCache,
     pub projected_labels: Vec<ProjectedLabel>,
 
@@ -90,8 +97,11 @@ impl Default for SharedInputState {
             cam_uvs: [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
             fov_scale: 1.0,
             ipd_meters: 0.064,
+            stereo_mode: false,
+            show_demo_scene: false,
             recenter_requested: false,
             anchor_origin: None,
+            anchored_floor_y: None,
             hands: [None; MAX_HANDS],
             last_hand_instant: None,
             gesture_tracker: GestureTracker::default(),
@@ -101,7 +111,8 @@ impl Default for SharedInputState {
             pull_closer: false,
             boost_until: None,
             palette_idx: 0,
-            room_scan_mode: 2,
+            room_scan_mode: 1,
+            reticle: ReticleHit::default(),
             spatial_cache: SpatialMemoryCache::default(),
             projected_labels: Vec::new(),
             physics: PhysicsWorld::default(),
@@ -148,6 +159,9 @@ impl SharedInputState {
                 self.ar_rot = q.normalize();
                 self.gyro_at_ar_capture = self.gyro_latest;
                 self.has_ar_pose = true;
+                if py.is_finite() {
+                    self.anchored_floor_y.get_or_insert(py - 1.35);
+                }
             }
         }
     }
@@ -186,18 +200,119 @@ impl SharedInputState {
     }
 
     pub fn set_room_scan_mode(&mut self, mode: i32) {
-        let clamped = mode.clamp(0, 2);
+        let clamped = mode.clamp(0, 3);
         self.room_scan_mode = clamped;
         if clamped == 0 {
             self.spatial_cache.clear();
             self.projected_labels.clear();
+            self.reticle = ReticleHit::default();
             self.perf.active_planes = 0;
             self.perf.active_objects = 0;
             self.perf.cached_planes = 0;
-        } else if clamped == 1 {
+            self.perf.reticle_hit_kind = 0;
+            self.perf.reticle_surface_kind = 0;
+            self.perf.reticle_dist = 0.0;
+        } else if clamped != 2 {
             self.spatial_cache.clear_objects();
             self.perf.active_objects = 0;
         }
+    }
+
+    pub fn set_stereo_mode(&mut self, enabled: bool) {
+        self.stereo_mode = enabled;
+    }
+
+    fn current_cam_pose(&self) -> (Vec3, Quat) {
+        if self.has_ar_pose {
+            (self.ar_pos, self.ar_rot)
+        } else {
+            let head = if self.has_gyro {
+                self.gyro_latest
+            } else {
+                Quat::IDENTITY
+            };
+            (Vec3::ZERO, head)
+        }
+    }
+
+    pub fn on_surface_reticle(
+        &mut self,
+        valid: bool,
+        hit_kind: i32,
+        pos: Vec3,
+        normal: Vec3,
+        distance: f32,
+    ) -> (i32, i32, f32) {
+        if self.room_scan_mode <= 0 {
+            self.reticle = ReticleHit::default();
+            self.perf.reticle_hit_kind = 0;
+            self.perf.reticle_surface_kind = 0;
+            self.perf.reticle_dist = 0.0;
+            return (0, 0, 0.0);
+        }
+
+        let (cam_pos, cam_rot) = self.current_cam_pose();
+        if valid && pos.is_finite() && normal.is_finite() {
+            let n = {
+                let cand = normal.normalize_or_zero();
+                if cand.length_squared() > 1e-4 {
+                    cand
+                } else {
+                    Vec3::Y
+                }
+            };
+            let skind = self
+                .spatial_cache
+                .ingest_hit_surface(pos, n, cam_pos.y, hit_kind);
+            let dist = if distance > 0.05 && distance.is_finite() {
+                distance
+            } else {
+                (pos - cam_pos).length()
+            };
+            self.reticle = ReticleHit {
+                valid: true,
+                hit_kind,
+                surface_kind: skind,
+                pos,
+                normal: n,
+                distance: dist,
+            };
+            self.perf.reticle_hit_kind = hit_kind;
+            self.perf.reticle_surface_kind = skind as i32;
+            self.perf.reticle_dist = dist;
+            return (hit_kind, skind as i32, dist);
+        }
+
+        // Ray-floor fallback when aiming downward below eye level
+        let dir = (cam_rot * -Vec3::Z).normalize_or_zero();
+        let floor_y = self
+            .spatial_cache
+            .inferred_floor_y()
+            .unwrap_or_else(|| self.anchored_floor_y.unwrap_or(cam_pos.y - 1.35));
+        if dir.y < -0.08 {
+            let t = (floor_y - cam_pos.y) / dir.y;
+            if (0.35..=5.0).contains(&t) {
+                let hit_pos = cam_pos + dir * t;
+                self.reticle = ReticleHit {
+                    valid: true,
+                    hit_kind: 3,
+                    surface_kind: SurfaceKind::Floor,
+                    pos: hit_pos,
+                    normal: Vec3::Y,
+                    distance: t,
+                };
+                self.perf.reticle_hit_kind = 3;
+                self.perf.reticle_surface_kind = SurfaceKind::Floor as i32;
+                self.perf.reticle_dist = t;
+                return (3, SurfaceKind::Floor as i32, t);
+            }
+        }
+
+        self.reticle = ReticleHit::default();
+        self.perf.reticle_hit_kind = 0;
+        self.perf.reticle_surface_kind = 0;
+        self.perf.reticle_dist = 0.0;
+        (0, 0, 0.0)
     }
 
     pub fn on_ar_planes(&mut self, count: usize, packed: &[f32]) {
@@ -218,7 +333,7 @@ impl SharedInputState {
         tan_h: f32,
         tan_v: f32,
     ) {
-        if self.room_scan_mode < 2 {
+        if self.room_scan_mode != 2 {
             self.spatial_cache.clear_objects();
             return;
         }
@@ -248,19 +363,38 @@ impl SharedInputState {
     }
 
     pub fn spawn_physics_from_camera(&mut self, throw_speed: f32) {
-        let (cam_pos, cam_rot) = if self.has_ar_pose {
-            (self.ar_pos, self.ar_rot)
+        self.throw_physics_at_reticle(throw_speed);
+    }
+
+    pub fn drop_physics_at_reticle(&mut self) {
+        let (cam_pos, cam_rot) = self.current_cam_pose();
+        if self.reticle.valid && self.reticle.pos.is_finite() {
+            self.physics
+                .spawn_drop(self.reticle.pos, self.reticle.normal, None);
         } else {
-            let head = if self.has_gyro {
-                self.gyro_latest
-            } else {
-                Quat::IDENTITY
-            };
-            (Vec3::ZERO, head)
-        };
+            let dir = (cam_rot * -Vec3::Z).normalize_or_zero();
+            let floor_y = self
+                .spatial_cache
+                .inferred_floor_y()
+                .unwrap_or_else(|| self.anchored_floor_y.unwrap_or(cam_pos.y - 1.35));
+            let pos = Vec3::new(cam_pos.x + dir.x * 0.75, floor_y, cam_pos.z + dir.z * 0.75);
+            self.physics.spawn_drop(pos, Vec3::Y, None);
+        }
+    }
+
+    pub fn throw_physics_at_reticle(&mut self, throw_speed: f32) {
+        let (cam_pos, cam_rot) = self.current_cam_pose();
         let dir = (cam_rot * -Vec3::Z).normalize_or_zero();
-        let origin = cam_pos + dir * 0.42 + Vec3::new(0.0, 0.05, 0.0);
-        self.physics.spawn_throw(origin, dir, throw_speed, None);
+        if self.reticle.valid && self.reticle.pos.is_finite() {
+            let dist = (self.reticle.pos - cam_pos).length();
+            let launch_off = (dist * 0.30).clamp(0.14, 0.38);
+            let origin = cam_pos + dir * launch_off + Vec3::new(0.0, 0.02, 0.0);
+            self.physics
+                .spawn_throw_at(origin, self.reticle.pos, dir, throw_speed, None);
+        } else {
+            let origin = cam_pos + dir * 0.35 + Vec3::new(0.0, 0.04, 0.0);
+            self.physics.spawn_throw(origin, dir, throw_speed, None);
+        }
     }
 
     pub fn clear_physics_bodies(&mut self) {
@@ -429,10 +563,14 @@ impl SharedInputState {
 
         let dt_phys = now.duration_since(self.last_physics_step).as_secs_f32();
         self.last_physics_step = now;
-        let fallback_floor_y = self
-            .spatial_cache
-            .inferred_floor_y()
-            .unwrap_or(cam_pos_capture.y - 1.35);
+        let fallback_floor_y = if let Some(inferred) = self.spatial_cache.inferred_floor_y() {
+            self.anchored_floor_y = Some(inferred);
+            inferred
+        } else {
+            *self
+                .anchored_floor_y
+                .get_or_insert(cam_pos_capture.y - 1.35)
+        };
         self.physics.step(
             dt_phys,
             &active_planes,
@@ -469,6 +607,8 @@ impl SharedInputState {
             uvs: self.cam_uvs,
             fov_scale: self.fov_scale,
             ipd_meters: self.ipd_meters,
+            stereo_mode: self.stereo_mode,
+            show_demo_scene: self.show_demo_scene,
             hands: active_hands,
             pull_closer: self.pull_closer,
             boost_factor,
@@ -478,7 +618,14 @@ impl SharedInputState {
             room_planes: active_planes,
             room_objects: active_objects,
             blocks_25d,
+            reticle: if self.room_scan_mode > 0 {
+                self.reticle
+            } else {
+                ReticleHit::default()
+            },
+            show_grid: matches!(self.room_scan_mode, 1 | 2),
             physics_bodies: self.physics.bodies.clone(),
+            physics_rings: self.physics.impact_rings.clone(),
         }
     }
 }
@@ -495,6 +642,8 @@ pub struct FrameSnapshot {
     pub uvs: [f32; 8],
     pub fov_scale: f32,
     pub ipd_meters: f32,
+    pub stereo_mode: bool,
+    pub show_demo_scene: bool,
     pub hands: [Option<HandData>; MAX_HANDS],
     pub pull_closer: bool,
     pub boost_factor: f32,
@@ -504,7 +653,10 @@ pub struct FrameSnapshot {
     pub room_planes: Vec<PlaneMarker>,
     pub room_objects: Vec<WorldObjectMarker>,
     pub blocks_25d: Vec<AabbCollider>,
+    pub reticle: ReticleHit,
+    pub show_grid: bool,
     pub physics_bodies: Vec<PhysicsBody>,
+    pub physics_rings: Vec<ImpactRing>,
 }
 
 pub fn compute_yaw_aligned_anchor(head_pos: Vec3, head_rot: Quat) -> Mat4 {
@@ -525,12 +677,13 @@ pub fn compute_eye_projection(
     cam_tan_h: f32,
     cam_tan_v: f32,
     fov_scale: f32,
+    overscan: f32,
 ) -> Mat4 {
     let safe_aspect = eye_aspect.max(0.2);
     let safe_h = cam_tan_h.clamp(0.2, 2.5);
     let safe_v = cam_tan_v.clamp(0.2, 2.5);
     let cover_tan_v = safe_v.min(safe_h / safe_aspect);
-    let fill = fov_scale.clamp(0.50, 1.15) * 1.06;
+    let fill = fov_scale.clamp(0.50, 1.15) * overscan.clamp(1.00, 1.15);
     let eye_tan_v = (cover_tan_v / fill).clamp(0.18, 2.2);
     Mat4::perspective_rh_gl(2.0 * eye_tan_v.atan(), safe_aspect, 0.05, 50.0)
 }
@@ -667,9 +820,6 @@ impl GlRenderer {
 
         let w = self.width;
         let h = self.height;
-        let half_w = (w / 2).max(1);
-        let right_w = (w - half_w).max(1);
-        let eye_aspect = half_w as f32 / h as f32;
 
         self.passthrough.update_quad(
             &self.gl,
@@ -693,103 +843,182 @@ impl GlRenderer {
             &snap.room_planes,
             &snap.room_objects,
             &snap.blocks_25d,
+            &snap.reticle,
+            snap.show_grid,
             snap.head_pos_120hz,
             snap.head_rot_120hz,
         );
 
-        let proj_eye = compute_eye_projection(
-            eye_aspect,
-            snap.tan_half_h,
-            snap.tan_half_v,
-            snap.fov_scale,
-        );
-        let (left_view, right_view) =
-            compute_stereo_views(snap.head_pos_120hz, snap.head_rot_120hz, snap.ipd_meters);
-
         let t_cam_capture =
             Mat4::from_rotation_translation(snap.cam_rot_capture, snap.cam_pos_capture);
-
         let elapsed = self.start_time.elapsed().as_secs_f32();
-        let (cube_model, octa_model) = Scene3D::object_transforms(
-            &snap.anchor_origin,
-            elapsed,
-            snap.pull_closer,
-            snap.boost_factor,
-        );
+        let (cube_model, octa_model) = if snap.show_demo_scene {
+            Scene3D::object_transforms(
+                &snap.anchor_origin,
+                elapsed,
+                snap.pull_closer,
+                snap.boost_factor,
+            )
+        } else {
+            (Mat4::IDENTITY, Mat4::IDENTITY)
+        };
 
-        let left_vp = proj_eye * left_view;
-        let left_pass_mvp = left_vp * t_cam_capture;
-        let right_vp = proj_eye * right_view;
-        let right_pass_mvp = right_vp * t_cam_capture;
-
-        let (left_scissor, left_uv_bounds) =
-            compute_quad_screen_bounds(&left_pass_mvp, quad_hw, quad_hh, 0, half_w, h);
-        let (right_scissor, right_uv_bounds) =
-            compute_quad_screen_bounds(&right_pass_mvp, quad_hw, quad_hh, half_w, right_w, h);
-
-        unsafe {
-            self.gl.viewport(0, 0, w, h);
-            self.gl.clear_color(0.0, 0.0, 0.0, 1.0);
-            self.gl
-                .clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);
-
-            // Left eye viewport
-            self.gl.viewport(0, 0, half_w, h);
-            self.passthrough
-                .draw(&self.gl, &left_pass_mvp, snap.has_camera_frame);
-            self.scene.draw(
-                &self.gl,
-                &left_vp,
-                &cube_model,
-                &octa_model,
-                snap.palette_idx,
+        let (left_vp, right_vp, left_uv_bounds, right_uv_bounds) = if !snap.stereo_mode {
+            let eye_aspect = w as f32 / h as f32;
+            let proj = compute_eye_projection(
+                eye_aspect,
+                snap.tan_half_h,
+                snap.tan_half_v,
+                snap.fov_scale,
+                1.02,
             );
-            self.physics_renderer
-                .draw(&self.gl, &left_vp, &snap.physics_bodies);
-            self.gl.enable(glow::SCISSOR_TEST);
-            self.gl.scissor(
-                left_scissor.0,
-                left_scissor.1,
-                left_scissor.2,
-                left_scissor.3,
-            );
-            self.room_scanner.draw_world_markers(&self.gl, &left_vp);
-            self.gl.disable(glow::SCISSOR_TEST);
-            self.finger_draw.draw(&self.gl, &left_vp);
-            self.hand_overlay.draw(&self.gl, &left_pass_mvp);
+            let mono_view =
+                Mat4::from_rotation_translation(snap.head_rot_120hz, snap.head_pos_120hz).inverse();
+            let vp = proj * mono_view;
+            let pass_mvp = vp * t_cam_capture;
+            let (mono_scissor, mono_uv_bounds) =
+                compute_quad_screen_bounds(&pass_mvp, quad_hw, quad_hh, 0, w, h);
 
-            // Right eye viewport
-            self.gl.viewport(half_w, 0, right_w, h);
-            self.passthrough
-                .draw(&self.gl, &right_pass_mvp, snap.has_camera_frame);
-            self.scene.draw(
-                &self.gl,
-                &right_vp,
-                &cube_model,
-                &octa_model,
-                snap.palette_idx,
-            );
-            self.physics_renderer
-                .draw(&self.gl, &right_vp, &snap.physics_bodies);
-            self.gl.enable(glow::SCISSOR_TEST);
-            self.gl.scissor(
-                right_scissor.0,
-                right_scissor.1,
-                right_scissor.2,
-                right_scissor.3,
-            );
-            self.room_scanner.draw_world_markers(&self.gl, &right_vp);
-            self.gl.disable(glow::SCISSOR_TEST);
-            self.finger_draw.draw(&self.gl, &right_vp);
-            self.hand_overlay.draw(&self.gl, &right_pass_mvp);
+            unsafe {
+                self.gl.viewport(0, 0, w, h);
+                self.gl.clear_color(0.0, 0.0, 0.0, 1.0);
+                self.gl
+                    .clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);
 
-            // Subtle 2px VR headset center ridge alignment guide
-            self.gl.enable(glow::SCISSOR_TEST);
-            self.gl.scissor((half_w - 1).max(0), 0, 2, h);
-            self.gl.clear_color(0.12, 0.12, 0.15, 1.0);
-            self.gl.clear(glow::COLOR_BUFFER_BIT);
-            self.gl.disable(glow::SCISSOR_TEST);
-        }
+                self.passthrough
+                    .draw(&self.gl, &pass_mvp, snap.has_camera_frame);
+                if snap.show_demo_scene {
+                    self.scene.draw(
+                        &self.gl,
+                        &vp,
+                        &cube_model,
+                        &octa_model,
+                        snap.palette_idx,
+                    );
+                }
+                self.physics_renderer.draw(
+                    &self.gl,
+                    &vp,
+                    &snap.physics_bodies,
+                    &snap.physics_rings,
+                );
+                self.gl.enable(glow::SCISSOR_TEST);
+                self.gl.scissor(
+                    mono_scissor.0,
+                    mono_scissor.1,
+                    mono_scissor.2,
+                    mono_scissor.3,
+                );
+                self.room_scanner.draw_world_markers(&self.gl, &vp);
+                self.gl.disable(glow::SCISSOR_TEST);
+                self.finger_draw.draw(&self.gl, &vp);
+                self.hand_overlay.draw(&self.gl, &pass_mvp);
+            }
+
+            (vp, vp, mono_uv_bounds, mono_uv_bounds)
+        } else {
+            let half_w = (w / 2).max(1);
+            let right_w = (w - half_w).max(1);
+            let eye_aspect = half_w as f32 / h as f32;
+
+            let proj_eye = compute_eye_projection(
+                eye_aspect,
+                snap.tan_half_h,
+                snap.tan_half_v,
+                snap.fov_scale,
+                1.06,
+            );
+            let (left_view, right_view) =
+                compute_stereo_views(snap.head_pos_120hz, snap.head_rot_120hz, snap.ipd_meters);
+
+            let left_vp = proj_eye * left_view;
+            let left_pass_mvp = left_vp * t_cam_capture;
+            let right_vp = proj_eye * right_view;
+            let right_pass_mvp = right_vp * t_cam_capture;
+
+            let (left_scissor, left_uv_bounds) =
+                compute_quad_screen_bounds(&left_pass_mvp, quad_hw, quad_hh, 0, half_w, h);
+            let (right_scissor, right_uv_bounds) =
+                compute_quad_screen_bounds(&right_pass_mvp, quad_hw, quad_hh, half_w, right_w, h);
+
+            unsafe {
+                self.gl.viewport(0, 0, w, h);
+                self.gl.clear_color(0.0, 0.0, 0.0, 1.0);
+                self.gl
+                    .clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);
+
+                // Left eye viewport
+                self.gl.viewport(0, 0, half_w, h);
+                self.passthrough
+                    .draw(&self.gl, &left_pass_mvp, snap.has_camera_frame);
+                if snap.show_demo_scene {
+                    self.scene.draw(
+                        &self.gl,
+                        &left_vp,
+                        &cube_model,
+                        &octa_model,
+                        snap.palette_idx,
+                    );
+                }
+                self.physics_renderer.draw(
+                    &self.gl,
+                    &left_vp,
+                    &snap.physics_bodies,
+                    &snap.physics_rings,
+                );
+                self.gl.enable(glow::SCISSOR_TEST);
+                self.gl.scissor(
+                    left_scissor.0,
+                    left_scissor.1,
+                    left_scissor.2,
+                    left_scissor.3,
+                );
+                self.room_scanner.draw_world_markers(&self.gl, &left_vp);
+                self.gl.disable(glow::SCISSOR_TEST);
+                self.finger_draw.draw(&self.gl, &left_vp);
+                self.hand_overlay.draw(&self.gl, &left_pass_mvp);
+
+                // Right eye viewport
+                self.gl.viewport(half_w, 0, right_w, h);
+                self.passthrough
+                    .draw(&self.gl, &right_pass_mvp, snap.has_camera_frame);
+                if snap.show_demo_scene {
+                    self.scene.draw(
+                        &self.gl,
+                        &right_vp,
+                        &cube_model,
+                        &octa_model,
+                        snap.palette_idx,
+                    );
+                }
+                self.physics_renderer.draw(
+                    &self.gl,
+                    &right_vp,
+                    &snap.physics_bodies,
+                    &snap.physics_rings,
+                );
+                self.gl.enable(glow::SCISSOR_TEST);
+                self.gl.scissor(
+                    right_scissor.0,
+                    right_scissor.1,
+                    right_scissor.2,
+                    right_scissor.3,
+                );
+                self.room_scanner.draw_world_markers(&self.gl, &right_vp);
+                self.gl.disable(glow::SCISSOR_TEST);
+                self.finger_draw.draw(&self.gl, &right_vp);
+                self.hand_overlay.draw(&self.gl, &right_pass_mvp);
+
+                // Subtle 2px VR headset center ridge alignment guide
+                self.gl.enable(glow::SCISSOR_TEST);
+                self.gl.scissor((half_w - 1).max(0), 0, 2, h);
+                self.gl.clear_color(0.12, 0.12, 0.15, 1.0);
+                self.gl.clear(glow::COLOR_BUFFER_BIT);
+                self.gl.disable(glow::SCISSOR_TEST);
+            }
+
+            (left_vp, right_vp, left_uv_bounds, right_uv_bounds)
+        };
 
         let labels = if snap.room_planes.is_empty() && snap.room_objects.is_empty() {
             Vec::new()
@@ -845,7 +1074,7 @@ mod tests {
         let quad_pt = Vec3::new(cam_ndc_x * quad_hw, cam_ndc_y * quad_hh, -PASSTHROUGH_DIST);
 
         for fov_scale in [0.65f32, 0.85, 1.00] {
-            let proj = compute_eye_projection(eye_aspect, tan_h, tan_v, fov_scale);
+            let proj = compute_eye_projection(eye_aspect, tan_h, tan_v, fov_scale, 1.06);
             let clip_world = proj * world_pt.extend(1.0);
             let clip_quad = proj * quad_pt.extend(1.0);
             let ndc_world = (clip_world.x / clip_world.w, clip_world.y / clip_world.w);
@@ -854,10 +1083,63 @@ mod tests {
             assert!((ndc_world.1 - ndc_quad.1).abs() < 1e-4);
         }
 
-        // At 100% scale, camera quad corners must completely cover [-1, 1] NDC edge-to-edge (overscan >= 1.05)
-        let full_proj = compute_eye_projection(eye_aspect, tan_h, tan_v, 1.0);
+        // At 100% scale, camera quad corners must completely cover [-1, 1] NDC edge-to-edge (overscan >= 1.05 in stereo, >= 1.01 in mono)
+        let full_proj = compute_eye_projection(eye_aspect, tan_h, tan_v, 1.0, 1.06);
         let clip_corner = full_proj * Vec3::new(quad_hw, quad_hh, -PASSTHROUGH_DIST).extend(1.0);
         assert!(clip_corner.x / clip_corner.w >= 1.05);
         assert!(clip_corner.y / clip_corner.w >= 1.05);
+
+        let mono_proj = compute_eye_projection(2400.0 / 1080.0, tan_h, tan_v, 1.0, 1.02);
+        let clip_mono = mono_proj * Vec3::new(quad_hw, quad_hh, -PASSTHROUGH_DIST).extend(1.0);
+        assert!(clip_mono.x / clip_mono.w >= 1.01);
+        assert!(clip_mono.y / clip_mono.w >= 1.01);
+    }
+
+    #[test]
+    fn anchored_floor_locks_in_world_and_reticle_drop_does_not_chase_camera() {
+        let mut state = SharedInputState::default();
+        assert!(!state.stereo_mode);
+        assert!(!state.show_demo_scene);
+        assert_eq!(state.room_scan_mode, 1);
+
+        // Camera starts at y = 0.0 -> world floor anchors at -1.35
+        state.on_ar_frame(
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.67,
+            0.50,
+            [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            true,
+        );
+        let snap1 = state.snapshot_frame();
+        assert_eq!(state.anchored_floor_y, Some(-1.35));
+
+        // Walk closer / crouch lower: anchored floor does NOT shift downward with camera!
+        state.on_ar_frame(
+            0.0,
+            -0.45,
+            -0.40,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.67,
+            0.50,
+            [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            true,
+        );
+        state.on_surface_reticle(true, 2, Vec3::new(0.0, -0.35, -0.75), Vec3::Y, 0.37);
+        state.drop_physics_at_reticle();
+        let snap2 = state.snapshot_frame();
+        assert_eq!(state.anchored_floor_y, Some(-1.35));
+        assert_eq!(snap2.physics_bodies.len(), 1);
+        assert!(snap2.reticle.valid);
+        assert_eq!(snap2.reticle.surface_kind, SurfaceKind::Table);
+        let _ = snap1;
     }
 }

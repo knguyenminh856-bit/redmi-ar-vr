@@ -5,6 +5,7 @@ use glow::HasContext;
 use std::mem::size_of;
 
 pub const MAX_BODIES: usize = 16;
+pub const MAX_IMPACT_RINGS: usize = 16;
 const GRAVITY_Y: f32 = 9.81;
 
 const PHYS_VERT: &str = r#"
@@ -34,11 +35,11 @@ void main() {
     vec3 n = normalize(v_normal_w);
     vec3 light_dir = normalize(vec3(0.45, 0.85, 0.55));
     float diff = max(dot(n, light_dir), 0.0);
-    float hemi = 0.36 + 0.22 * n.y;
+    float hemi = 0.42 + 0.20 * n.y;
     vec3 view_dir = normalize(vec3(0.0, 0.20, 1.0));
     vec3 half_vec = normalize(light_dir + view_dir);
-    float spec = pow(max(dot(n, half_vec), 0.0), 28.0) * 0.32;
-    vec3 lit = u_color.rgb * (hemi + diff * 0.72) + vec3(spec) + vec3(0.35, 0.45, 0.55) * u_flash;
+    float spec = pow(max(dot(n, half_vec), 0.0), 20.0) * 0.24;
+    vec3 lit = u_color.rgb * (hemi + diff * 0.68) + vec3(spec) + vec3(0.28, 0.36, 0.44) * u_flash;
     gl_FragColor = vec4(lit, u_color.a);
 }
 "#;
@@ -64,17 +65,34 @@ pub struct PhysicsBody {
     pub shadow_y: f32,
 }
 
+#[derive(Clone, Debug)]
+pub struct ImpactRing {
+    pub pos: Vec3,
+    pub normal: Vec3,
+    pub age: f32,
+    pub max_age: f32,
+    pub color: [f32; 3],
+}
+
 const BODY_PALETTE: [[f32; 3]; 6] = [
-    [0.18, 0.92, 0.86], // Cyan
-    [1.00, 0.62, 0.22], // Tangerine
-    [0.42, 0.96, 0.56], // Mint
-    [0.82, 0.48, 1.00], // Violet
-    [1.00, 0.38, 0.58], // Coral pink
-    [0.98, 0.84, 0.26], // Gold
+    [0.24, 0.64, 0.72], // Anodized Slate Teal
+    [0.84, 0.45, 0.30], // Matte Terracotta
+    [0.38, 0.68, 0.48], // Satin Sage
+    [0.78, 0.64, 0.30], // Brushed Brass / Ochre
+    [0.44, 0.52, 0.74], // Matte Slate Blue
+    [0.82, 0.38, 0.42], // Ceramic Clay
 ];
+
+fn body_props(shape: BodyShape) -> (f32, f32) {
+    match shape {
+        BodyShape::Cube => (0.048, 0.30),
+        BodyShape::Sphere => (0.048, 0.54),
+    }
+}
 
 pub struct PhysicsWorld {
     pub bodies: Vec<PhysicsBody>,
+    pub impact_rings: Vec<ImpactRing>,
     next_idx: usize,
     prev_hand_pos: Option<Vec3>,
 }
@@ -83,6 +101,7 @@ impl Default for PhysicsWorld {
     fn default() -> Self {
         Self {
             bodies: Vec::with_capacity(MAX_BODIES),
+            impact_rings: Vec::with_capacity(MAX_IMPACT_RINGS),
             next_idx: 0,
             prev_hand_pos: None,
         }
@@ -92,6 +111,37 @@ impl Default for PhysicsWorld {
 impl PhysicsWorld {
     pub fn clear(&mut self) {
         self.bodies.clear();
+        self.impact_rings.clear();
+    }
+
+    fn push_ring(&mut self, pos: Vec3, normal: Vec3, color: [f32; 3]) {
+        let n = normal.normalize_or_zero();
+        if !pos.is_finite() || n.length_squared() < 1e-4 {
+            return;
+        }
+        if self.impact_rings.len() >= MAX_IMPACT_RINGS {
+            self.impact_rings.remove(0);
+        }
+        self.impact_rings.push(ImpactRing {
+            pos,
+            normal: n,
+            age: 0.0,
+            max_age: 0.42,
+            color,
+        });
+    }
+
+    fn next_body_spec(&mut self, shape_override: Option<BodyShape>) -> (usize, BodyShape, f32, f32, [f32; 3]) {
+        let idx = self.next_idx;
+        self.next_idx = self.next_idx.wrapping_add(1);
+        let shape = shape_override.unwrap_or(if idx % 2 == 0 {
+            BodyShape::Cube
+        } else {
+            BodyShape::Sphere
+        });
+        let (radius, restitution) = body_props(shape);
+        let color = BODY_PALETTE[idx % BODY_PALETTE.len()];
+        (idx, shape, radius, restitution, color)
     }
 
     pub fn spawn_throw(
@@ -101,21 +151,87 @@ impl PhysicsWorld {
         speed: f32,
         shape_override: Option<BodyShape>,
     ) {
-        let idx = self.next_idx;
-        self.next_idx = self.next_idx.wrapping_add(1);
-
-        let shape = shape_override.unwrap_or(if idx % 2 == 0 {
-            BodyShape::Cube
-        } else {
-            BodyShape::Sphere
-        });
-        let (radius, restitution) = match shape {
-            BodyShape::Cube => (0.052, 0.34),
-            BodyShape::Sphere => (0.056, 0.58),
-        };
-        let color = BODY_PALETTE[idx % BODY_PALETTE.len()];
+        let (idx, shape, radius, restitution, color) = self.next_body_spec(shape_override);
         let throw_dir = dir.normalize_or_zero();
         let vel = throw_dir * speed + Vec3::new(0.0, 0.38, 0.0);
+        let spin_sign = if idx % 2 == 0 { 1.0 } else { -1.0 };
+        let ang_vel = Vec3::new(2.2 * spin_sign, 1.5, -1.8 * spin_sign);
+
+        if self.bodies.len() >= MAX_BODIES {
+            self.bodies.remove(0);
+        }
+        self.bodies.push(PhysicsBody {
+            pos: origin,
+            vel,
+            rot: Quat::IDENTITY,
+            ang_vel,
+            radius,
+            shape,
+            color,
+            restitution,
+            impact_flash: 0.45,
+            grounded: false,
+            shadow_y: origin.y - 1.2,
+        });
+    }
+
+    /// Spawns a rigid body ~14cm along `surface_normal` above the aimed 3D reticle surface so it drops straight down.
+    pub fn spawn_drop(
+        &mut self,
+        surface_pos: Vec3,
+        surface_normal: Vec3,
+        shape_override: Option<BodyShape>,
+    ) {
+        let (idx, shape, radius, restitution, color) = self.next_body_spec(shape_override);
+        let n = {
+            let cand = surface_normal.normalize_or_zero();
+            if cand.length_squared() > 1e-4 {
+                cand
+            } else {
+                Vec3::Y
+            }
+        };
+        let pos = surface_pos + n * (radius + 0.14);
+        let spin_sign = if idx % 2 == 0 { 1.0 } else { -1.0 };
+        let ang_vel = Vec3::new(0.35 * spin_sign, 0.65, -0.30 * spin_sign);
+
+        if self.bodies.len() >= MAX_BODIES {
+            self.bodies.remove(0);
+        }
+        self.bodies.push(PhysicsBody {
+            pos,
+            vel: Vec3::ZERO,
+            rot: Quat::IDENTITY,
+            ang_vel,
+            radius,
+            shape,
+            color,
+            restitution,
+            impact_flash: 0.25,
+            grounded: false,
+            shadow_y: surface_pos.y,
+        });
+    }
+
+    /// Launches a rigid body from `origin` with gravity-compensated ballistic arc aimed at `target`.
+    pub fn spawn_throw_at(
+        &mut self,
+        origin: Vec3,
+        target: Vec3,
+        cam_dir: Vec3,
+        speed: f32,
+        shape_override: Option<BodyShape>,
+    ) {
+        let (idx, shape, radius, restitution, color) = self.next_body_spec(shape_override);
+        let delta = target - origin;
+        let dist = delta.length();
+        let vel = if target.is_finite() && (0.22..=8.5).contains(&dist) {
+            let t = (dist / speed.max(1.2)).clamp(0.10, 0.72);
+            let v = delta / t + Vec3::new(0.0, 0.5 * GRAVITY_Y * t, 0.0);
+            v.clamp_length_max(6.8)
+        } else {
+            cam_dir.normalize_or_zero() * speed + Vec3::new(0.0, 0.38, 0.0)
+        };
         let spin_sign = if idx % 2 == 0 { 1.0 } else { -1.0 };
         let ang_vel = Vec3::new(2.2 * spin_sign, 1.5, -1.8 * spin_sign);
 
@@ -146,6 +262,11 @@ impl PhysicsWorld {
         hand_world_pos: Option<Vec3>,
     ) {
         let dt = dt_sec.clamp(0.001, 0.025);
+        for ring in &mut self.impact_rings {
+            ring.age += dt;
+        }
+        self.impact_rings.retain(|r| r.age < r.max_age);
+
         let hand_vel = match (self.prev_hand_pos, hand_world_pos) {
             (Some(prev), Some(curr)) => ((curr - prev) / dt).clamp_length_max(4.0),
             _ => Vec3::ZERO,
@@ -156,8 +277,9 @@ impl PhysicsWorld {
             return;
         }
 
-        let sub_dt = dt * 0.5;
-        for _sub in 0..2 {
+        let mut pending_rings: Vec<(Vec3, Vec3, [f32; 3])> = Vec::new();
+        let sub_dt = dt * 0.25;
+        for _sub in 0..4 {
             for b in &mut self.bodies {
                 b.grounded = false;
                 b.vel.y -= GRAVITY_Y * sub_dt;
@@ -171,7 +293,7 @@ impl PhysicsWorld {
                 }
                 b.impact_flash = (b.impact_flash - sub_dt * 2.8).max(0.0);
 
-                // 1. ARCore plane collisions (Floor, Table, Seat, Ceiling, Wall, VerticalObject)
+                // 1. ARCore plane collisions (exact Table/Seat boundaries so bodies fall cleanly off edges)
                 for plane in planes {
                     let n = (plane.rot * Vec3::Y).normalize_or_zero();
                     if n.length_squared() < 1e-4 {
@@ -180,10 +302,10 @@ impl PhysicsWorld {
                     let ax_x = plane.rot * Vec3::X;
                     let ax_z = plane.rot * Vec3::Z;
                     let rel = b.pos - plane.pos;
-                    let extra = if plane.kind == SurfaceKind::Floor {
-                        0.85
-                    } else {
-                        0.14
+                    let extra = match plane.kind {
+                        SurfaceKind::Floor => 0.85,
+                        SurfaceKind::Table | SurfaceKind::Seat => 0.0,
+                        _ => 0.08,
                     };
                     if rel.dot(ax_x).abs() > plane.extent_x * 0.5 + extra
                         || rel.dot(ax_z).abs() > plane.extent_z * 0.5 + extra
@@ -199,12 +321,16 @@ impl PhysicsWorld {
                             let push_n = if signed_dist >= 0.0 { n } else { -n };
                             let pen = b.radius - signed_dist.abs();
                             b.pos += push_n * pen;
-                            apply_contact_response(b, push_n, sub_dt);
+                            if apply_contact_response(b, push_n, sub_dt) {
+                                pending_rings.push((b.pos - push_n * b.radius, push_n, b.color));
+                            }
                         }
                     } else if signed_dist < b.radius && signed_dist > -0.22 {
                         let pen = b.radius - signed_dist;
                         b.pos += n * pen;
-                        apply_contact_response(b, n, sub_dt);
+                        if apply_contact_response(b, n, sub_dt) {
+                            pending_rings.push((b.pos - n * b.radius, n, b.color));
+                        }
                         if n.y > 0.5 {
                             b.grounded = true;
                         }
@@ -221,7 +347,6 @@ impl PhysicsWorld {
                             let d = d2.sqrt();
                             (diff / d, b.radius - d)
                         } else {
-                            // Center inside box: resolve along shallowest exit face
                             let faces = [
                                 (-Vec3::X, b.pos.x - box_col.min.x),
                                 (Vec3::X, box_col.max.x - b.pos.x),
@@ -237,7 +362,9 @@ impl PhysicsWorld {
                             (best_n, best_d + b.radius)
                         };
                         b.pos += push_n * pen;
-                        apply_contact_response(b, push_n, sub_dt);
+                        if apply_contact_response(b, push_n, sub_dt) {
+                            pending_rings.push((b.pos - push_n * b.radius, push_n, b.color));
+                        }
                         if push_n.y > 0.5 {
                             b.grounded = true;
                         }
@@ -247,7 +374,9 @@ impl PhysicsWorld {
                 // 3. Fallback floor plane prevents dropping to infinity before floor is mapped
                 if b.pos.y - b.radius < fallback_floor_y {
                     b.pos.y = fallback_floor_y + b.radius;
-                    apply_contact_response(b, Vec3::Y, sub_dt);
+                    if apply_contact_response(b, Vec3::Y, sub_dt) {
+                        pending_rings.push((b.pos - Vec3::Y * b.radius, Vec3::Y, b.color));
+                    }
                     b.grounded = true;
                 }
 
@@ -301,6 +430,10 @@ impl PhysicsWorld {
             }
         }
 
+        for (pos, normal, color) in pending_rings {
+            self.push_ring(pos, normal, color);
+        }
+
         // Update contact shadow height for every body once per frame
         for b in &mut self.bodies {
             let mut best_y = fallback_floor_y;
@@ -313,10 +446,10 @@ impl PhysicsWorld {
                     continue;
                 }
                 let rel = b.pos - plane.pos;
-                let extra = if plane.kind == SurfaceKind::Floor {
-                    0.85
-                } else {
-                    0.12
+                let extra = match plane.kind {
+                    SurfaceKind::Floor => 0.85,
+                    SurfaceKind::Table | SurfaceKind::Seat => 0.0,
+                    _ => 0.08,
                 };
                 if rel.dot(plane.rot * Vec3::X).abs() <= plane.extent_x * 0.5 + extra
                     && rel.dot(plane.rot * Vec3::Z).abs() <= plane.extent_z * 0.5 + extra
@@ -339,27 +472,63 @@ impl PhysicsWorld {
     }
 }
 
-fn apply_contact_response(b: &mut PhysicsBody, n: Vec3, sub_dt: f32) {
+fn settle_cube_upright(b: &mut PhysicsBody, n: Vec3, sub_dt: f32) {
+    const LOCAL_AXES: [Vec3; 6] = [
+        Vec3::X,
+        Vec3::NEG_X,
+        Vec3::Y,
+        Vec3::NEG_Y,
+        Vec3::Z,
+        Vec3::NEG_Z,
+    ];
+    let mut best_world = Vec3::Y;
+    let mut best_dot = -2.0f32;
+    for local in LOCAL_AXES {
+        let w = (b.rot * local).normalize_or_zero();
+        let d = w.dot(n);
+        if d > best_dot {
+            best_dot = d;
+            best_world = w;
+        }
+    }
+    if best_world.length_squared() > 1e-4 {
+        let align_q = Quat::from_rotation_arc(best_world, n);
+        let target_rot = (align_q * b.rot).normalize();
+        b.rot = b.rot.slerp(target_rot, (12.0 * sub_dt).clamp(0.0, 1.0)).normalize();
+    }
+    b.ang_vel *= (1.0 - 14.0 * sub_dt).clamp(0.0, 1.0);
+}
+
+fn apply_contact_response(b: &mut PhysicsBody, n: Vec3, sub_dt: f32) -> bool {
     let vn = b.vel.dot(n);
     if vn < 0.0 {
+        let spawn_ripple = -vn > 0.55;
         let bounce = if -vn < 0.35 { 0.0 } else { b.restitution };
         b.vel -= (1.0 + bounce) * vn * n;
         if -vn > 0.45 {
             b.impact_flash = b.impact_flash.max((-vn / 2.8).clamp(0.25, 1.0));
         }
 
-        let vt = b.vel - b.vel.dot(n) * n;
-        let friction = (1.0 - 4.2 * sub_dt).clamp(0.55, 0.98);
-        b.vel = b.vel.dot(n) * n + vt * friction;
-
-        // Visual rolling spin aligned with surface tangent velocity
-        if vt.length_squared() > 1e-4 {
-            let roll = n.cross(vt) / b.radius.max(0.02);
-            b.ang_vel = b.ang_vel * 0.72 + roll * 0.28;
-        } else {
-            b.ang_vel *= 0.85;
+        let mut vt = b.vel - b.vel.dot(n) * n;
+        let drag_rate = if b.shape == BodyShape::Cube { 7.5 } else { 4.5 };
+        let friction = (1.0 - drag_rate * sub_dt).clamp(0.55, 0.98);
+        vt *= friction;
+        if vt.length_squared() < 0.045 * 0.045 && -vn < 0.08 {
+            vt = Vec3::ZERO;
         }
+        b.vel = b.vel.dot(n) * n + vt;
+
+        if b.shape == BodyShape::Cube && n.y > 0.65 && vt.length() < 0.28 {
+            settle_cube_upright(b, n, sub_dt);
+        } else if vt.length_squared() > 1e-4 {
+            let roll = n.cross(vt) / b.radius.max(0.02);
+            b.ang_vel = b.ang_vel * 0.70 + roll * 0.30;
+        } else {
+            b.ang_vel *= (1.0 - 8.0 * sub_dt).clamp(0.0, 1.0);
+        }
+        return spawn_ripple;
     }
+    false
 }
 
 #[repr(C)]
@@ -510,11 +679,34 @@ fn build_shadow_disc_verts() -> Vec<PhysVertex> {
     out
 }
 
+fn build_impact_ring_verts() -> Vec<PhysVertex> {
+    let segs = 18usize;
+    let r_in = 0.78f32;
+    let r_out = 1.0f32;
+    let mut out = Vec::with_capacity(segs * 6);
+    for i in 0..segs {
+        let a0 = (i as f32 / segs as f32) * std::f32::consts::TAU;
+        let a1 = ((i + 1) as f32 / segs as f32) * std::f32::consts::TAU;
+        let p0_in = [a0.cos() * r_in, 0.0, a0.sin() * r_in];
+        let p0_out = [a0.cos() * r_out, 0.0, a0.sin() * r_out];
+        let p1_in = [a1.cos() * r_in, 0.0, a1.sin() * r_in];
+        let p1_out = [a1.cos() * r_out, 0.0, a1.sin() * r_out];
+        for p in [p0_in, p0_out, p1_out, p0_in, p1_out, p1_in] {
+            out.push(PhysVertex {
+                pos: p,
+                normal: [0.0, 1.0, 0.0],
+            });
+        }
+    }
+    out
+}
+
 pub struct PhysicsRenderer {
     program: glow::Program,
     cube: PhysMeshGpu,
     sphere: PhysMeshGpu,
     shadow: PhysMeshGpu,
+    ring: PhysMeshGpu,
     u_mvp: Option<glow::UniformLocation>,
     u_model: Option<glow::UniformLocation>,
     u_color: Option<glow::UniformLocation>,
@@ -529,6 +721,7 @@ impl PhysicsRenderer {
             let cube = PhysMeshGpu::from_vertices(gl, program, &build_unit_cube_verts())?;
             let sphere = PhysMeshGpu::from_vertices(gl, program, &build_unit_sphere_verts())?;
             let shadow = PhysMeshGpu::from_vertices(gl, program, &build_shadow_disc_verts())?;
+            let ring = PhysMeshGpu::from_vertices(gl, program, &build_impact_ring_verts())?;
             let u_mvp = gl.get_uniform_location(program, "u_mvp");
             let u_model = gl.get_uniform_location(program, "u_model");
             let u_color = gl.get_uniform_location(program, "u_color");
@@ -539,6 +732,7 @@ impl PhysicsRenderer {
                 cube,
                 sphere,
                 shadow,
+                ring,
                 u_mvp,
                 u_model,
                 u_color,
@@ -548,14 +742,20 @@ impl PhysicsRenderer {
         }
     }
 
-    pub fn draw(&self, gl: &glow::Context, view_proj: &Mat4, bodies: &[PhysicsBody]) {
-        if bodies.is_empty() {
+    pub fn draw(
+        &self,
+        gl: &glow::Context,
+        view_proj: &Mat4,
+        bodies: &[PhysicsBody],
+        impact_rings: &[ImpactRing],
+    ) {
+        if bodies.is_empty() && impact_rings.is_empty() {
             return;
         }
         unsafe {
             gl.use_program(Some(self.program));
 
-            // Pass 1: Soft contact shadows projected onto surfaces below each body
+            // Pass 1: Dual-layer soft contact shadows + expanding impact ripple rings
             gl.enable(glow::DEPTH_TEST);
             gl.depth_mask(false);
             gl.disable(glow::CULL_FACE);
@@ -567,27 +767,64 @@ impl PhysicsRenderer {
             if let Some(loc) = &self.u_flash {
                 gl.uniform_1_f32(Some(loc), 0.0);
             }
-            gl.bind_vertex_array(Some(self.shadow.vao));
-            for b in bodies {
-                let h = (b.pos.y - b.radius - b.shadow_y).max(0.0);
-                let fade = (1.0 - h / 1.4).clamp(0.0, 1.0);
-                if fade <= 0.02 {
-                    continue;
+            if !bodies.is_empty() {
+                gl.bind_vertex_array(Some(self.shadow.vao));
+                for b in bodies {
+                    let h = (b.pos.y - b.radius - b.shadow_y).max(0.0);
+                    let fade = (1.0 - h / 1.4).clamp(0.0, 1.0);
+                    if fade <= 0.02 {
+                        continue;
+                    }
+                    let base_rad = b.radius * (1.15 - fade * 0.25).clamp(0.55, 1.2);
+                    for (scale_mul, alpha_mul) in [(1.45f32, 0.18f32), (0.85f32, 0.34f32)] {
+                        let s_rad = base_rad * scale_mul;
+                        let model = Mat4::from_translation(Vec3::new(b.pos.x, b.shadow_y + 0.004, b.pos.z))
+                            * Mat4::from_scale(Vec3::new(s_rad, 1.0, s_rad));
+                        let mvp = *view_proj * model;
+                        if let Some(loc) = &self.u_mvp {
+                            gl.uniform_matrix_4_f32_slice(Some(loc), false, mvp.as_ref());
+                        }
+                        if let Some(loc) = &self.u_model {
+                            gl.uniform_matrix_4_f32_slice(Some(loc), false, model.as_ref());
+                        }
+                        if let Some(loc) = &self.u_color {
+                            gl.uniform_4_f32(Some(loc), 0.0, 0.0, 0.0, alpha_mul * fade);
+                        }
+                        gl.draw_arrays(glow::TRIANGLES, 0, self.shadow.vert_count);
+                    }
                 }
-                let s_rad = b.radius * (1.15 - fade * 0.25).clamp(0.55, 1.2);
-                let model = Mat4::from_translation(Vec3::new(b.pos.x, b.shadow_y + 0.006, b.pos.z))
-                    * Mat4::from_scale(Vec3::new(s_rad, 1.0, s_rad));
-                let mvp = *view_proj * model;
-                if let Some(loc) = &self.u_mvp {
-                    gl.uniform_matrix_4_f32_slice(Some(loc), false, mvp.as_ref());
+            }
+            if !impact_rings.is_empty() {
+                gl.bind_vertex_array(Some(self.ring.vao));
+                for r in impact_rings {
+                    let t = (r.age / r.max_age.max(0.05)).clamp(0.0, 1.0);
+                    let radius = 0.025 + t * 0.145;
+                    let alpha = (1.0 - t) * (1.0 - t) * 0.65;
+                    if alpha <= 0.02 {
+                        continue;
+                    }
+                    let n = r.normal.normalize_or_zero();
+                    let rot = if n.y < -0.99 {
+                        Quat::from_rotation_x(std::f32::consts::PI)
+                    } else if n.length_squared() > 1e-4 {
+                        Quat::from_rotation_arc(Vec3::Y, n)
+                    } else {
+                        Quat::IDENTITY
+                    };
+                    let model = Mat4::from_rotation_translation(rot, r.pos + n * 0.005)
+                        * Mat4::from_scale(Vec3::new(radius, 1.0, radius));
+                    let mvp = *view_proj * model;
+                    if let Some(loc) = &self.u_mvp {
+                        gl.uniform_matrix_4_f32_slice(Some(loc), false, mvp.as_ref());
+                    }
+                    if let Some(loc) = &self.u_model {
+                        gl.uniform_matrix_4_f32_slice(Some(loc), false, model.as_ref());
+                    }
+                    if let Some(loc) = &self.u_color {
+                        gl.uniform_4_f32(Some(loc), r.color[0], r.color[1], r.color[2], alpha);
+                    }
+                    gl.draw_arrays(glow::TRIANGLES, 0, self.ring.vert_count);
                 }
-                if let Some(loc) = &self.u_model {
-                    gl.uniform_matrix_4_f32_slice(Some(loc), false, model.as_ref());
-                }
-                if let Some(loc) = &self.u_color {
-                    gl.uniform_4_f32(Some(loc), 0.0, 0.0, 0.0, 0.36 * fade);
-                }
-                gl.draw_arrays(glow::TRIANGLES, 0, self.shadow.vert_count);
             }
             gl.disable(glow::BLEND);
 
@@ -603,10 +840,7 @@ impl PhysicsRenderer {
                     BodyShape::Cube => &self.cube,
                     BodyShape::Sphere => &self.sphere,
                 };
-                let scale = match b.shape {
-                    BodyShape::Cube => b.radius * 0.90,
-                    BodyShape::Sphere => b.radius,
-                };
+                let scale = b.radius;
                 let model = Mat4::from_rotation_translation(b.rot, b.pos)
                     * Mat4::from_scale(Vec3::splat(scale));
                 let mvp = *view_proj * model;
@@ -636,6 +870,7 @@ impl PhysicsRenderer {
             self.cube.destroy(gl);
             self.sphere.destroy(gl);
             self.shadow.destroy(gl);
+            self.ring.destroy(gl);
             gl.delete_program(self.program);
         }
     }
@@ -711,5 +946,112 @@ mod tests {
         assert!(b.grounded);
         // Should rest right on top of the 2.5D object box (y = 0.0 + radius), NOT drop to -1.5m
         assert!((b.pos.y - b.radius).abs() < 0.015);
+    }
+
+    #[test]
+    fn drop_at_reticle_lands_directly_on_exact_table_spot_and_settles_flat() {
+        let mut world = PhysicsWorld::default();
+        let spot = Vec3::new(0.25, -0.35, -0.70);
+        world.spawn_drop(spot, Vec3::Y, Some(BodyShape::Cube));
+
+        let table = vec![PlaneMarker {
+            kind: SurfaceKind::Table,
+            pos: Vec3::new(0.20, -0.35, -0.75),
+            rot: Quat::IDENTITY,
+            extent_x: 0.90,
+            extent_z: 0.60,
+        }];
+
+        for _ in 0..120 {
+            world.step(1.0 / 60.0, &table, &[], -1.6, None);
+        }
+        let b = &world.bodies[0];
+        assert!(b.grounded);
+        assert!((b.pos.x - spot.x).abs() < 0.05);
+        assert!((b.pos.z - spot.z).abs() < 0.05);
+        assert!((b.pos.y - (-0.35 + b.radius)).abs() < 0.01);
+        assert!(b.vel.length() < 0.01);
+        // Cube bottom face aligns flat with surface normal
+        let max_up_dot = [
+            Vec3::X,
+            Vec3::NEG_X,
+            Vec3::Y,
+            Vec3::NEG_Y,
+            Vec3::Z,
+            Vec3::NEG_Z,
+        ]
+        .into_iter()
+        .map(|a| (b.rot * a).dot(Vec3::Y))
+        .fold(-1.0f32, f32::max);
+        assert!(max_up_dot > 0.99);
+    }
+
+    #[test]
+    fn cube_rolls_off_table_edge_and_falls_onto_floor() {
+        let mut world = PhysicsWorld::default();
+        let table = vec![
+            PlaneMarker {
+                kind: SurfaceKind::Table,
+                pos: Vec3::new(0.0, -0.30, -0.80),
+                rot: Quat::IDENTITY,
+                extent_x: 0.50,
+                extent_z: 0.50,
+            },
+            PlaneMarker {
+                kind: SurfaceKind::Floor,
+                pos: Vec3::new(0.0, -1.10, -0.80),
+                rot: Quat::IDENTITY,
+                extent_x: 3.0,
+                extent_z: 3.0,
+            },
+        ];
+
+        // Start inside table edge moving briskly toward +X edge
+        world.spawn_throw(
+            Vec3::new(0.18, -0.22, -0.80),
+            Vec3::new(1.0, 0.0, 0.0),
+            1.4,
+            Some(BodyShape::Sphere),
+        );
+
+        for _ in 0..150 {
+            world.step(1.0 / 60.0, &table, &[], -1.6, None);
+        }
+        let b = &world.bodies[0];
+        // Beyond table extent (x > 0.25), sphere falls to the Floor at y = -1.10 + radius
+        assert!(b.pos.x > 0.25);
+        assert!((b.pos.y - (-1.10 + b.radius)).abs() < 0.02);
+        assert!((b.shadow_y - (-1.10)).abs() < 0.02);
+    }
+
+    #[test]
+    fn throw_at_wall_uses_ballistics_and_spawns_impact_ring() {
+        let mut world = PhysicsWorld::default();
+        let wall_rot = Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
+        let wall = vec![PlaneMarker {
+            kind: SurfaceKind::Wall,
+            pos: Vec3::new(0.0, 0.0, -1.0),
+            rot: wall_rot,
+            extent_x: 2.5,
+            extent_z: 2.0,
+        }];
+
+        world.spawn_throw_at(
+            Vec3::new(0.0, -0.05, -0.2),
+            Vec3::new(0.0, 0.0, -1.0),
+            Vec3::NEG_Z,
+            2.4,
+            Some(BodyShape::Sphere),
+        );
+
+        let mut saw_ring = false;
+        for _ in 0..45 {
+            world.step(1.0 / 60.0, &wall, &[], -1.5, None);
+            if !world.impact_rings.is_empty() {
+                saw_ring = true;
+            }
+            assert!(world.bodies[0].pos.z >= -1.0);
+        }
+        assert!(saw_ring);
     }
 }
