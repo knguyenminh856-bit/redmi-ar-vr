@@ -2,20 +2,19 @@
 
 Ứng dụng thực tế hỗn hợp (Passthrough AR/VR) tối ưu cho **Xiaomi Redmi Note 14 4G** (`arm64-v8a`, Helio G99-Ultra, GPU Mali-G57 MC2, AMOLED 120Hz `2400×1080`), viết bằng **Rust + OpenGL ES 3.0 (`glow`) + ARCore + MediaPipe GPU**.
 
-## Tính năng chính (Build #10 — Lưu/Nạp Phòng 3D `.arroom`, Xuất `.obj` & Tự khớp 4-DoF)
+## Tính năng chính (Build #11 — Lưới Surface Nets mượt `4cm` + Che khuất Z-Buffer 3D)
 
-1. **Lưu / Nạp Bản đồ Phòng 3D Offline (`💾 Phòng`) & Tự khớp 4-DoF:**
-   - **Định dạng nhị phân siêu gọn `.arroom` (`room_persistence.rs` & `RoomMapStorage.kt`):** Lưu mặt phẳng đã gộp, các ô khối 3D thưa (3 byte/ô) và tối đa `8` mốc chữ ký ảnh `32×24` hoàn toàn trên luồng I/O nền (không khựng 120Hz) vào thư mục `Android/data/com.minhkhoi.arvr/files/rooms/`.
-   - **Tự khớp lại phòng không cần mạng (4-DoF Relocalization):** Khi mở app lần sau và bấm **`📂 Nạp`**, app tự đối chiếu ảnh camera với `8` mốc ảnh bằng thuật toán NCC chống chói sáng (`4Hz`). Khớp xong tự căn góc quay `yaw` + dịch chuyển `(tx, ty, tz)` rồi **gộp thẳng bản đồ cũ vào phiên mới** để tiếp tục quét tăng cường & gọt bỏ đồ đã di chuyển! Có sẵn nút **`📍 Khớp ngay`** để khóa thủ công tức thì khi ánh sáng phòng đổi mạnh.
-   - **Xuất mô hình 3D chuẩn (`📤 Xuất .OBJ`):** Xuất toàn bộ lưới tam giác căn phòng (`Floor`, `Table`, `Seat`, `Wall`, `Obstacles`) ra file `.obj` mở được trực tiếp trên Blender / PC.
-2. **Chế độ Lưới Tam Giác (`🔺 Lưới △`) & Tái tạo 3D không chồng lớp (`spatial_mesh.rs`):**
-   - Bấm nút góc trên phải chuyển qua **`🔺 Lưới △`** để nhìn chính xác từng **tấm lưới tam giác** (đa giác mặt phẳng thật đã gộp đồng phẳng + bề mặt vật cản 3D từ **Greedy Meshing** trên 128 Sparse Chunks `6cm`), vẽ bằng shader GLES 3.0 `fwidth` siêu nét trong 1 draw call.
-   - **Tự xóa vật cũ khi dời đồ (Free-Space Carving):** Chiếu tia bước `5.5cm` xuyên qua ô cũ nên di chuyển bàn ghế xong mô hình 3D tự cập nhật không bóng ma; `InstantPlacement` chỉ hiện vòng nét đứt ước lượng.
-   - Chu kỳ nút quét: **`🏠 Lưới 3D` ➔ `🔺 Lưới △` ➔ `🏠 Ẩn lưới` ➔ `🏠 +AI Vật` ➔ `🏠 TẮT`**.
-3. **Chế độ `👁 1 Mắt` / `🥽 2 Mắt`, Soi cận cảnh (`2cm`) & Nút Vật lý góc dưới phải:**
-   - Mặc định **`👁 1 Mắt`** Full màn hình `2400×1080` chuẩn khoảng cách; nút **`⬇ Thả`** và **`🎯 Ném`** to dễ bấm ở góc dưới phải; vật lý 4x substeps, bóng đổ 2 lớp và vòng sóng va chạm.
-4. **Bảng thông số gọn (`📊`) & Tự động cập nhật OTA (`🔄` ➔ `⬇ #10`):**
-   - Hiển thị gọn Render FPS/ms, số mặt phẳng gộp, chunk 3D, số tam giác `△`, số mốc ảnh định vị `X/8`, Pin/Nhiệt độ/RAM; bấm **`🔄`** để tải và cài đè bản mới nhất trực tiếp từ GitHub Releases (`latest-apk`).
+1. **Lưới 3D Mượt ôm sát thực thể tĩnh (`🔺 Lưới △` mặc định — `spatial_mesh.rs`):**
+   - **Độ chi tiết `4cm` + Sub-Voxel Surface Nets (`0.15mm`) + Làm mượt Laplacian:** Nâng độ phân giải khối gấp `3.375×` (192 Sparse Chunks `~3.8 MB` RAM), giữ lại tọa độ bề mặt dưới-centimet của từng điểm 3D và nối thành **lớp lưới tam giác mượt ôm sát vật thể thật** (bỏ hoàn toàn dạng khối hộp vuông cứng).
+   - **Tăng cường chi tiết đa nguồn (`RawDepth 3Hz` + `SLAM PointCloud 5Hz` + Đa giác ARCore thật):** Nếu máy hỗ trợ `RAW_DEPTH_ONLY`, app tự lấy thêm lưới độ sâu tin cậy cao (`conf >= 175`, `24×18` điểm @ `3Hz`) hợp nhất qua tối thiểu 3 khung hình — chỉ **thực thể tĩnh** mới khóa thành lưới chắc chắn, còn đồ đã dời bị **Free-Space Carving (`3.6cm`)** tự gọt sạch.
+2. **Che khuất tự động bằng Hardware Z-Buffer (`🛡 Che khuất vật thật: BẬT`):**
+   - Dùng chính mô hình lưới 3D tĩnh đã hợp nhất để ghi độ sâu phần cứng (`color_mask = false`, đẩy lùi `1.6cm` theo pháp tuyến để vật đặt *trên* bàn không bị cắt):
+     - **Tự che các lớp lưới scan bị khuất phía sau** tủ, ghế, giường, tường (không còn rối mắt khi nhìn xuyên qua vật thể).
+     - **Tự che khuất bóng/khối vật lý và nét vẽ 3D** khi lăn hoặc nằm ra sau đồ vật thật — ổn định 120Hz, không nhấp nháy như depth từng khung hình. (Có nút bật/tắt `🛡 Che khuất` trong menu `⚙`).
+3. **Lưu / Nạp Phòng 3D Offline (`💾 Phòng`), Xuất `.obj` & Tự khớp 4-DoF:**
+   - Lưu/nạp bản đồ phòng siêu gọn `.arroom` trên luồng I/O nền (`Android/data/com.minhkhoi.arvr/files/rooms/`), xuất `.obj` mở được trên Blender/PC, và tự khớp lại căn phòng bằng 8 mốc ảnh `32×24` (Shifted-NCC) kèm nút **`📍 Khớp ngay`**.
+4. **Chế độ `👁 1 Mắt` / `🥽 2 Mắt`, Vật lý 4x Substeps & Tự cập nhật OTA (`🔄` ➔ `⬇ #11`):**
+   - Mặc định **`👁 1 Mắt`** Full màn `2400×1080`, nút **`⬇ Thả`** & **`🎯 Ném`** góc dưới phải; bấm **`🔄`** để cập nhật thẳng APK mới nhất từ GitHub Releases (`latest-apk`).
 
 ---
 

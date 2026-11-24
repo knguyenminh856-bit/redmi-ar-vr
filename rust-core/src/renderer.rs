@@ -84,6 +84,7 @@ pub struct SharedInputState {
     pub palette_idx: u32,
 
     pub room_scan_mode: i32,
+    pub mesh_occlusion_enabled: bool,
     pub reticle: ReticleHit,
     pub spatial_cache: SpatialMemoryCache,
     pub spatial_mesh: SpatialMeshMap,
@@ -137,6 +138,7 @@ impl Default for SharedInputState {
             boost_until: None,
             palette_idx: 0,
             room_scan_mode: 1,
+            mesh_occlusion_enabled: true,
             reticle: ReticleHit::default(),
             spatial_cache: SpatialMemoryCache::default(),
             spatial_mesh: SpatialMeshMap::default(),
@@ -387,6 +389,10 @@ impl SharedInputState {
 
     pub fn set_stereo_mode(&mut self, enabled: bool) {
         self.stereo_mode = enabled;
+    }
+
+    pub fn set_mesh_occlusion(&mut self, enabled: bool) {
+        self.mesh_occlusion_enabled = enabled;
     }
 
     fn current_cam_pose(&self) -> (Vec3, Quat) {
@@ -781,9 +787,12 @@ impl SharedInputState {
             }
         }
 
-        // Rebuild Triangle Mesh VBO snapshot ONLY when in Mode 4 (🔺 Lưới △) AND map/camera actually changed
+        // Rebuild static Surface-Nets + Plane Mesh VBO when either Triangle View (mode 4) OR
+        // Hardware Depth-Buffer Occlusion is active (and only when map/camera actually changed!)
         let tri_mesh_mode = self.room_scan_mode == 4;
-        let tri_mesh_verts = if tri_mesh_mode {
+        let mesh_occlusion_active = self.mesh_occlusion_enabled && self.room_scan_mode > 0;
+        let need_mesh_vbo = tri_mesh_mode || mesh_occlusion_active;
+        let tri_mesh_verts = if need_mesh_vbo {
             let moved = (cam_pos_capture - self.cached_tri_cull_pos).length_squared() > 0.60 * 0.60;
             if self.cached_tri_src_gen != self.spatial_mesh.mesh_gen || moved || self.cached_tri_upload_gen == 0 {
                 let cam_fwd = (head_rot_120hz * -Vec3::Z).normalize_or_zero();
@@ -877,6 +886,7 @@ impl SharedInputState {
             },
             show_grid: matches!(self.room_scan_mode, 1 | 2),
             tri_mesh_mode,
+            mesh_occlusion_active,
             tri_mesh_gen: self.cached_tri_upload_gen,
             tri_mesh_verts,
             physics_bodies: self.physics.bodies.clone(),
@@ -911,6 +921,7 @@ pub struct FrameSnapshot {
     pub reticle: ReticleHit,
     pub show_grid: bool,
     pub tri_mesh_mode: bool,
+    pub mesh_occlusion_active: bool,
     pub tri_mesh_gen: u64,
     pub tri_mesh_verts: Option<Vec<TriMeshVertex>>,
     pub physics_bodies: Vec<PhysicsBody>,
@@ -1109,7 +1120,7 @@ impl GlRenderer {
             snap.head_pos_120hz,
             snap.head_rot_120hz,
         );
-        if snap.tri_mesh_mode {
+        if snap.tri_mesh_mode || snap.mesh_occlusion_active {
             if let Some(ref verts) = snap.tri_mesh_verts {
                 self.tri_mesh
                     .sync_if_dirty(&self.gl, verts, snap.tri_mesh_gen);
@@ -1154,6 +1165,9 @@ impl GlRenderer {
 
                 self.passthrough
                     .draw(&self.gl, &pass_mvp, snap.has_camera_frame);
+                if snap.mesh_occlusion_active {
+                    self.tri_mesh.draw_depth_occlusion(&self.gl, &vp);
+                }
                 if snap.show_demo_scene {
                     self.scene.draw(
                         &self.gl,
@@ -1221,6 +1235,9 @@ impl GlRenderer {
                 self.gl.viewport(0, 0, half_w, h);
                 self.passthrough
                     .draw(&self.gl, &left_pass_mvp, snap.has_camera_frame);
+                if snap.mesh_occlusion_active {
+                    self.tri_mesh.draw_depth_occlusion(&self.gl, &left_vp);
+                }
                 if snap.show_demo_scene {
                     self.scene.draw(
                         &self.gl,
@@ -1255,6 +1272,9 @@ impl GlRenderer {
                 self.gl.viewport(half_w, 0, right_w, h);
                 self.passthrough
                     .draw(&self.gl, &right_pass_mvp, snap.has_camera_frame);
+                if snap.mesh_occlusion_active {
+                    self.tri_mesh.draw_depth_occlusion(&self.gl, &right_vp);
+                }
                 if snap.show_demo_scene {
                     self.scene.draw(
                         &self.gl,

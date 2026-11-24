@@ -57,6 +57,7 @@ object NativeBridge {
     external fun nativeOnPointCloud(pointCount: Int, packedXyzc: FloatArray)
     external fun nativeSpawnPhysicsBody(throwSpeed: Float)
     external fun nativeSetStereoMode(enabled: Boolean)
+    external fun nativeSetMeshOcclusion(enabled: Boolean)
     external fun nativeOnSurfaceReticle(
         valid: Boolean,
         hitKind: Int,

@@ -698,6 +698,17 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeSetStereoMode(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeSetMeshOcclusion(
+    _env: JNIEnv,
+    _class: JClass,
+    enabled: jboolean,
+) {
+    if let Ok(mut state) = input_state().lock() {
+        state.set_mesh_occlusion(enabled != 0);
+    }
+}
+
+#[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeOnSurfaceReticle(
     env: JNIEnv,
