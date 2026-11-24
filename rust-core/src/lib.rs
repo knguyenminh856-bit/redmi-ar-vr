@@ -1,3 +1,5 @@
+pub mod depth_occlusion;
+pub mod finger_draw;
 pub mod gyro_predict;
 pub mod hand_tracking;
 pub mod passthrough;
@@ -5,22 +7,27 @@ pub mod renderer;
 pub mod scene_3d;
 
 use hand_tracking::{FLOATS_PER_LANDMARK, LANDMARKS_PER_HAND, MAX_HANDS};
-
-use jni::objects::{JClass, JFloatArray};
-use jni::sys::{jboolean, jint, JNI_TRUE};
+use jni::objects::{JByteArray, JClass, JFloatArray};
+use jni::sys::{jboolean, jint, jstring, JNI_TRUE};
 use jni::JNIEnv;
 use renderer::{GlRenderer, SharedInputState};
 use std::cell::RefCell;
 use std::sync::{Mutex, OnceLock};
 
 static INPUT_STATE: OnceLock<Mutex<SharedInputState>> = OnceLock::new();
+static GPU_INFO: OnceLock<Mutex<String>> = OnceLock::new();
 
 fn input_state() -> &'static Mutex<SharedInputState> {
     INPUT_STATE.get_or_init(|| Mutex::new(SharedInputState::default()))
 }
 
+fn gpu_info() -> &'static Mutex<String> {
+    GPU_INFO.get_or_init(|| Mutex::new("Unknown GLES3 GPU".to_string()))
+}
+
 thread_local! {
     static GL_RENDERER: RefCell<Option<GlRenderer>> = const { RefCell::new(None) };
+    static LAST_SYNCED_DEPTH_GEN: RefCell<u64> = const { RefCell::new(0) };
 }
 
 #[cfg(target_os = "android")]
@@ -102,6 +109,7 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeOnSurfaceCreate
     _class: JClass,
 ) -> jint {
     init_logging();
+    LAST_SYNCED_DEPTH_GEN.with(|g| *g.borrow_mut() = 0);
     let tex_id = GL_RENDERER.with(|cell| {
         if let Some(old) = cell.borrow_mut().take() {
             old.destroy();
@@ -109,6 +117,9 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeOnSurfaceCreate
         match create_gles_context().and_then(GlRenderer::new) {
             Ok(renderer) => {
                 let id = renderer.camera_texture_id() as jint;
+                if let Ok(mut name) = gpu_info().lock() {
+                    *name = renderer.gpu_renderer_name.clone();
+                }
                 *cell.borrow_mut() = Some(renderer);
                 log::info!("GL renderer created, OES texture id={}", id);
                 id
@@ -134,6 +145,21 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeOnSurfaceChange
             renderer.resize(width, height);
         }
     });
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeGetGpuInfo(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let text = gpu_info()
+        .lock()
+        .map(|s| s.clone())
+        .unwrap_or_else(|_| "Unknown".to_string());
+    match env.new_string(text) {
+        Ok(jstr) => jstr.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
 }
 
 #[no_mangle]
@@ -206,6 +232,35 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeOnFallbackCamer
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeOnDepthFrame(
+    env: JNIEnv,
+    _class: JClass,
+    width: jint,
+    height: jint,
+    packed_bytes: JByteArray,
+    d0x: f32,
+    d0y: f32,
+    dxx: f32,
+    dxy: f32,
+    dyx: f32,
+    dyy: f32,
+) {
+    let needed = (width.max(0) as usize) * (height.max(0) as usize) * 2;
+    if needed == 0 {
+        return;
+    }
+    let Ok(bytes) = env.convert_byte_array(&packed_bytes) else {
+        return;
+    };
+    if bytes.len() < needed {
+        return;
+    }
+    if let Ok(mut state) = input_state().lock() {
+        state.on_depth_frame(width, height, &bytes[..needed], [d0x, d0y], [dxx, dxy], [dyx, dyy]);
+    }
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeSetCalibration(
     _env: JNIEnv,
     _class: JClass,
@@ -214,6 +269,28 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeSetCalibration(
 ) {
     if let Ok(mut state) = input_state().lock() {
         state.set_calibration(fov_scale, ipd_meters);
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeSetFeatures(
+    _env: JNIEnv,
+    _class: JClass,
+    depth_occlusion: jboolean,
+    draw_mode: jint,
+) {
+    if let Ok(mut state) = input_state().lock() {
+        state.set_features(depth_occlusion == JNI_TRUE, draw_mode);
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeClearDrawings(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    if let Ok(mut state) = input_state().lock() {
+        state.clear_drawings();
     }
 }
 
@@ -253,6 +330,33 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeOnHandLandmarks
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeGetPerfMetrics(
+    env: JNIEnv,
+    _class: JClass,
+    out_arr: JFloatArray,
+) {
+    let perf = {
+        let Ok(state) = input_state().lock() else {
+            return;
+        };
+        state.perf
+    };
+    let buf = [
+        perf.render_fps,
+        perf.frame_ms,
+        perf.center_depth_m,
+        perf.active_hands as f32,
+        perf.current_gesture as f32,
+        perf.stroke_vertices as f32,
+        perf.index_tip_cam[0],
+        perf.index_tip_cam[1],
+        perf.index_tip_cam[2],
+        if perf.has_valid_depth { 1.0 } else { 0.0 },
+    ];
+    let _ = env.set_float_array_region(&out_arr, 0, &buf);
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeDrawFrame(
     _env: JNIEnv,
     _class: JClass,
@@ -264,9 +368,27 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeDrawFrame(
         state.snapshot_frame()
     };
 
-    GL_RENDERER.with(|cell| {
-        if let Some(renderer) = cell.borrow_mut().as_mut() {
-            renderer.draw_frame(&snap);
+    let last_gen = LAST_SYNCED_DEPTH_GEN.with(|g| *g.borrow());
+    if snap.pending_depth_gen != 0 && snap.pending_depth_gen != last_gen {
+        if let Ok(state) = input_state().lock() {
+            GL_RENDERER.with(|cell| {
+                if let Some(renderer) = cell.borrow_mut().as_mut() {
+                    renderer.sync_depth_if_needed(&state.pending_depth);
+                }
+            });
+            LAST_SYNCED_DEPTH_GEN.with(|g| *g.borrow_mut() = state.pending_depth.generation);
         }
+    }
+
+    let timing = GL_RENDERER.with(|cell| {
+        cell.borrow_mut()
+            .as_mut()
+            .map(|renderer| renderer.draw_frame(&snap))
     });
+
+    if let Some((fps, frame_ms)) = timing {
+        if let Ok(mut state) = input_state().lock() {
+            state.record_render_timing(fps, frame_ms);
+        }
+    }
 }

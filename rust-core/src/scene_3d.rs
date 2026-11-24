@@ -1,3 +1,4 @@
+use crate::depth_occlusion::DepthTextureGpu;
 use crate::passthrough::compile_program;
 use glam::{Mat4, Vec3};
 use glow::HasContext;
@@ -10,20 +11,54 @@ attribute vec3 a_normal;
 attribute vec3 a_color;
 uniform mat4 u_mvp;
 uniform mat4 u_model;
+uniform mat4 u_inv_cam_capture;
 varying vec3 v_normal_w;
 varying vec3 v_color;
+varying vec3 v_cam_local;
 void main() {
     v_normal_w = normalize(mat3(u_model) * a_normal);
     v_color = a_color;
+    v_cam_local = (u_inv_cam_capture * u_model * vec4(a_pos, 1.0)).xyz;
     gl_Position = u_mvp * vec4(a_pos, 1.0);
 }
 "#;
 
 const SCENE_FRAG: &str = r#"
 precision mediump float;
+uniform sampler2D u_depth_tex;
+uniform float u_occlusion_enabled;
+uniform vec2 u_tan_fov_scaled;
+uniform vec2 u_d0;
+uniform vec2 u_dx_vec;
+uniform vec2 u_dy_vec;
+uniform float u_color_shift;
 varying vec3 v_normal_w;
 varying vec3 v_color;
+varying vec3 v_cam_local;
 void main() {
+    if (u_occlusion_enabled > 0.5) {
+        float frag_d = -v_cam_local.z;
+        if (frag_d > 0.05) {
+            vec2 q_ndc = (v_cam_local.xy / frag_d) / u_tan_fov_scaled;
+            if (abs(q_ndc.x) <= 1.0 && abs(q_ndc.y) <= 1.0) {
+                vec2 st = q_ndc * 0.5 + 0.5;
+                vec2 duv = u_d0 + st.x * u_dx_vec + st.y * u_dy_vec;
+                vec2 rg = texture2D(u_depth_tex, duv).xy;
+                float real_d = (rg.x * 255.0 + rg.y * 65280.0) * 0.001;
+                if (real_d > 0.08 && real_d + 0.035 < frag_d) {
+                    discard;
+                }
+            }
+        }
+    }
+
+    vec3 base_col = v_color;
+    if (u_color_shift > 0.5 && u_color_shift < 1.5) {
+        base_col = base_col.gbr;
+    } else if (u_color_shift >= 1.5) {
+        base_col = base_col.brg;
+    }
+
     vec3 n = normalize(v_normal_w);
     vec3 light_dir = normalize(vec3(0.45, 0.80, 0.55));
     float diff = max(dot(n, light_dir), 0.0);
@@ -31,7 +66,7 @@ void main() {
     vec3 view_dir = normalize(vec3(0.0, 0.25, 1.0));
     vec3 half_vec = normalize(light_dir + view_dir);
     float spec = pow(max(dot(n, half_vec), 0.0), 24.0) * 0.28;
-    vec3 lit = v_color * (hemi + diff * 0.72) + vec3(spec);
+    vec3 lit = base_col * (hemi + diff * 0.72) + vec3(spec);
     gl_FragColor = vec4(lit, 1.0);
 }
 "#;
@@ -44,42 +79,34 @@ pub struct Vertex3D {
     pub color: [f32; 3],
 }
 
-/// Builds a 36-vertex multi-color unit-scaled cube centered at origin.
 pub fn build_cube_vertices(half_size: f32) -> Vec<Vertex3D> {
     let s = half_size;
-    // Six faces with outward CCW winding and distinct crisp colors for easy stereo fusion.
     let faces: [([Vec3; 4], Vec3, [f32; 3]); 6] = [
-        // +Z front (coral red)
         (
             [Vec3::new(-s, -s, s), Vec3::new(s, -s, s), Vec3::new(s, s, s), Vec3::new(-s, s, s)],
             Vec3::Z,
             [0.98, 0.36, 0.32],
         ),
-        // -Z back (teal)
         (
             [Vec3::new(s, -s, -s), Vec3::new(-s, -s, -s), Vec3::new(-s, s, -s), Vec3::new(s, s, -s)],
             -Vec3::Z,
             [0.14, 0.80, 0.72],
         ),
-        // +X right (amber)
         (
             [Vec3::new(s, -s, s), Vec3::new(s, -s, -s), Vec3::new(s, s, -s), Vec3::new(s, s, s)],
             Vec3::X,
             [0.98, 0.72, 0.18],
         ),
-        // -X left (sky blue)
         (
             [Vec3::new(-s, -s, -s), Vec3::new(-s, -s, s), Vec3::new(-s, s, s), Vec3::new(-s, s, -s)],
             -Vec3::X,
             [0.24, 0.62, 0.98],
         ),
-        // +Y top (mint green)
         (
             [Vec3::new(-s, s, s), Vec3::new(s, s, s), Vec3::new(s, s, -s), Vec3::new(-s, s, -s)],
             Vec3::Y,
             [0.36, 0.92, 0.54],
         ),
-        // -Y bottom (violet)
         (
             [Vec3::new(-s, -s, -s), Vec3::new(s, -s, -s), Vec3::new(s, -s, s), Vec3::new(-s, -s, s)],
             -Vec3::Y,
@@ -101,7 +128,6 @@ pub fn build_cube_vertices(half_size: f32) -> Vec<Vertex3D> {
     out
 }
 
-/// Builds a 24-vertex crystal octahedron centered at origin with flat per-face normals.
 pub fn build_octahedron_vertices(radius: f32) -> Vec<Vertex3D> {
     let top = Vec3::new(0.0, radius * 1.25, 0.0);
     let bottom = Vec3::new(0.0, -radius * 1.25, 0.0);
@@ -217,6 +243,14 @@ pub struct Scene3D {
     octahedron: MeshGpu,
     u_mvp: Option<glow::UniformLocation>,
     u_model: Option<glow::UniformLocation>,
+    u_inv_cam_capture: Option<glow::UniformLocation>,
+    u_depth_tex: Option<glow::UniformLocation>,
+    u_occlusion_enabled: Option<glow::UniformLocation>,
+    u_tan_fov_scaled: Option<glow::UniformLocation>,
+    u_d0: Option<glow::UniformLocation>,
+    u_dx_vec: Option<glow::UniformLocation>,
+    u_dy_vec: Option<glow::UniformLocation>,
+    u_color_shift: Option<glow::UniformLocation>,
 }
 
 impl Scene3D {
@@ -225,33 +259,63 @@ impl Scene3D {
             let program = compile_program(gl, SCENE_VERT, SCENE_FRAG)?;
             let cube = MeshGpu::from_vertices(gl, program, &build_cube_vertices(0.11))?;
             let octahedron = MeshGpu::from_vertices(gl, program, &build_octahedron_vertices(0.15))?;
-            let u_mvp = gl.get_uniform_location(program, "u_mvp");
-            let u_model = gl.get_uniform_location(program, "u_model");
 
             Ok(Self {
                 program,
                 cube,
                 octahedron,
-                u_mvp,
-                u_model,
+                u_mvp: gl.get_uniform_location(program, "u_mvp"),
+                u_model: gl.get_uniform_location(program, "u_model"),
+                u_inv_cam_capture: gl.get_uniform_location(program, "u_inv_cam_capture"),
+                u_depth_tex: gl.get_uniform_location(program, "u_depth_tex"),
+                u_occlusion_enabled: gl.get_uniform_location(program, "u_occlusion_enabled"),
+                u_tan_fov_scaled: gl.get_uniform_location(program, "u_tan_fov_scaled"),
+                u_d0: gl.get_uniform_location(program, "u_d0"),
+                u_dx_vec: gl.get_uniform_location(program, "u_dx_vec"),
+                u_dy_vec: gl.get_uniform_location(program, "u_dy_vec"),
+                u_color_shift: gl.get_uniform_location(program, "u_color_shift"),
             })
         }
     }
 
-    /// Computes world model transforms for the 2 floating 3D objects relative to `anchor_origin`.
-    pub fn object_transforms(anchor_origin: &Mat4, time_sec: f32) -> (Mat4, Mat4) {
-        let cube_local = Mat4::from_translation(Vec3::new(-0.18, -0.02, -1.25))
-            * Mat4::from_rotation_y(time_sec * 0.65)
-            * Mat4::from_rotation_x(time_sec * 0.30);
+    pub fn object_transforms(
+        anchor_origin: &Mat4,
+        time_sec: f32,
+        pull_closer: bool,
+        boost_factor: f32,
+    ) -> (Mat4, Mat4) {
+        let z_cube = if pull_closer { -0.78 } else { -1.25 };
+        let z_octa = if pull_closer { -1.05 } else { -1.65 };
+        let speed = 1.0 + boost_factor * 2.5;
+        let pulse = 1.0 + boost_factor * 0.22 * (time_sec * 12.0).sin().abs();
+
+        let cube_local = Mat4::from_translation(Vec3::new(-0.18, -0.02, z_cube))
+            * Mat4::from_rotation_y(time_sec * 0.65 * speed)
+            * Mat4::from_rotation_x(time_sec * 0.30 * speed)
+            * Mat4::from_scale(Vec3::splat(pulse));
 
         let bob_y = (time_sec * 1.8).sin() * 0.045;
-        let octa_local = Mat4::from_translation(Vec3::new(0.24, 0.04 + bob_y, -1.65))
-            * Mat4::from_rotation_y(-time_sec * 0.85);
+        let octa_local = Mat4::from_translation(Vec3::new(0.24, 0.04 + bob_y, z_octa))
+            * Mat4::from_rotation_y(-time_sec * 0.85 * speed)
+            * Mat4::from_scale(Vec3::splat(pulse));
 
         (*anchor_origin * cube_local, *anchor_origin * octa_local)
     }
 
-    pub fn draw(&self, gl: &glow::Context, view_proj: &Mat4, cube_model: &Mat4, octa_model: &Mat4) {
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw(
+        &self,
+        gl: &glow::Context,
+        view_proj: &Mat4,
+        cube_model: &Mat4,
+        octa_model: &Mat4,
+        inv_cam_capture: &Mat4,
+        depth_tex: &DepthTextureGpu,
+        occlusion_enabled: bool,
+        tan_half_h_scaled: f32,
+        tan_half_v_scaled: f32,
+        palette_idx: u32,
+    ) {
         unsafe {
             gl.enable(glow::DEPTH_TEST);
             gl.depth_mask(true);
@@ -259,9 +323,40 @@ impl Scene3D {
             gl.cull_face(glow::BACK);
             gl.use_program(Some(self.program));
 
+            if let Some(loc) = &self.u_inv_cam_capture {
+                gl.uniform_matrix_4_f32_slice(Some(loc), false, inv_cam_capture.as_ref());
+            }
+
+            let use_env_depth = occlusion_enabled && depth_tex.has_valid_depth;
+            gl.active_texture(glow::TEXTURE1);
+            gl.bind_texture(glow::TEXTURE_2D, Some(depth_tex.texture));
+            if let Some(loc) = &self.u_depth_tex {
+                gl.uniform_1_i32(Some(loc), 1);
+            }
+            if let Some(loc) = &self.u_occlusion_enabled {
+                gl.uniform_1_f32(Some(loc), if use_env_depth { 1.0 } else { 0.0 });
+            }
+            if let Some(loc) = &self.u_tan_fov_scaled {
+                gl.uniform_2_f32(Some(loc), tan_half_h_scaled, tan_half_v_scaled);
+            }
+            if let Some(loc) = &self.u_d0 {
+                gl.uniform_2_f32(Some(loc), depth_tex.d0[0], depth_tex.d0[1]);
+            }
+            if let Some(loc) = &self.u_dx_vec {
+                gl.uniform_2_f32(Some(loc), depth_tex.dx[0], depth_tex.dx[1]);
+            }
+            if let Some(loc) = &self.u_dy_vec {
+                gl.uniform_2_f32(Some(loc), depth_tex.dy[0], depth_tex.dy[1]);
+            }
+            if let Some(loc) = &self.u_color_shift {
+                gl.uniform_1_f32(Some(loc), (palette_idx % 3) as f32);
+            }
+
             self.draw_mesh(gl, &self.cube, view_proj, cube_model);
             self.draw_mesh(gl, &self.octahedron, view_proj, octa_model);
 
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            gl.active_texture(glow::TEXTURE0);
             gl.bind_vertex_array(None);
             gl.disable(glow::CULL_FACE);
         }
