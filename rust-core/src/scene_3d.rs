@@ -1,4 +1,3 @@
-use crate::depth_occlusion::DepthTextureGpu;
 use crate::passthrough::compile_program;
 use glam::{Mat4, Vec3};
 use glow::HasContext;
@@ -11,47 +10,21 @@ attribute vec3 a_normal;
 attribute vec3 a_color;
 uniform mat4 u_mvp;
 uniform mat4 u_model;
-uniform mat4 u_inv_cam_capture;
 varying vec3 v_normal_w;
 varying vec3 v_color;
-varying vec3 v_cam_local;
 void main() {
     v_normal_w = normalize(mat3(u_model) * a_normal);
     v_color = a_color;
-    v_cam_local = (u_inv_cam_capture * u_model * vec4(a_pos, 1.0)).xyz;
     gl_Position = u_mvp * vec4(a_pos, 1.0);
 }
 "#;
 
 const SCENE_FRAG: &str = r#"
 precision mediump float;
-uniform sampler2D u_depth_tex;
-uniform float u_occlusion_enabled;
-uniform vec2 u_tan_fov_scaled;
-uniform vec2 u_d0;
-uniform vec2 u_dx_vec;
-uniform vec2 u_dy_vec;
 uniform float u_color_shift;
 varying vec3 v_normal_w;
 varying vec3 v_color;
-varying vec3 v_cam_local;
 void main() {
-    if (u_occlusion_enabled > 0.5) {
-        float frag_d = -v_cam_local.z;
-        if (frag_d > 0.05) {
-            vec2 q_ndc = (v_cam_local.xy / frag_d) / u_tan_fov_scaled;
-            if (abs(q_ndc.x) <= 1.0 && abs(q_ndc.y) <= 1.0) {
-                vec2 st = q_ndc * 0.5 + 0.5;
-                vec2 duv = u_d0 + st.x * u_dx_vec + st.y * u_dy_vec;
-                vec2 rg = texture2D(u_depth_tex, duv).xy;
-                float real_d = (rg.x * 255.0 + rg.y * 65280.0) * 0.001;
-                if (real_d > 0.08 && real_d + 0.035 < frag_d) {
-                    discard;
-                }
-            }
-        }
-    }
-
     vec3 base_col = v_color;
     if (u_color_shift > 0.5 && u_color_shift < 1.5) {
         base_col = base_col.gbr;
@@ -243,13 +216,6 @@ pub struct Scene3D {
     octahedron: MeshGpu,
     u_mvp: Option<glow::UniformLocation>,
     u_model: Option<glow::UniformLocation>,
-    u_inv_cam_capture: Option<glow::UniformLocation>,
-    u_depth_tex: Option<glow::UniformLocation>,
-    u_occlusion_enabled: Option<glow::UniformLocation>,
-    u_tan_fov_scaled: Option<glow::UniformLocation>,
-    u_d0: Option<glow::UniformLocation>,
-    u_dx_vec: Option<glow::UniformLocation>,
-    u_dy_vec: Option<glow::UniformLocation>,
     u_color_shift: Option<glow::UniformLocation>,
 }
 
@@ -266,13 +232,6 @@ impl Scene3D {
                 octahedron,
                 u_mvp: gl.get_uniform_location(program, "u_mvp"),
                 u_model: gl.get_uniform_location(program, "u_model"),
-                u_inv_cam_capture: gl.get_uniform_location(program, "u_inv_cam_capture"),
-                u_depth_tex: gl.get_uniform_location(program, "u_depth_tex"),
-                u_occlusion_enabled: gl.get_uniform_location(program, "u_occlusion_enabled"),
-                u_tan_fov_scaled: gl.get_uniform_location(program, "u_tan_fov_scaled"),
-                u_d0: gl.get_uniform_location(program, "u_d0"),
-                u_dx_vec: gl.get_uniform_location(program, "u_dx_vec"),
-                u_dy_vec: gl.get_uniform_location(program, "u_dy_vec"),
                 u_color_shift: gl.get_uniform_location(program, "u_color_shift"),
             })
         }
@@ -302,18 +261,12 @@ impl Scene3D {
         (*anchor_origin * cube_local, *anchor_origin * octa_local)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &self,
         gl: &glow::Context,
         view_proj: &Mat4,
         cube_model: &Mat4,
         octa_model: &Mat4,
-        inv_cam_capture: &Mat4,
-        depth_tex: &DepthTextureGpu,
-        occlusion_enabled: bool,
-        tan_half_h_scaled: f32,
-        tan_half_v_scaled: f32,
         palette_idx: u32,
     ) {
         unsafe {
@@ -323,31 +276,6 @@ impl Scene3D {
             gl.cull_face(glow::BACK);
             gl.use_program(Some(self.program));
 
-            if let Some(loc) = &self.u_inv_cam_capture {
-                gl.uniform_matrix_4_f32_slice(Some(loc), false, inv_cam_capture.as_ref());
-            }
-
-            let use_env_depth = occlusion_enabled && depth_tex.has_valid_depth;
-            gl.active_texture(glow::TEXTURE1);
-            gl.bind_texture(glow::TEXTURE_2D, Some(depth_tex.texture));
-            if let Some(loc) = &self.u_depth_tex {
-                gl.uniform_1_i32(Some(loc), 1);
-            }
-            if let Some(loc) = &self.u_occlusion_enabled {
-                gl.uniform_1_f32(Some(loc), if use_env_depth { 1.0 } else { 0.0 });
-            }
-            if let Some(loc) = &self.u_tan_fov_scaled {
-                gl.uniform_2_f32(Some(loc), tan_half_h_scaled, tan_half_v_scaled);
-            }
-            if let Some(loc) = &self.u_d0 {
-                gl.uniform_2_f32(Some(loc), depth_tex.d0[0], depth_tex.d0[1]);
-            }
-            if let Some(loc) = &self.u_dx_vec {
-                gl.uniform_2_f32(Some(loc), depth_tex.dx[0], depth_tex.dx[1]);
-            }
-            if let Some(loc) = &self.u_dy_vec {
-                gl.uniform_2_f32(Some(loc), depth_tex.dy[0], depth_tex.dy[1]);
-            }
             if let Some(loc) = &self.u_color_shift {
                 gl.uniform_1_f32(Some(loc), (palette_idx % 3) as f32);
             }
@@ -355,8 +283,6 @@ impl Scene3D {
             self.draw_mesh(gl, &self.cube, view_proj, cube_model);
             self.draw_mesh(gl, &self.octahedron, view_proj, octa_model);
 
-            gl.bind_texture(glow::TEXTURE_2D, None);
-            gl.active_texture(glow::TEXTURE0);
             gl.bind_vertex_array(None);
             gl.disable(glow::CULL_FACE);
         }

@@ -82,12 +82,10 @@ class MainActivity : Activity(), SensorEventListener {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val sessionLock = Any()
 
-    // ARCore session (primary 6DoF + Depth API)
+    // ARCore session (primary 6DoF tracking)
     private var arSession: Session? = null
     private var arNeedsTextureBind = false
     private var arInitAttempted = false
-    @Volatile
-    private var isArDepthSupported = false
     @Volatile
     private var isUsingArCore = false
 
@@ -106,14 +104,9 @@ class MainActivity : Activity(), SensorEventListener {
     private val fallbackTexMtx = FloatArray(16)
 
     private lateinit var handTracker: HandTrackerHelper
+    private lateinit var appUpdater: AppUpdater
     private val imgBasis = floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f)
     private val ndcBasis = FloatArray(6)
-
-    // ARCore Depth reusable buffers
-    private var depthBytes = ByteArray(0)
-    private val depthQuadCorners = floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f)
-    private val depthUvBasis = FloatArray(6)
-    private var lastDepthUpdateNs = 0L
 
     // GL state synced with render thread
     @Volatile
@@ -143,14 +136,14 @@ class MainActivity : Activity(), SensorEventListener {
     private var lastArUpdateNs = 0L
     private var lastArTimestampNs = 0L
 
-    // Feature toggles & UI
+    // Feature toggles, OTA Updater & UI
     private var fovPct = 78
     private var ipdMm = 64
     @Volatile
-    private var depthOcclusionEnabled = true
-    @Volatile
     private var drawMode = 0 // 0=Off, 1=1 Finger, 2=5 Fingers
     private var telemetryVisible = false
+    private var availableUpdate: UpdateCheckResult? = null
+    private var pendingInstallPermissionResume = false
 
     private lateinit var panelLayout: LinearLayout
     private var recenterRunnable: Runnable? = null
@@ -160,9 +153,10 @@ class MainActivity : Activity(), SensorEventListener {
     private lateinit var leftTelemetryCard: TextView
     private lateinit var rightTelemetryCard: TextView
     private lateinit var drawToggleBtn: Button
-    private lateinit var depthToggleBtn: Button
+    private lateinit var checkUpdateBtn: Button
+    private lateinit var installUpdateBtn: Button
     private lateinit var telemetryToggleBtn: Button
-    private val metricsBuf = FloatArray(10)
+    private val metricsBuf = FloatArray(8)
     private var cachedGpuName = ""
     private var telemetryRunnable: Runnable? = null
 
@@ -172,9 +166,10 @@ class MainActivity : Activity(), SensorEventListener {
         handTracker = HandTrackerHelper(this, mainHandler) { code ->
             showStereoGesturePopup(code)
         }
+        appUpdater = AppUpdater(mainHandler)
 
         loadCalibration()
-        NativeBridge.nativeSetFeatures(depthOcclusionEnabled, drawMode)
+        NativeBridge.nativeSetDrawMode(drawMode)
         configureHighRefreshDisplayAndKeepOn()
 
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
@@ -209,6 +204,8 @@ class MainActivity : Activity(), SensorEventListener {
         if (!hasCameraPermission()) {
             requestPermissions(arrayOf(Manifest.permission.CAMERA), REQ_CAMERA)
         }
+
+        mainHandler.postDelayed({ performUpdateCheck(manual = false) }, 2500L)
     }
 
     private fun loadCalibration() {
@@ -384,10 +381,13 @@ class MainActivity : Activity(), SensorEventListener {
             NativeBridge.nativeClearDrawings()
             showStereoBanner("\uD83E\uDDF9  Đã xóa nét vẽ", "#FF5252", 1200L)
         }
-        depthToggleBtn = makeQuickButton("\uD83C\uDF0A Che khuất: BẬT") {
-            depthOcclusionEnabled = !depthOcclusionEnabled
-            depthToggleBtn.text = if (depthOcclusionEnabled) "\uD83C\uDF0A Che khuất: BẬT" else "\uD83C\uDF0A Che khuất: TẮT"
-            NativeBridge.nativeSetFeatures(depthOcclusionEnabled, drawMode)
+        checkUpdateBtn = makeQuickButton("\uD83D\uDD04 Check cập nhật") {
+            performUpdateCheck(manual = true)
+        }
+        installUpdateBtn = makeQuickButton("\u2B07 Cập nhật", fillColor = Color.argb(220, 0, 180, 80)) {
+            triggerApkDownloadAndInstall()
+        }.apply {
+            visibility = View.GONE
         }
         telemetryToggleBtn = makeQuickButton("\uD83D\uDCCA Thông số") {
             toggleTelemetryHud()
@@ -401,12 +401,13 @@ class MainActivity : Activity(), SensorEventListener {
             LinearLayout.LayoutParams.WRAP_CONTENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
         ).apply {
-            marginStart = 10
+            marginStart = 8
         }
 
         bar.addView(drawToggleBtn, itemParams)
         bar.addView(clearBtn, itemParams)
-        bar.addView(depthToggleBtn, itemParams)
+        bar.addView(checkUpdateBtn, itemParams)
+        bar.addView(installUpdateBtn, itemParams)
         bar.addView(telemetryToggleBtn, itemParams)
         bar.addView(gearBtn, itemParams)
 
@@ -421,24 +422,106 @@ class MainActivity : Activity(), SensorEventListener {
         root.addView(bar, barParams)
     }
 
-    private fun makeQuickButton(label: String, onClick: () -> Unit): Button {
+    private fun makeQuickButton(
+        label: String,
+        fillColor: Int = Color.argb(175, 20, 24, 34),
+        onClick: () -> Unit
+    ): Button {
         val bg = GradientDrawable().apply {
             cornerRadius = 20f
-            setColor(Color.argb(170, 20, 24, 34))
-            setStroke(2, Color.argb(120, 255, 255, 255))
+            setColor(fillColor)
+            setStroke(2, Color.argb(130, 255, 255, 255))
         }
         return Button(this).apply {
             text = label
             isAllCaps = false
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
             setTextColor(Color.WHITE)
             background = bg
             minHeight = 0
             minimumHeight = 0
             minWidth = 0
             minimumWidth = 0
-            setPadding(20, 10, 20, 10)
+            setPadding(18, 10, 18, 10)
             setOnClickListener { onClick() }
+        }
+    }
+
+    private fun performUpdateCheck(manual: Boolean) {
+        if (appUpdater.isDownloading) return
+        if (manual) {
+            checkUpdateBtn.text = "\uD83D\uDD04 Đang check..."
+            checkUpdateBtn.isEnabled = false
+        }
+        appUpdater.checkForUpdate { res ->
+            checkUpdateBtn.text = "\uD83D\uDD04 Check cập nhật"
+            checkUpdateBtn.isEnabled = true
+
+            if (res.error != null) {
+                if (manual) {
+                    showStereoBanner("\u26A0\uFE0F  Lỗi kiểm tra cập nhật: ${res.error}", "#FF7043", 2200L)
+                }
+                return@checkForUpdate
+            }
+
+            if (res.hasUpdate) {
+                availableUpdate = res
+                val tag = if (res.remoteBuildNumber > 0) "#${res.remoteBuildNumber}" else res.remoteCommit.take(7)
+                installUpdateBtn.text = "\u2B07 Cập nhật $tag"
+                installUpdateBtn.visibility = View.VISIBLE
+                showStereoBanner(
+                    "\u2B07  Có bản cập nhật mới ($tag)! Bấm [Cập nhật] để cài",
+                    "#00E676",
+                    2600L,
+                    strokeWidth = 4
+                )
+            } else {
+                availableUpdate = null
+                installUpdateBtn.visibility = View.GONE
+                if (manual) {
+                    showStereoBanner(
+                        "\u2705  Đang dùng bản mới nhất (v${BuildConfig.VERSION_NAME})",
+                        "#00E5FF",
+                        1900L
+                    )
+                }
+            }
+        }
+    }
+
+    private fun triggerApkDownloadAndInstall() {
+        val upd = availableUpdate ?: return
+        if (appUpdater.isDownloading) return
+
+        val started = appUpdater.startDownloadAndInstall(
+            activity = this,
+            downloadUrl = upd.downloadUrl,
+            expectedSize = upd.assetSizeBytes,
+            onProgress = { pct, _, _ ->
+                installUpdateBtn.isEnabled = false
+                installUpdateBtn.text = "\u2B07 Đang tải ${pct}%"
+            },
+            onReadyToInstall = {
+                installUpdateBtn.isEnabled = true
+                installUpdateBtn.text = "\u2B07 Cài đặt lại"
+                showStereoBanner("\uD83D\uDCE6  Đã tải xong — đang mở cài đặt...", "#00E676", 2200L)
+            },
+            onError = { errMsg ->
+                installUpdateBtn.isEnabled = true
+                installUpdateBtn.text = "\u2B07 Thử cập nhật lại"
+                showStereoBanner("\u26A0\uFE0F  Lỗi tải APK: $errMsg", "#FF5252", 2400L)
+            }
+        )
+
+        if (!started) {
+            pendingInstallPermissionResume = true
+            Toast.makeText(
+                this,
+                "Hãy bật quyền 'Cài đặt ứng dụng không xác định' rồi quay lại app để tự cài đặt.",
+                Toast.LENGTH_LONG
+            ).show()
+        } else {
+            showStereoBanner("\u2B07  Đang tải bản cập nhật...", "#00E5FF", 1600L)
         }
     }
 
@@ -450,7 +533,7 @@ class MainActivity : Activity(), SensorEventListener {
             else -> "\u270F Vẽ: TẮT"
         }
         drawToggleBtn.text = modeLabel
-        NativeBridge.nativeSetFeatures(depthOcclusionEnabled, drawMode)
+        NativeBridge.nativeSetDrawMode(drawMode)
         if (showPopup) {
             val banner = when (drawMode) {
                 1 -> "\u270F  Chế độ vẽ: 1 NGÓN TRỎ"
@@ -500,14 +583,12 @@ class MainActivity : Activity(), SensorEventListener {
 
         val renderFps = metricsBuf[0].toInt()
         val frameMs = metricsBuf[1]
-        val centerDepth = metricsBuf[2]
-        val activeHands = metricsBuf[3].toInt()
-        val gestureCode = metricsBuf[4].toInt()
-        val strokeSegs = metricsBuf[5].toInt() / 12
-        val tipX = metricsBuf[6]
-        val tipY = metricsBuf[7]
-        val tipZ = metricsBuf[8]
-        val hasEnvDepth = metricsBuf[9] > 0.5f
+        val activeHands = metricsBuf[2].toInt()
+        val gestureCode = metricsBuf[3].toInt()
+        val strokeSegs = metricsBuf[4].toInt() / 48
+        val tipX = metricsBuf[5]
+        val tipY = metricsBuf[6]
+        val tipZ = metricsBuf[7]
 
         val batIntent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
         val level = batIntent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
@@ -528,13 +609,6 @@ class MainActivity : Activity(), SensorEventListener {
         }
 
         val trackMode = if (isUsingArCore) "ARCore 6DoF" else "Camera2 3DoF"
-        val depthText = when {
-            !depthOcclusionEnabled -> "TẮT"
-            !isUsingArCore -> "Tay Z-Mask (Camera2)"
-            !isArDepthSupported -> "Tay Z-Mask (No ARDepth)"
-            hasEnvDepth && centerDepth > 0.05f -> String.format(Locale.US, "BẬT | Tâm=%.2fm", centerDepth)
-            else -> "ARDepth đang khởi tạo..."
-        }
         val tipText = if (activeHands > 0 && tipZ > 0.05f) {
             String.format(Locale.US, "X=%+.2f Y=%+.2f Z=%.2fm", tipX, tipY, tipZ)
         } else {
@@ -554,14 +628,15 @@ class MainActivity : Activity(), SensorEventListener {
 
         val aiFps = handTracker.aiFps.toInt()
         val inferMs = handTracker.lastInferMs
+        val shortSha = BuildConfig.GIT_COMMIT_SHA.take(7)
 
         val summary = StringBuilder()
-            .append("Máy: ${Build.MODEL} ($soc)\n")
+            .append("Bản: v${BuildConfig.VERSION_NAME} ($shortSha) | ${Build.MODEL} ($soc)\n")
             .append("GPU: $cachedGpuName\n")
             .append("Màn: ${displayModeW}x${displayModeH}@${displayHz}Hz | Pin: ${batPct}% (${String.format(Locale.US, "%.1f", tempC)}°C) | RAM: ${totalRamMb}MB\n")
-            .append(String.format(Locale.US, "Render: %d fps (%.1f ms) | AI Tay: %d fps (%d ms)\n", renderFps, frameMs, aiFps, inferMs))
-            .append("Track: $trackMode | Depth: $depthText\n")
-            .append("Tay ($activeHands): $gestureName | Trỏ: $tipText | Vẽ: ${strokeSegs} đoạn")
+            .append(String.format(Locale.US, "Render: %d fps (%.1f ms) | AI Tay (%s): %d fps (%d ms)\n", renderFps, frameMs, handTracker.delegateLabel, aiFps, inferMs))
+            .append("Track: $trackMode | Tay ($activeHands): $gestureName | Vẽ: ${strokeSegs} nét\n")
+            .append("Ngón Trỏ: $tipText")
             .toString()
 
         leftTelemetryCard.text = summary
@@ -726,6 +801,12 @@ class MainActivity : Activity(), SensorEventListener {
         if (telemetryVisible) {
             startTelemetryLoop()
         }
+        if (pendingInstallPermissionResume) {
+            pendingInstallPermissionResume = false
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || packageManager.canRequestPackageInstalls()) {
+                triggerApkDownloadAndInstall()
+            }
+        }
     }
 
     override fun onPause() {
@@ -740,6 +821,7 @@ class MainActivity : Activity(), SensorEventListener {
 
     override fun onDestroy() {
         handTracker.close()
+        appUpdater.close()
         synchronized(sessionLock) {
             arSession?.close()
             arSession = null
@@ -834,20 +916,18 @@ class MainActivity : Activity(), SensorEventListener {
                         session.cameraConfig = preferred
                         Log.i(TAG, "ARCore CameraConfig: cpu=${preferred.imageSize}, gpu=${preferred.textureSize}")
                     }
-                    val depthSupported = session.isDepthModeSupported(Config.DepthMode.AUTOMATIC)
-                    isArDepthSupported = depthSupported
                     val config = Config(session).apply {
                         focusMode = Config.FocusMode.AUTO
                         planeFindingMode = Config.PlaneFindingMode.DISABLED
                         lightEstimationMode = Config.LightEstimationMode.DISABLED
-                        depthMode = if (depthSupported) Config.DepthMode.AUTOMATIC else Config.DepthMode.DISABLED
+                        depthMode = Config.DepthMode.DISABLED
                         updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
                     }
                     session.configure(config)
                     arSession = session
                     arNeedsTextureBind = true
                     isUsingArCore = true
-                    Log.i(TAG, "ARCore 6DoF initialized (depthSupported=$depthSupported)")
+                    Log.i(TAG, "ARCore 6DoF initialized (depth disabled for max speed)")
                 } catch (t: Throwable) {
                     Log.w(TAG, "ARCore unavailable, falling back to Camera2 + 120Hz 3DoF: ${t.message}")
                     arSession = null
@@ -1163,59 +1243,7 @@ class MainActivity : Activity(), SensorEventListener {
                                     valid
                                 )
 
-                                // Throttled 15Hz 16-bit Environment Depth extraction
-                                if (depthOcclusionEnabled &&
-                                    isArDepthSupported &&
-                                    nowNs - lastDepthUpdateNs >= 66_000_000L
-                                ) {
-                                    try {
-                                        val depthImg = frame.acquireDepthImage16Bits()
-                                        try {
-                                            lastDepthUpdateNs = nowNs
-                                            val dw = depthImg.width
-                                            val dh = depthImg.height
-                                            val plane = depthImg.planes[0]
-                                            val buf = plane.buffer
-                                            val rowStride = plane.rowStride
-                                            val tightStride = dw * 2
-                                            val needed = tightStride * dh
-                                            if (depthBytes.size < needed) {
-                                                depthBytes = ByteArray(needed)
-                                            }
-                                            if (rowStride == tightStride) {
-                                                buf.position(0)
-                                                buf.get(depthBytes, 0, needed)
-                                            } else {
-                                                for (r in 0 until dh) {
-                                                    buf.position(r * rowStride)
-                                                    buf.get(depthBytes, r * tightStride, tightStride)
-                                                }
-                                            }
-                                            frame.transformCoordinates2d(
-                                                Coordinates2d.OPENGL_NORMALIZED_DEVICE_COORDINATES,
-                                                depthQuadCorners,
-                                                Coordinates2d.IMAGE_NORMALIZED,
-                                                depthUvBasis
-                                            )
-                                            NativeBridge.nativeOnDepthFrame(
-                                                dw,
-                                                dh,
-                                                depthBytes,
-                                                depthUvBasis[0],
-                                                depthUvBasis[1],
-                                                depthUvBasis[2] - depthUvBasis[0],
-                                                depthUvBasis[3] - depthUvBasis[1],
-                                                depthUvBasis[4] - depthUvBasis[0],
-                                                depthUvBasis[5] - depthUvBasis[1]
-                                            )
-                                        } finally {
-                                            depthImg.close()
-                                        }
-                                    } catch (_: Throwable) {
-                                    }
-                                }
-
-                                // Non-blocking 20Hz MediaPipe Hand Tracking
+                                // Fast 480p GPU MediaPipe Hand Tracking
                                 if (!handTracker.isBusy.get()) {
                                     try {
                                         frame.transformCoordinates2d(
@@ -1293,7 +1321,6 @@ class MainActivity : Activity(), SensorEventListener {
             val numConfig = IntArray(1)
             val configs = arrayOfNulls<EGLConfig>(1)
 
-            // 0x MSAA avoids 4x Mali-G57 fragment fill-rate overhead across 2400x1080 @ 120Hz
             val fastAttribs = intArrayOf(
                 EGL10.EGL_RED_SIZE, 8,
                 EGL10.EGL_GREEN_SIZE, 8,

@@ -1,4 +1,3 @@
-pub mod depth_occlusion;
 pub mod finger_draw;
 pub mod gyro_predict;
 pub mod hand_tracking;
@@ -7,7 +6,7 @@ pub mod renderer;
 pub mod scene_3d;
 
 use hand_tracking::{FLOATS_PER_LANDMARK, LANDMARKS_PER_HAND, MAX_HANDS};
-use jni::objects::{JByteArray, JClass, JFloatArray};
+use jni::objects::{JClass, JFloatArray};
 use jni::sys::{jboolean, jint, jstring, JNI_TRUE};
 use jni::JNIEnv;
 use renderer::{GlRenderer, SharedInputState};
@@ -27,7 +26,6 @@ fn gpu_info() -> &'static Mutex<String> {
 
 thread_local! {
     static GL_RENDERER: RefCell<Option<GlRenderer>> = const { RefCell::new(None) };
-    static LAST_SYNCED_DEPTH_GEN: RefCell<u64> = const { RefCell::new(0) };
 }
 
 #[cfg(target_os = "android")]
@@ -109,7 +107,6 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeOnSurfaceCreate
     _class: JClass,
 ) -> jint {
     init_logging();
-    LAST_SYNCED_DEPTH_GEN.with(|g| *g.borrow_mut() = 0);
     let tex_id = GL_RENDERER.with(|cell| {
         if let Some(old) = cell.borrow_mut().take() {
             old.destroy();
@@ -232,35 +229,6 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeOnFallbackCamer
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeOnDepthFrame(
-    env: JNIEnv,
-    _class: JClass,
-    width: jint,
-    height: jint,
-    packed_bytes: JByteArray,
-    d0x: f32,
-    d0y: f32,
-    dxx: f32,
-    dxy: f32,
-    dyx: f32,
-    dyy: f32,
-) {
-    let needed = (width.max(0) as usize) * (height.max(0) as usize) * 2;
-    if needed == 0 {
-        return;
-    }
-    let Ok(bytes) = env.convert_byte_array(&packed_bytes) else {
-        return;
-    };
-    if bytes.len() < needed {
-        return;
-    }
-    if let Ok(mut state) = input_state().lock() {
-        state.on_depth_frame(width, height, &bytes[..needed], [d0x, d0y], [dxx, dxy], [dyx, dyy]);
-    }
-}
-
-#[no_mangle]
 pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeSetCalibration(
     _env: JNIEnv,
     _class: JClass,
@@ -273,14 +241,13 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeSetCalibration(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeSetFeatures(
+pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeSetDrawMode(
     _env: JNIEnv,
     _class: JClass,
-    depth_occlusion: jboolean,
     draw_mode: jint,
 ) {
     if let Ok(mut state) = input_state().lock() {
-        state.set_features(depth_occlusion == JNI_TRUE, draw_mode);
+        state.set_draw_mode(draw_mode);
     }
 }
 
@@ -344,14 +311,12 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeGetPerfMetrics(
     let buf = [
         perf.render_fps,
         perf.frame_ms,
-        perf.center_depth_m,
         perf.active_hands as f32,
         perf.current_gesture as f32,
         perf.stroke_vertices as f32,
         perf.index_tip_cam[0],
         perf.index_tip_cam[1],
         perf.index_tip_cam[2],
-        if perf.has_valid_depth { 1.0 } else { 0.0 },
     ];
     let _ = env.set_float_array_region(&out_arr, 0, &buf);
 }
@@ -367,18 +332,6 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeDrawFrame(
         };
         state.snapshot_frame()
     };
-
-    let last_gen = LAST_SYNCED_DEPTH_GEN.with(|g| *g.borrow());
-    if snap.pending_depth_gen != 0 && snap.pending_depth_gen != last_gen {
-        if let Ok(state) = input_state().lock() {
-            GL_RENDERER.with(|cell| {
-                if let Some(renderer) = cell.borrow_mut().as_mut() {
-                    renderer.sync_depth_if_needed(&state.pending_depth);
-                }
-            });
-            LAST_SYNCED_DEPTH_GEN.with(|g| *g.borrow_mut() = state.pending_depth.generation);
-        }
-    }
 
     let timing = GL_RENDERER.with(|cell| {
         cell.borrow_mut()

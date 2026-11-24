@@ -2,8 +2,8 @@
 
 | Phase | Task | Status | Notes |
 | :--- | :--- | :--- | :--- |
-| 1. Setup | Create `ARCHITECTURE.md`, `TASKS.md`, `.gitignore`, `README.md` | [x] | Updated with Depth, Combos & Telemetry |
-| 2. Rust Core | `depth_occlusion.rs`, `finger_draw.rs`, `hand_tracking.rs` (1€ + 8 poses + 5 combos), `scene_3d.rs`, `renderer.rs`, `lib.rs` | [x] | 14 unit tests pass |
-| 3. Android Shell | `FastEglConfigChooser`, ARCore 480p/1080p split + `DEPTH16`, CPU MediaPipe `224px`, Quick Bar, Stereo Telemetry HUD | [x] | Verified locally |
-| 4. CI/CD APK | `.github/workflows/build-apk.yml` (Rust `cargo-ndk` + Gradle APK + Release) | [x] | Rolling `latest-apk` release |
-| 5. Verify & Git | Run `cargo test`, `cargo check --target aarch64-linux-android`, `gradlew :app:assembleDebug`, push `main` | [x] | Pushed & verified |
+| 1. Setup | Update `ARCHITECTURE.md`, `TASKS.md`, `README.md` | [x] | Removed depth occlusion; documented OTA & GPU hands |
+| 2. Rust Core | Update `hand_tracking.rs`, `finger_draw.rs`, `scene_3d.rs`, `renderer.rs`, `lib.rs` (delete `depth_occlusion.rs`) | [x] | 12 unit tests pass |
+| 3. Android Shell | Add `debug-fixed.keystore`, `ApkFileProvider.kt`, `AppUpdater.kt`, GPU `480p` MediaPipe, Quick Bar + HUD | [x] | Verified locally |
+| 4. CI/CD APK | Update `.github/workflows/build-apk.yml` (`fetch-depth: 0` + `BuildCommit`/`BuildNumber`) | [x] | Rolling `latest-apk` release |
+| 5. Verify & Git | Run `cargo test`, `cargo check --target aarch64-linux-android`, `gradlew :app:assembleDebug`, push `main` | [x] | Verified & pushed |
