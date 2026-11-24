@@ -5,13 +5,16 @@ pub mod passthrough;
 pub mod renderer;
 pub mod room_scanner;
 pub mod scene_3d;
+pub mod vision_ram;
 
+use glam::{Quat, Vec3};
 use hand_tracking::{FLOATS_PER_LANDMARK, LANDMARKS_PER_HAND, MAX_HANDS};
-use room_scanner::{FLOATS_PER_LABEL, FLOATS_PER_OBJECT, FLOATS_PER_PLANE, MAX_LABELS};
-use jni::objects::{JClass, JFloatArray};
-use jni::sys::{jboolean, jint, jstring, JNI_TRUE};
+use jni::objects::{JByteBuffer, JClass, JFloatArray};
+use jni::sys::{jboolean, jfloat, jint, jlong, jstring, JNI_TRUE};
 use jni::JNIEnv;
 use renderer::{GlRenderer, SharedInputState};
+use room_scanner::{FLOATS_PER_LABEL, FLOATS_PER_OBJECT, FLOATS_PER_PLANE, MAX_LABELS};
+use vision_ram::{convert_latest_rgba, ingest_camera_planes, init_vision_ram, CaptureMeta};
 use std::cell::RefCell;
 use std::sync::{Mutex, OnceLock};
 
@@ -99,8 +102,9 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeInit(
     _class: JClass,
 ) {
     init_logging();
+    init_vision_ram();
     let _ = input_state();
-    log::info!("Rust AR/VR core initialized");
+    log::info!("Rust AR/VR core + 2MB RAM LUT initialized");
 }
 
 #[no_mangle]
@@ -321,8 +325,180 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeGetPerfMetrics(
         perf.index_tip_cam[2],
         perf.active_planes as f32,
         perf.active_objects as f32,
+        perf.cached_planes as f32,
     ];
     let _ = env.set_float_array_region(&out_arr, 0, &buf);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeGetRenderFrameMs(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jfloat {
+    input_state()
+        .lock()
+        .map(|s| s.perf.frame_ms)
+        .unwrap_or(0.0)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeIngestCameraImage(
+    env: JNIEnv,
+    _class: JClass,
+    y_buf: JByteBuffer,
+    u_buf: JByteBuffer,
+    v_buf: JByteBuffer,
+    y_len: jint,
+    u_len: jint,
+    v_len: jint,
+    width: jint,
+    height: jint,
+    y_row_stride: jint,
+    y_pixel_stride: jint,
+    uv_row_stride: jint,
+    uv_pixel_stride: jint,
+    rot_deg: jint,
+    ndc_basis_arr: JFloatArray,
+) -> jlong {
+    if width < 2 || height < 2 || y_len <= 0 || u_len <= 0 || v_len <= 0 {
+        return 0;
+    }
+    let mut ndc_basis = [0.0f32; 6];
+    if env.get_float_array_region(&ndc_basis_arr, 0, &mut ndc_basis).is_err() {
+        return 0;
+    }
+
+    let (cam_pos, cam_rot, tan_h, tan_v) = {
+        let Ok(state) = input_state().lock() else {
+            return 0;
+        };
+        let (pos, rot) = if state.has_ar_pose {
+            (state.ar_pos, state.ar_rot)
+        } else {
+            let head = if state.has_gyro {
+                state.gyro_latest
+            } else {
+                Quat::IDENTITY
+            };
+            (Vec3::ZERO, head)
+        };
+        (
+            pos.to_array(),
+            rot.to_array(),
+            state.cam_tan_half_h,
+            state.cam_tan_half_v,
+        )
+    };
+
+    let (Ok(y_ptr), Ok(y_cap)) = (
+        env.get_direct_buffer_address(&y_buf),
+        env.get_direct_buffer_capacity(&y_buf),
+    ) else {
+        return 0;
+    };
+    let (Ok(u_ptr), Ok(u_cap)) = (
+        env.get_direct_buffer_address(&u_buf),
+        env.get_direct_buffer_capacity(&u_buf),
+    ) else {
+        return 0;
+    };
+    let (Ok(v_ptr), Ok(v_cap)) = (
+        env.get_direct_buffer_address(&v_buf),
+        env.get_direct_buffer_capacity(&v_buf),
+    ) else {
+        return 0;
+    };
+
+    if y_ptr.is_null() || u_ptr.is_null() || v_ptr.is_null() {
+        return 0;
+    }
+
+    let y_slice = unsafe { std::slice::from_raw_parts(y_ptr, (y_len as usize).min(y_cap)) };
+    let u_slice = unsafe { std::slice::from_raw_parts(u_ptr, (u_len as usize).min(u_cap)) };
+    let v_slice = unsafe { std::slice::from_raw_parts(v_ptr, (v_len as usize).min(v_cap)) };
+
+    let seq = ingest_camera_planes(
+        y_slice,
+        u_slice,
+        v_slice,
+        width as usize,
+        height as usize,
+        y_row_stride.max(1) as usize,
+        y_pixel_stride.max(1) as usize,
+        uv_row_stride.max(1) as usize,
+        uv_pixel_stride.max(1) as usize,
+        CaptureMeta {
+            seq: 0,
+            cam_pos,
+            cam_rot,
+            tan_h,
+            tan_v,
+            ndc_basis,
+            rot_deg,
+        },
+    );
+    seq as jlong
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeConvertLatestFrameRgba(
+    env: JNIEnv,
+    _class: JClass,
+    out_rgba_buf: JByteBuffer,
+    dst_w: jint,
+    dst_h: jint,
+    last_seq: jlong,
+    update_motion: jboolean,
+    out_meta_arr: JFloatArray,
+) -> jlong {
+    if dst_w < 2 || dst_h < 2 {
+        return 0;
+    }
+    let needed = (dst_w as usize) * (dst_h as usize) * 4;
+    let (Ok(out_ptr), Ok(out_cap)) = (
+        env.get_direct_buffer_address(&out_rgba_buf),
+        env.get_direct_buffer_capacity(&out_rgba_buf),
+    ) else {
+        return 0;
+    };
+    if out_ptr.is_null() || out_cap < needed {
+        return 0;
+    }
+
+    let out_slice = unsafe { std::slice::from_raw_parts_mut(out_ptr, needed) };
+    let Some((meta, skin_pm, motion_pm, convert_us)) = convert_latest_rgba(
+        out_slice,
+        dst_w as usize,
+        dst_h as usize,
+        last_seq.max(0) as u64,
+        update_motion == JNI_TRUE,
+    ) else {
+        return 0;
+    };
+
+    let meta_floats = [
+        skin_pm as f32,
+        motion_pm as f32,
+        convert_us as f32,
+        meta.cam_pos[0],
+        meta.cam_pos[1],
+        meta.cam_pos[2],
+        meta.cam_rot[0],
+        meta.cam_rot[1],
+        meta.cam_rot[2],
+        meta.cam_rot[3],
+        meta.tan_h,
+        meta.tan_v,
+        meta.ndc_basis[0],
+        meta.ndc_basis[1],
+        meta.ndc_basis[2],
+        meta.ndc_basis[3],
+        meta.ndc_basis[4],
+        meta.ndc_basis[5],
+        meta.rot_deg as f32,
+    ];
+    let _ = env.set_float_array_region(&out_meta_arr, 0, &meta_floats);
+    meta.seq as jlong
 }
 
 #[no_mangle]
@@ -365,10 +541,25 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeOnDetectedObjec
     _class: JClass,
     object_count: jint,
     packed_objects: JFloatArray,
+    pose_and_tan_arr: JFloatArray,
 ) {
+    let mut pose_buf = [0.0f32; 9];
+    if env.get_float_array_region(&pose_and_tan_arr, 0, &mut pose_buf).is_err() {
+        return;
+    }
+    let cam_pos = Vec3::new(pose_buf[0], pose_buf[1], pose_buf[2]);
+    let q = Quat::from_xyzw(pose_buf[3], pose_buf[4], pose_buf[5], pose_buf[6]);
+    let cam_rot = if q.length_squared() > 1e-6 {
+        q.normalize()
+    } else {
+        Quat::IDENTITY
+    };
+    let tan_h = pose_buf[7];
+    let tan_v = pose_buf[8];
+
     if object_count <= 0 {
         if let Ok(mut state) = input_state().lock() {
-            state.on_detected_objects(0, &[]);
+            state.on_detected_objects(0, &[], cam_pos, cam_rot, tan_h, tan_v);
         }
         return;
     }
@@ -381,7 +572,7 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeOnDetectedObjec
         return;
     }
     if let Ok(mut state) = input_state().lock() {
-        state.on_detected_objects(count, &buf);
+        state.on_detected_objects(count, &buf, cam_pos, cam_rot, tan_h, tan_v);
     }
 }
 

@@ -21,6 +21,7 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
+import android.media.Image
 import android.media.ImageReader
 import android.opengl.GLSurfaceView
 import android.os.BatteryManager
@@ -36,6 +37,7 @@ import android.util.TypedValue
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.Surface
+import android.view.SurfaceHolder
 import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsController
@@ -64,6 +66,8 @@ import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.egl.EGLDisplay
 import javax.microedition.khronos.opengles.GL10
 import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
 
 class MainActivity : Activity(), SensorEventListener {
 
@@ -109,6 +113,8 @@ class MainActivity : Activity(), SensorEventListener {
     private lateinit var appUpdater: AppUpdater
     private val imgBasis = floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f)
     private val ndcBasis = FloatArray(6)
+    private val fallbackBasis90 = floatArrayOf(-1f, 1f, 1f, 1f, -1f, -1f)
+    private val fallbackBasis270 = floatArrayOf(1f, -1f, -1f, -1f, 1f, 1f)
 
     // GL state synced with render thread
     @Volatile
@@ -139,12 +145,16 @@ class MainActivity : Activity(), SensorEventListener {
     private var lastArTimestampNs = 0L
 
     // Feature toggles, OTA Updater & UI
-    private var fovPct = 78
+    private var fovPct = 85
     private var ipdMm = 64
     @Volatile
     private var drawMode = 0 // 0=Off, 1=1 Finger, 2=5 Fingers
     @Volatile
+    private var handMode = 1 // 1=Tự động, 2=Nhanh, 0=Tắt
+    @Volatile
     private var roomScanMode = 2 // 0=Tắt, 1=Sàn/Tường, 2=Đầy đủ (AR Plane + Đồ vật)
+    @Volatile
+    private var cachedPlanesCount = 0
     private var telemetryVisible = false
     private var availableUpdate: UpdateCheckResult? = null
     private var pendingInstallPermissionResume = false
@@ -167,11 +177,12 @@ class MainActivity : Activity(), SensorEventListener {
     private lateinit var leftTelemetryCard: TextView
     private lateinit var rightTelemetryCard: TextView
     private lateinit var drawToggleBtn: Button
+    private lateinit var handModeBtn: Button
     private lateinit var roomScanToggleBtn: Button
     private lateinit var checkUpdateBtn: Button
     private lateinit var installUpdateBtn: Button
     private lateinit var telemetryToggleBtn: Button
-    private val metricsBuf = FloatArray(10)
+    private val metricsBuf = FloatArray(11)
     private var cachedGpuName = ""
     private var telemetryRunnable: Runnable? = null
 
@@ -205,6 +216,17 @@ class MainActivity : Activity(), SensorEventListener {
             setRenderer(ArVrGlRenderer())
             renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
         }
+        glView.holder.addCallback(object : SurfaceHolder.Callback {
+            override fun surfaceCreated(holder: SurfaceHolder) {
+                applySurfaceRefreshRate(holder.surface)
+            }
+
+            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+                applySurfaceRefreshRate(holder.surface)
+            }
+
+            override fun surfaceDestroyed(holder: SurfaceHolder) {}
+        })
         root.addView(
             glView,
             FrameLayout.LayoutParams(
@@ -226,9 +248,27 @@ class MainActivity : Activity(), SensorEventListener {
         mainHandler.postDelayed({ performUpdateCheck(manual = false) }, 2500L)
     }
 
+    private fun dp(v: Float): Int =
+        TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v, resources.displayMetrics).toInt()
+
+    private fun applySurfaceRefreshRate(surface: Surface) {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                surface.setFrameRate(
+                    120f,
+                    Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE,
+                    Surface.CHANGE_FRAME_RATE_ONLY_IF_SEAMLESS
+                )
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                surface.setFrameRate(120f, Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
     private fun loadCalibration() {
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        fovPct = prefs.getInt(KEY_FOV_PCT, 78).coerceIn(50, 100)
+        fovPct = prefs.getInt(KEY_FOV_PCT, 85).coerceIn(50, 100)
         ipdMm = prefs.getInt(KEY_IPD_MM, 64).coerceIn(56, 72)
         NativeBridge.nativeSetCalibration(fovPct / 100f, ipdMm / 1000f)
     }
@@ -259,15 +299,23 @@ class MainActivity : Activity(), SensorEventListener {
             }
             .maxByOrNull { it.refreshRate } ?: curMode
 
-        displayModeW = bestMode.physicalWidth
-        displayModeH = bestMode.physicalHeight
+        displayModeW = max(bestMode.physicalWidth, bestMode.physicalHeight)
+        displayModeH = min(bestMode.physicalWidth, bestMode.physicalHeight)
         displayHz = bestMode.refreshRate.toInt()
 
+        val attrs = window.attributes
         if (bestMode.modeId != curMode.modeId) {
-            val attrs = window.attributes
             attrs.preferredDisplayModeId = bestMode.modeId
-            window.attributes = attrs
         }
+        attrs.preferredRefreshRate = bestMode.refreshRate
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            attrs.layoutInDisplayCutoutMode =
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            attrs.layoutInDisplayCutoutMode =
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
+        window.attributes = attrs
         displayRotation = currentDisplay.rotation
     }
 
@@ -378,16 +426,16 @@ class MainActivity : Activity(), SensorEventListener {
             visibility = View.GONE
             background = pillBg
             setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14.5f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             typeface = Typeface.DEFAULT_BOLD
-            setPadding(28, 16, 28, 16)
+            setPadding(dp(14f), dp(7f), dp(14f), dp(7f))
             gravity = Gravity.CENTER
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 Gravity.TOP or Gravity.CENTER_HORIZONTAL
             ).apply {
-                topMargin = 112
+                topMargin = dp(52f)
             }
             translationX = nasalShiftPx.toFloat()
         }
@@ -403,17 +451,17 @@ class MainActivity : Activity(), SensorEventListener {
             visibility = View.GONE
             background = cardBg
             setTextColor(Color.parseColor("#E0F7FA"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 9.5f)
             typeface = Typeface.MONOSPACE
-            setPadding(18, 12, 18, 12)
-            setLineSpacing(2f, 1.08f)
+            setPadding(dp(10f), dp(6f), dp(10f), dp(6f))
+            setLineSpacing(2f, 1.06f)
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 Gravity.TOP or Gravity.START
             ).apply {
-                topMargin = 58
-                leftMargin = 18
+                topMargin = dp(46f)
+                leftMargin = dp(10f)
             }
             translationX = nasalShiftPx.toFloat()
         }
@@ -428,14 +476,17 @@ class MainActivity : Activity(), SensorEventListener {
         drawToggleBtn = makeQuickButton("\u270F Vẽ: TẮT") {
             cycleDrawMode(showPopup = false)
         }
-        val clearBtn = makeQuickButton("\uD83D\uDDD1 Xóa") {
+        handModeBtn = makeQuickButton("\uD83D\uDD90 Tay: T.ĐỘNG") {
+            cycleHandMode(showPopup = true)
+        }
+        val clearBtn = makeQuickButton("\uD83D\uDDD1") {
             NativeBridge.nativeClearDrawings()
             showStereoBanner("\uD83E\uDDF9  Đã xóa nét vẽ", "#FF5252", 1200L)
         }
-        roomScanToggleBtn = makeQuickButton("\uD83C\uDFE0 Quét: ĐẦY ĐỦ") {
+        roomScanToggleBtn = makeQuickButton("\uD83C\uDFE0 ĐẦY ĐỦ") {
             cycleRoomScanMode(showPopup = true)
         }
-        checkUpdateBtn = makeQuickButton("\uD83D\uDD04 Check cập nhật") {
+        checkUpdateBtn = makeQuickButton("\uD83D\uDD04 Check") {
             performUpdateCheck(manual = true)
         }
         installUpdateBtn = makeQuickButton("\u2B07 Cập nhật", fillColor = Color.argb(220, 0, 180, 80)) {
@@ -443,7 +494,7 @@ class MainActivity : Activity(), SensorEventListener {
         }.apply {
             visibility = View.GONE
         }
-        telemetryToggleBtn = makeQuickButton("\uD83D\uDCCA Thông số") {
+        telemetryToggleBtn = makeQuickButton("\uD83D\uDCCA Info") {
             toggleTelemetryHud()
         }
         val gearBtn = makeQuickButton("\u2699") {
@@ -455,10 +506,11 @@ class MainActivity : Activity(), SensorEventListener {
             LinearLayout.LayoutParams.WRAP_CONTENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
         ).apply {
-            marginStart = 8
+            marginStart = dp(3.5f)
         }
 
         bar.addView(drawToggleBtn, itemParams)
+        bar.addView(handModeBtn, itemParams)
         bar.addView(clearBtn, itemParams)
         bar.addView(roomScanToggleBtn, itemParams)
         bar.addView(checkUpdateBtn, itemParams)
@@ -471,8 +523,8 @@ class MainActivity : Activity(), SensorEventListener {
             FrameLayout.LayoutParams.WRAP_CONTENT,
             Gravity.TOP or Gravity.END
         ).apply {
-            topMargin = 14
-            marginEnd = 16
+            topMargin = dp(6f)
+            marginEnd = dp(8f)
         }
         root.addView(bar, barParams)
     }
@@ -490,14 +542,14 @@ class MainActivity : Activity(), SensorEventListener {
         return Button(this).apply {
             text = label
             isAllCaps = false
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
             setTextColor(Color.WHITE)
             background = bg
             minHeight = 0
             minimumHeight = 0
             minWidth = 0
             minimumWidth = 0
-            setPadding(18, 10, 18, 10)
+            setPadding(dp(7f), dp(4.5f), dp(7f), dp(4.5f))
             setOnClickListener { onClick() }
         }
     }
@@ -505,11 +557,11 @@ class MainActivity : Activity(), SensorEventListener {
     private fun performUpdateCheck(manual: Boolean) {
         if (appUpdater.isDownloading) return
         if (manual) {
-            checkUpdateBtn.text = "\uD83D\uDD04 Đang check..."
+            checkUpdateBtn.text = "\uD83D\uDD04 Check..."
             checkUpdateBtn.isEnabled = false
         }
         appUpdater.checkForUpdate { res ->
-            checkUpdateBtn.text = "\uD83D\uDD04 Check cập nhật"
+            checkUpdateBtn.text = "\uD83D\uDD04 Check"
             checkUpdateBtn.isEnabled = true
 
             if (res.error != null) {
@@ -599,15 +651,43 @@ class MainActivity : Activity(), SensorEventListener {
         }
     }
 
+    private fun cycleHandMode(showPopup: Boolean) {
+        handMode = when (handMode) {
+            1 -> 2
+            2 -> 0
+            else -> 1
+        }
+        handTracker.setMode(handMode)
+        handModeBtn.text = when (handMode) {
+            2 -> "\uD83D\uDD90 Tay: NHANH"
+            0 -> "\uD83D\uDD90 Tay: TẮT"
+            else -> "\uD83D\uDD90 Tay: T.ĐỘNG"
+        }
+        if (showPopup) {
+            val banner = when (handMode) {
+                2 -> "\uD83D\uDD90  AI Tay: NHANH (24Hz liên tục)"
+                0 -> "\uD83D\uDD90  Đã TẮT AI Tay (Max FPS xuyên thấu)"
+                else -> "\uD83D\uDD90  AI Tay: TỰ ĐỘNG (Tiết kiệm GPU)"
+            }
+            showStereoBanner(banner, "#69F0AE", 1500L)
+        }
+    }
+
     private fun cycleRoomScanMode(showPopup: Boolean) {
         roomScanMode = (roomScanMode + 2) % 3 // Cycles 2 -> 1 -> 0 -> 2
         val modeLabel = when (roomScanMode) {
-            2 -> "\uD83C\uDFE0 Quét: ĐẦY ĐỦ"
-            1 -> "\uD83C\uDFE0 Quét: SÀN/TƯỜNG"
-            else -> "\uD83C\uDFE0 Quét: TẮT"
+            2 -> "\uD83C\uDFE0 ĐẦY ĐỦ"
+            1 -> "\uD83C\uDFE0 SÀN/TƯỜNG"
+            else -> "\uD83C\uDFE0 TẮT"
         }
         roomScanToggleBtn.text = modeLabel
         NativeBridge.nativeSetRoomScanMode(roomScanMode)
+        if (roomScanMode < 2) {
+            roomScanner.resetMetrics()
+        }
+        if (roomScanMode == 0) {
+            cachedPlanesCount = 0
+        }
         updateArPlaneFindingMode()
 
         if (roomScanMode > 0) {
@@ -703,8 +783,12 @@ class MainActivity : Activity(), SensorEventListener {
         }
         val tagW = if (tag.width > 0) tag.width else 88
         val tagH = if (tag.height > 0) tag.height else 30
-        val tx = (u * paneW - tagW * 0.5f).coerceIn(8f, (paneW - tagW - 8).coerceAtLeast(8).toFloat())
-        val ty = (v * paneH - tagH * 0.5f).coerceIn(54f, (paneH - tagH - 12).coerceAtLeast(54).toFloat())
+        val minTy = dp(44f).toFloat()
+        val maxTy = (paneH - tagH - dp(8f)).coerceAtLeast(dp(44f)).toFloat()
+        val minTx = dp(6f).toFloat()
+        val maxTx = (paneW - tagW - dp(6f)).coerceAtLeast(dp(6f)).toFloat()
+        val tx = (u * paneW - tagW * 0.5f).coerceIn(minTx, maxTx)
+        val ty = (v * paneH - tagH * 0.5f).coerceIn(minTy, maxTy)
         tag.translationX = tx
         tag.translationY = ty
         if (tag.visibility != View.VISIBLE) {
@@ -719,6 +803,7 @@ class MainActivity : Activity(), SensorEventListener {
             3 -> "Mặt bàn" to Color.argb(180, 255, 184, 61)
             4 -> "Bề mặt ghế" to Color.argb(180, 194, 133, 255)
             5 -> "Trần nhà" to Color.argb(180, 148, 166, 245)
+            6 -> "Mặt đứng" to Color.argb(180, 153, 189, 230)
             11 -> "Bàn ${pct}%" to Color.argb(190, 61, 240, 163)
             12 -> "Ghế ${pct}%" to Color.argb(190, 61, 240, 163)
             13 -> "Sofa ${pct}%" to Color.argb(190, 61, 240, 163)
@@ -736,7 +821,7 @@ class MainActivity : Activity(), SensorEventListener {
         val vis = if (telemetryVisible) View.VISIBLE else View.GONE
         leftTelemetryCard.visibility = vis
         rightTelemetryCard.visibility = vis
-        telemetryToggleBtn.text = if (telemetryVisible) "\uD83D\uDCCA Ẩn thông số" else "\uD83D\uDCCA Thông số"
+        telemetryToggleBtn.text = if (telemetryVisible) "\uD83D\uDCCA Ẩn" else "\uD83D\uDCCA Info"
         if (telemetryVisible) {
             startTelemetryLoop()
         } else {
@@ -778,6 +863,7 @@ class MainActivity : Activity(), SensorEventListener {
         val tipZ = metricsBuf[7]
         val activePlanes = metricsBuf[8].toInt()
         val activeObjects = metricsBuf[9].toInt()
+        val cachedPlanes = metricsBuf[10].toInt()
 
         val batIntent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
         val level = batIntent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
@@ -817,16 +903,28 @@ class MainActivity : Activity(), SensorEventListener {
 
         val aiFps = handTracker.aiFps.toInt()
         val inferMs = handTracker.lastInferMs
+        val yuvUs = handTracker.lastConvertUs
         val scanInferMs = roomScanner.lastInferMs
         val shortSha = BuildConfig.GIT_COMMIT_SHA.take(7)
+
+        val handAiText = if (handMode == 0) {
+            "AI Tay: TẮT"
+        } else {
+            "AI Tay (${handTracker.delegateLabel}): $aiFps fps (${inferMs}ms | LUT ${yuvUs}µs)"
+        }
+        val objScanText = if (roomScanMode < 2) {
+            "Đồ vật: TẮT"
+        } else {
+            "$activeObjects đồ vật (${scanInferMs}ms CPU)"
+        }
 
         val summary = StringBuilder()
             .append("Bản: v${BuildConfig.VERSION_NAME} ($shortSha) | ${Build.MODEL} ($soc)\n")
             .append("GPU: $cachedGpuName\n")
             .append("Màn: ${displayModeW}x${displayModeH}@${displayHz}Hz | Pin: ${batPct}% (${String.format(Locale.US, "%.1f", tempC)}°C) | RAM: ${totalRamMb}MB\n")
-            .append(String.format(Locale.US, "Render: %d fps (%.1f ms) | AI Tay (%s): %d fps (%d ms)\n", renderFps, frameMs, handTracker.delegateLabel, aiFps, inferMs))
+            .append(String.format(Locale.US, "Render: %d fps (%.1f ms) | %s\n", renderFps, frameMs, handAiText))
             .append("Track: $trackMode | Tay ($activeHands): $gestureName | Vẽ: ${strokeSegs} nét\n")
-            .append("Quét: ${activePlanes} mặt phẳng | ${activeObjects} đồ vật (${scanInferMs}ms CPU) | Trỏ: $tipText")
+            .append("Quét: $activePlanes mặt (RAM:$cachedPlanes) | $objScanText | Trỏ: $tipText")
             .toString()
 
         leftTelemetryCard.text = summary
@@ -1250,26 +1348,22 @@ class MainActivity : Activity(), SensorEventListener {
                 } catch (_: Throwable) {
                     null
                 } ?: return@setOnImageAvailableListener
+                val wantHand = handMode > 0 && !handTracker.isBusy.get()
+                val wantRoom = roomScanMode == 2 && !roomScanner.isBusy.get()
+                var ingestedSeq = 0L
                 try {
-                    val wantHand = !handTracker.isBusy.get()
-                    val wantRoom = roomScanMode == 2 && !roomScanner.isBusy.get()
                     if (wantHand || wantRoom) {
                         val rot = displayRotation
-                        val p0x = if (rot == Surface.ROTATION_270) 1f else -1f
-                        val p0y = if (rot == Surface.ROTATION_270) -1f else 1f
-                        val pxx = if (rot == Surface.ROTATION_270) -1f else 1f
-                        val pxy = if (rot == Surface.ROTATION_270) -1f else 1f
-                        val pyx = if (rot == Surface.ROTATION_270) 1f else -1f
-                        val pyy = if (rot == Surface.ROTATION_270) 1f else -1f
-                        if (wantHand) {
-                            handTracker.submitYuvFrame(img, rot, p0x, p0y, pxx, pxy, pyx, pyy)
-                        }
-                        if (wantRoom) {
-                            roomScanner.submitYuvFrame(img, rot, p0x, p0y, pxx, pxy, pyx, pyy)
-                        }
+                        val rotDeg = if (rot == Surface.ROTATION_270) 180 else 0
+                        val basis = if (rot == Surface.ROTATION_270) fallbackBasis270 else fallbackBasis90
+                        ingestedSeq = ingestYuvToNative(img, rotDeg, basis)
                     }
                 } finally {
                     img.close()
+                }
+                if (ingestedSeq > 0L) {
+                    if (wantHand) handTracker.notifyFrameAvailable()
+                    if (wantRoom) roomScanner.notifyFrameAvailable()
                 }
             }, handler)
         }
@@ -1396,6 +1490,33 @@ class MainActivity : Activity(), SensorEventListener {
         cameraHandler = null
     }
 
+    private fun ingestYuvToNative(img: Image, rotDeg: Int, basis: FloatArray): Long {
+        val planes = img.planes
+        if (planes.size < 3) return 0L
+        val yBuf = planes[0].buffer
+        val uBuf = planes[1].buffer
+        val vBuf = planes[2].buffer
+        yBuf.position(0)
+        uBuf.position(0)
+        vBuf.position(0)
+        return NativeBridge.nativeIngestCameraImage(
+            yBuf,
+            uBuf,
+            vBuf,
+            yBuf.remaining(),
+            uBuf.remaining(),
+            vBuf.remaining(),
+            img.width,
+            img.height,
+            planes[0].rowStride,
+            planes[0].pixelStride,
+            planes[1].rowStride,
+            planes[1].pixelStride,
+            rotDeg,
+            basis
+        )
+    }
+
     private inner class ArVrGlRenderer : GLSurfaceView.Renderer {
         override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
             val texId = NativeBridge.nativeOnSurfaceCreated()
@@ -1428,7 +1549,8 @@ class MainActivity : Activity(), SensorEventListener {
                         arNeedsTextureBind = false
                     }
                     if (viewportDirty) {
-                        session.setDisplayGeometry(displayRotation, viewWidth, viewHeight)
+                        val eyeWidth = (viewWidth / 2).coerceAtLeast(1)
+                        session.setDisplayGeometry(displayRotation, eyeWidth, viewHeight)
                         viewportDirty = false
                     }
                     if (nowNs - lastArUpdateNs >= 31_000_000L) {
@@ -1471,8 +1593,9 @@ class MainActivity : Activity(), SensorEventListener {
                                     valid
                                 )
 
-                                // Sample ARCore spatial planes (Floor / Wall / Table / Seat) at 4Hz
-                                if (roomScanMode > 0 && nowNs - lastPlaneExtractNs >= 250_000_000L) {
+                                // Adaptive spatial plane sampling: 4Hz during initial discovery, 1.25Hz once mapped
+                                val planeIntervalNs = if (cachedPlanesCount < 3) 250_000_000L else 800_000_000L
+                                if (roomScanMode > 0 && nowNs - lastPlaneExtractNs >= planeIntervalNs) {
                                     lastPlaneExtractNs = nowNs
                                     try {
                                         var pCount = 0
@@ -1500,15 +1623,17 @@ class MainActivity : Activity(), SensorEventListener {
                                             packedPlanesBuf[base + 9] = plane.extentZ
                                             pCount++
                                         }
+                                        cachedPlanesCount = pCount
                                         NativeBridge.nativeOnArPlanes(pCount, packedPlanesBuf)
                                     } catch (_: Throwable) {
                                     }
                                 }
 
-                                // Share single 480p CPU image between GPU HandTracker & throttled CPU ObjectDetector
-                                val wantHand = !handTracker.isBusy.get()
+                                // Ingest single 480p YUV frame into Rust 4-slot RAM ring (<0.08ms), then wake workers
+                                val wantHand = handMode > 0 && !handTracker.isBusy.get()
                                 val wantRoom = roomScanMode == 2 && !roomScanner.isBusy.get()
                                 if (wantHand || wantRoom) {
+                                    var ingestedSeq = 0L
                                     try {
                                         frame.transformCoordinates2d(
                                             Coordinates2d.IMAGE_NORMALIZED,
@@ -1516,30 +1641,18 @@ class MainActivity : Activity(), SensorEventListener {
                                             Coordinates2d.OPENGL_NORMALIZED_DEVICE_COORDINATES,
                                             ndcBasis
                                         )
+                                        val rotDeg = if (displayRotation == Surface.ROTATION_270) 180 else 0
                                         val cpuImg = frame.acquireCameraImage()
                                         try {
-                                            if (wantHand) {
-                                                handTracker.submitYuvFrame(
-                                                    cpuImg,
-                                                    displayRotation,
-                                                    ndcBasis[0], ndcBasis[1],
-                                                    ndcBasis[2], ndcBasis[3],
-                                                    ndcBasis[4], ndcBasis[5]
-                                                )
-                                            }
-                                            if (wantRoom) {
-                                                roomScanner.submitYuvFrame(
-                                                    cpuImg,
-                                                    displayRotation,
-                                                    ndcBasis[0], ndcBasis[1],
-                                                    ndcBasis[2], ndcBasis[3],
-                                                    ndcBasis[4], ndcBasis[5]
-                                                )
-                                            }
+                                            ingestedSeq = ingestYuvToNative(cpuImg, rotDeg, ndcBasis)
                                         } finally {
                                             cpuImg.close()
                                         }
                                     } catch (_: Throwable) {
+                                    }
+                                    if (ingestedSeq > 0L) {
+                                        if (wantHand) handTracker.notifyFrameAvailable()
+                                        if (wantRoom) roomScanner.notifyFrameAvailable()
                                     }
                                 }
                             }

@@ -1,5 +1,7 @@
 package com.minhkhoi.arvr
 
+import java.nio.ByteBuffer
+
 object NativeBridge {
     init {
         System.loadLibrary("ar_vr_core")
@@ -41,8 +43,37 @@ object NativeBridge {
     external fun nativeOnHandLandmarks(handCount: Int, packedData: FloatArray): Int
     external fun nativeSetRoomScanMode(mode: Int)
     external fun nativeOnArPlanes(planeCount: Int, packedPlanes: FloatArray)
-    external fun nativeOnDetectedObjects(objectCount: Int, packedObjects: FloatArray)
+    external fun nativeOnDetectedObjects(
+        objectCount: Int,
+        packedObjects: FloatArray,
+        poseAndTan: FloatArray
+    )
     external fun nativeGetRoomLabels(outArr: FloatArray): Int
     external fun nativeGetPerfMetrics(outArr: FloatArray)
+    external fun nativeGetRenderFrameMs(): Float
+    external fun nativeIngestCameraImage(
+        yBuf: ByteBuffer,
+        uBuf: ByteBuffer,
+        vBuf: ByteBuffer,
+        yLen: Int,
+        uLen: Int,
+        vLen: Int,
+        width: Int,
+        height: Int,
+        yRowStride: Int,
+        yPixelStride: Int,
+        uvRowStride: Int,
+        uvPixelStride: Int,
+        rotDeg: Int,
+        ndcBasis: FloatArray
+    ): Long
+    external fun nativeConvertLatestFrameRgba(
+        outRgbaBuf: ByteBuffer,
+        dstW: Int,
+        dstH: Int,
+        lastSeq: Long,
+        updateMotion: Boolean,
+        outMeta: FloatArray
+    ): Long
     external fun nativeDrawFrame()
 }

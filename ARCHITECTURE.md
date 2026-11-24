@@ -19,11 +19,12 @@
 | Mechanism | Specification |
 | :--- | :--- |
 | **Zero-Copy Camera** | ARCore `CameraConfig` picks `imageSize<=480p` (CPU) + `textureSize>=1080p` (GPU OES `0x8D65`); `DepthMode.DISABLED`; 0x MSAA EGL surface. |
-| **1:1 Angular Scale** | Quad at virtual distance `2.5m` sized `half_w = 2.5 * tan_half_hfov * fov_scale`, `half_h = 2.5 * tan_half_vfov * fov_scale` over `#000000` AMOLED surround. |
-| **120Hz Async Timewarp** | `ArSession.update()` throttled to ~32Hz (`31ms`); `onDrawFrame()` runs at 120Hz using `ar_rot * (gyro_at_capture.inv() * gyro_latest)`. |
-| **Fast 480p GPU Hand AI** | `Delegate.GPU` (fallback `CPU`) on `480px`-wide `Bitmap` with arrival-time velocity-adaptive smoothing (`hand_tracking.rs`). |
+| **1:1 Angular Scale** | Quad at `2.5m` uses true metric `tan_half_h/v`; `fov_scale` adjusts VR `compute_eye_projection` (`tan(42.5°) / fov_scale`) so 3D planes & camera match 1:1. Per-eye `setDisplayGeometry(width/2, height)` & cutout `ALWAYS` center divider. |
+| **120Hz Async Timewarp** | `ArSession.update()` throttled to ~32Hz (`31ms`); `onDrawFrame()` runs at 120Hz (`preferredRefreshRate` + `Surface.setFrameRate`) using `ar_rot * (gyro_at_capture.inv() * gyro_latest)`. |
+| **RAM Vision Ring & LUT** | Pre-allocated 2MB 3D YUV->RGBA LUT, 4KB YCbCr skin mask, 4-slot `RwLock` frame ring (`vision_ram.rs`), preloaded direct model buffers, and GPU OpenCL kernel cache. |
+| **Adaptive GPU Hand AI** | `Delegate.GPU` (`GpuOptions` cached) via `ByteBufferImageBuilder` RGBA `320x240`; 3-gear governor (`42ms` active / `85ms` skin-or-motion wake / `240ms` idle + `110ms` render brake). |
 | **Gestures, Combos & Drawing** | 8 single poses + 5 timed combos (`101..105`) + quadratic Bezier dual-layer neon strokes pinned at `0.65m` (`finger_draw.rs`). |
-| **Room Surface & Object Scan** | ARCore `PlaneFindingMode.HORIZONTAL_AND_VERTICAL` at `4Hz` (Floor, Wall, Table, Seat, Ceiling) + MediaPipe `ObjectDetector` (`efficientdet_lite0.tflite` INT8, CPU delegate, `320px`, `~2.6Hz`), small faint patches/badges (`room_scanner.rs`) & stereo HUD mini-tags (`6` max). |
+| **Spatial RAM Room Scan** | Persistent cache (`64` planes @ `45s` TTL, `32` 3D raycast objects @ `10s` TTL); size-filtered Walls vs VerticalObject, gravity-aligned distance-scaled markers, scissored per-eye viewport, `ObjectDetector` CPU `256x192`. |
 | **OTA Self-Updater** | Fixed `debug-fixed.keystore`, `BuildConfig.GIT_COMMIT_SHA` check vs GitHub Release `latest-apk`, streaming download + `ApkFileProvider` install intent. |
 
 ## 4. JNI Contract (`com.minhkhoi.arvr.NativeBridge`)
@@ -43,7 +44,10 @@
 | `nativeOnHandLandmarks` | `handCount: Int, packedData: FloatArray(210)` | `Int` (`0..8`, `101..105`) |
 | `nativeSetRoomScanMode` | `mode: Int` (`0=Off, 1=Floor/Wall, 2=Full`) | `Unit` |
 | `nativeOnArPlanes` | `planeCount: Int, packedPlanes: FloatArray(120)` | `Unit` |
-| `nativeOnDetectedObjects` | `objectCount: Int, packedObjects: FloatArray(36)` | `Unit` |
+| `nativeOnDetectedObjects` | `objectCount: Int, packedObjects: FloatArray(36), poseAndTan: FloatArray(9)` | `Unit` |
 | `nativeGetRoomLabels` | `outArr: FloatArray(36)` | `Int` (`0..6`) |
-| `nativeGetPerfMetrics` | `outArr: FloatArray(10)` | `Unit` |
+| `nativeGetPerfMetrics` | `outArr: FloatArray(11)` | `Unit` |
+| `nativeGetRenderFrameMs` | None | `Float` |
+| `nativeIngestCameraImage` | `yBuf, uBuf, vBuf, yLen, uLen, vLen, w, h, strides, rotDeg, ndcBasis` | `Long` (`seq`) |
+| `nativeConvertLatestFrameRgba` | `outRgbaBuf, dstW, dstH, lastSeq, updateMotion, outMeta(19)` | `Long` (`seq`) |
 | `nativeDrawFrame` | None | `Unit` |

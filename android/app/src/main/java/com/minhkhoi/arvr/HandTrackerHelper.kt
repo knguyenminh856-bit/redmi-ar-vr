@@ -1,22 +1,26 @@
 package com.minhkhoi.arvr
 
 import android.content.Context
-import android.graphics.Bitmap
-import android.media.Image
 import android.os.Handler
 import android.os.SystemClock
 import android.util.Log
-import android.view.Surface
-import com.google.mediapipe.framework.image.BitmapImageBuilder
+import com.google.mediapipe.framework.image.ByteBufferImageBuilder
+import com.google.mediapipe.framework.image.MPImage
 import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.core.Delegate
 import com.google.mediapipe.tasks.vision.core.ImageProcessingOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
+import java.io.File
+import java.nio.ByteBuffer
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
 
+/**
+ * RAM-backed zero-Bitmap hand tracker reading upright RGBA frames from the Rust 2MB YUV LUT ring
+ * and throttling GPU palm-detection with a 3-gear adaptive governor so Mali-G57 MC2 never stalls.
+ */
 class HandTrackerHelper(
     context: Context,
     private val uiHandler: Handler,
@@ -25,7 +29,8 @@ class HandTrackerHelper(
     companion object {
         private const val TAG = "HandTracker"
         private const val MODEL_ASSET = "hand_landmarker.task"
-        private const val TARGET_WIDTH = 480
+        private const val TARGET_W = 320
+        private const val TARGET_H = 240
         private const val MAX_HANDS = 2
         private const val LANDMARKS_PER_HAND = 21
         private const val FLOATS_PER_LANDMARK = 5
@@ -33,10 +38,18 @@ class HandTrackerHelper(
 
     val isBusy = AtomicBoolean(false)
     private val isClosed = AtomicBoolean(false)
-    private val executor = Executors.newSingleThreadExecutor()
+    private val executor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "HandVisionThread").apply { priority = Thread.NORM_PRIORITY }
+    }
 
     @Volatile
     private var handLandmarker: HandLandmarker? = null
+
+    private var pinnedModelBuf: ByteBuffer? = null
+
+    @Volatile
+    var handMode: Int = 1 // 1=TỰ ĐỘNG, 2=NHANH, 0=TẮT
+        private set
 
     @Volatile
     var aiFps: Float = 0f
@@ -50,42 +63,97 @@ class HandTrackerHelper(
     var delegateLabel: String = "Init"
         private set
 
+    @Volatile
+    var lastSkinPermille: Int = 0
+        private set
+
+    @Volatile
+    var lastMotionPermille: Int = 0
+        private set
+
+    @Volatile
+    var lastConvertUs: Int = 0
+        private set
+
+    private var lastDispatchMs = 0L
+    private var lastHandSeenMs = 0L
+    private var lastSeq = 0L
     private var lastCompletedNs = 0L
-    private var yCopy = ByteArray(0)
-    private var uCopy = ByteArray(0)
-    private var vCopy = ByteArray(0)
-    private var argbPixels = IntArray(0)
-    private var reusableBitmap: Bitmap? = null
-    private val packedFloats = FloatArray(MAX_HANDS * LANDMARKS_PER_HAND * FLOATS_PER_LANDMARK)
     private var lastTimestampMs = 0L
+
+    private val rgbaDirectBuf: ByteBuffer = ByteBuffer.allocateDirect(TARGET_W * TARGET_H * 4)
+    private val metaBuf = FloatArray(19)
+    private val packedFloats = FloatArray(MAX_HANDS * LANDMARKS_PER_HAND * FLOATS_PER_LANDMARK)
+    private val uprightOpts = ImageProcessingOptions.builder().setRotationDegrees(0).build()
 
     init {
         val appCtx = context.applicationContext
         executor.execute {
             if (!isClosed.get()) {
+                pinnedModelBuf = preloadAssetToDirectBuffer(appCtx, MODEL_ASSET)
                 handLandmarker = createLandmarker(appCtx, Delegate.GPU)
                     ?: createLandmarker(appCtx, Delegate.CPU)
             }
         }
     }
 
+    fun setMode(mode: Int) {
+        val clamped = mode.coerceIn(0, 2)
+        handMode = clamped
+        if (clamped == 0) {
+            aiFps = 0f
+            lastInferMs = 0
+            NativeBridge.nativeOnHandLandmarks(0, packedFloats)
+        }
+    }
+
+    private fun preloadAssetToDirectBuffer(context: Context, assetName: String): ByteBuffer? {
+        return try {
+            val bytes = context.assets.open(assetName).use { it.readBytes() }
+            ByteBuffer.allocateDirect(bytes.size).apply {
+                put(bytes)
+                rewind()
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "RAM model preload failed ($assetName): ${t.message}")
+            null
+        }
+    }
+
     private fun createLandmarker(context: Context, delegate: Delegate): HandLandmarker? {
         return try {
-            val baseOpts = BaseOptions.builder()
-                .setModelAssetPath(MODEL_ASSET)
-                .setDelegate(delegate)
-                .build()
+            val baseBuilder = BaseOptions.builder().setDelegate(delegate)
+            val modelBuf = pinnedModelBuf
+            if (modelBuf != null) {
+                modelBuf.rewind()
+                baseBuilder.setModelAssetBuffer(modelBuf)
+            } else {
+                baseBuilder.setModelAssetPath(MODEL_ASSET)
+            }
+
+            if (delegate == Delegate.GPU) {
+                val cacheDir = context.codeCacheDir
+                if (!cacheDir.exists()) cacheDir.mkdirs()
+                val gpuOpts = BaseOptions.DelegateOptions.GpuOptions.builder()
+                    .setCachedKernelPath(File(cacheDir, "mp_hand_kernel.bin").absolutePath)
+                    .setSerializedModelDir(cacheDir.absolutePath)
+                    .setModelToken("hand_lm_v1")
+                    .build()
+                baseBuilder.setDelegateOptions(gpuOpts)
+            }
+
             val options = HandLandmarker.HandLandmarkerOptions.builder()
-                .setBaseOptions(baseOpts)
+                .setBaseOptions(baseBuilder.build())
                 .setRunningMode(RunningMode.VIDEO)
                 .setNumHands(MAX_HANDS)
                 .setMinHandDetectionConfidence(0.40f)
                 .setMinHandPresenceConfidence(0.40f)
                 .setMinTrackingConfidence(0.40f)
                 .build()
+
             val hl = HandLandmarker.createFromOptions(context, options)
             delegateLabel = delegate.name
-            Log.i(TAG, "MediaPipe HandLandmarker initialized on $delegate")
+            Log.i(TAG, "MediaPipe HandLandmarker pinned in RAM ($delegate, ${TARGET_W}x${TARGET_H})")
             hl
         } catch (t: Throwable) {
             Log.w(TAG, "HandLandmarker init failed on $delegate: ${t.message}")
@@ -94,150 +162,83 @@ class HandTrackerHelper(
     }
 
     /**
-     * Copies 640x480 YUV planes in <0.1ms via native bulk ByteBuffer.get(), then converts to a crisp
-     * 480px-wide Bitmap and runs GPU MediaPipe inference on the worker thread without dropping frames.
+     * Non-blocking adaptive trigger called after `nativeIngestCameraImage` writes the frame to RAM.
      */
-    fun submitYuvFrame(
-        image: Image,
-        displayRotation: Int,
-        p0x: Float,
-        p0y: Float,
-        pxx: Float,
-        pxy: Float,
-        pyx: Float,
-        pyy: Float
-    ) {
-        if (isClosed.get() || handLandmarker == null) return
-        val planes = image.planes
-        if (planes.size < 3) return
+    fun notifyFrameAvailable() {
+        val landmarker = handLandmarker ?: return
+        if (isClosed.get() || handMode == 0) return
+
+        val nowMs = SystemClock.uptimeMillis()
+        val renderMs = NativeBridge.nativeGetRenderFrameMs()
+        val minGapMs = when {
+            renderMs > 22f -> 110L
+            handMode == 2 || (nowMs - lastHandSeenMs) <= 900L -> 42L
+            lastSkinPermille >= 18 || lastMotionPermille >= 45 -> 85L
+            else -> 240L
+        }
+        if (nowMs - lastDispatchMs < minGapMs) return
         if (!isBusy.compareAndSet(false, true)) return
+        lastDispatchMs = nowMs
 
-        try {
-            val srcW = image.width
-            val srcH = image.height
-            if (srcW <= 0 || srcH <= 0) {
+        executor.execute {
+            try {
+                processLatestFrame(landmarker)
+            } catch (t: Throwable) {
+                Log.w(TAG, "HandLandmarker frame error: ${t.message}")
+            } finally {
                 isBusy.set(false)
-                return
             }
-
-            val yBuf = planes[0].buffer
-            val uBuf = planes[1].buffer
-            val vBuf = planes[2].buffer
-            yBuf.position(0)
-            uBuf.position(0)
-            vBuf.position(0)
-
-            val yLen = yBuf.remaining()
-            val uLen = uBuf.remaining()
-            val vLen = vBuf.remaining()
-
-            if (yCopy.size < yLen) yCopy = ByteArray(yLen)
-            if (uCopy.size < uLen) uCopy = ByteArray(uLen)
-            if (vCopy.size < vLen) vCopy = ByteArray(vLen)
-
-            yBuf.get(yCopy, 0, yLen)
-            uBuf.get(uCopy, 0, uLen)
-            vBuf.get(vCopy, 0, vLen)
-
-            val yRowStride = planes[0].rowStride
-            val yPixelStride = planes[0].pixelStride
-            val uvRowStride = planes[1].rowStride
-            val uvPixelStride = planes[1].pixelStride
-
-            executor.execute {
-                try {
-                    if (!isClosed.get()) {
-                        processFrameOnWorker(
-                            srcW, srcH,
-                            yLen, uLen, vLen,
-                            yRowStride, yPixelStride, uvRowStride, uvPixelStride,
-                            displayRotation,
-                            p0x, p0y, pxx, pxy, pyx, pyy
-                        )
-                    }
-                } catch (t: Throwable) {
-                    Log.w(TAG, "Hand tracking worker warning: ${t.message}")
-                } finally {
-                    isBusy.set(false)
-                }
-            }
-        } catch (t: Throwable) {
-            isBusy.set(false)
-            Log.w(TAG, "Failed to copy YUV image: ${t.message}")
         }
     }
 
-    private fun processFrameOnWorker(
-        srcW: Int,
-        srcH: Int,
-        yLen: Int,
-        uLen: Int,
-        vLen: Int,
-        yRowStride: Int,
-        yPixelStride: Int,
-        uvRowStride: Int,
-        uvPixelStride: Int,
-        displayRotation: Int,
-        p0x: Float,
-        p0y: Float,
-        pxx: Float,
-        pxy: Float,
-        pyx: Float,
-        pyy: Float
-    ) {
-        val landmarker = handLandmarker ?: return
+    private fun processLatestFrame(landmarker: HandLandmarker) {
+        if (isClosed.get() || handMode == 0) return
+
+        rgbaDirectBuf.position(0)
+        val seq = NativeBridge.nativeConvertLatestFrameRgba(
+            rgbaDirectBuf,
+            TARGET_W,
+            TARGET_H,
+            lastSeq,
+            true,
+            metaBuf
+        )
+        if (seq <= 0L) return
+        lastSeq = seq
+
+        lastSkinPermille = metaBuf[0].toInt()
+        lastMotionPermille = metaBuf[1].toInt()
+        lastConvertUs = metaBuf[2].toInt()
+        val p0x = metaBuf[12]
+        val p0y = metaBuf[13]
+        val pxx = metaBuf[14]
+        val pxy = metaBuf[15]
+        val pyx = metaBuf[16]
+        val pyy = metaBuf[17]
+        val rotDeg = metaBuf[18].toInt()
+
+        rgbaDirectBuf.position(0)
         val startMs = SystemClock.uptimeMillis()
-
-        val dstW = TARGET_WIDTH.coerceAtMost(srcW)
-        val dstH = ((srcH * dstW) / srcW).coerceAtLeast(1)
-        val totalPixels = dstW * dstH
-        if (argbPixels.size != totalPixels) {
-            argbPixels = IntArray(totalPixels)
-        }
-        val bmp = reusableBitmap?.takeIf { it.width == dstW && it.height == dstH }
-            ?: Bitmap.createBitmap(dstW, dstH, Bitmap.Config.ARGB_8888).also {
-                reusableBitmap = it
-            }
-
-        for (dy in 0 until dstH) {
-            val sy = (dy * srcH) / dstH
-            val yRowOff = sy * yRowStride
-            val uvRowOff = (sy shr 1) * uvRowStride
-            val rowOut = dy * dstW
-            for (dx in 0 until dstW) {
-                val sx = (dx * srcW) / dstW
-                val yIdx = yRowOff + sx * yPixelStride
-                val uvIdx = uvRowOff + (sx shr 1) * uvPixelStride
-
-                val yVal = if (yIdx in 0 until yLen) (yCopy[yIdx].toInt() and 0xFF) - 16 else 0
-                val uVal = if (uvIdx in 0 until uLen) (uCopy[uvIdx].toInt() and 0xFF) - 128 else 0
-                val vVal = if (uvIdx in 0 until vLen) (vCopy[uvIdx].toInt() and 0xFF) - 128 else 0
-
-                val c = if (yVal > 0) 298 * yVal else 0
-                val r = ((c + 409 * vVal + 128) shr 8).coerceIn(0, 255)
-                val g = ((c - 100 * uVal - 208 * vVal + 128) shr 8).coerceIn(0, 255)
-                val b = ((c + 516 * uVal + 128) shr 8).coerceIn(0, 255)
-                argbPixels[rowOut + dx] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-            }
-        }
-        bmp.setPixels(argbPixels, 0, dstW, 0, 0, dstW, dstH)
-
-        val rotDeg = if (displayRotation == Surface.ROTATION_270) 180 else 0
-        val imgOpts = ImageProcessingOptions.builder()
-            .setRotationDegrees(rotDeg)
-            .build()
-        val mpImage = BitmapImageBuilder(bmp).build()
-        val ts = max(lastTimestampMs + 1L, SystemClock.uptimeMillis())
+        val mpImage = ByteBufferImageBuilder(
+            rgbaDirectBuf,
+            TARGET_W,
+            TARGET_H,
+            MPImage.IMAGE_FORMAT_RGBA
+        ).build()
+        val ts = max(lastTimestampMs + 1L, startMs)
         lastTimestampMs = ts
 
-        val result = landmarker.detectForVideo(mpImage, imgOpts, ts)
-        val inferMs = (SystemClock.uptimeMillis() - startMs).toInt().coerceAtLeast(1)
-        lastInferMs = inferMs
+        val result = try {
+            landmarker.detectForVideo(mpImage, uprightOpts, ts)
+        } finally {
+            mpImage.close()
+        }
 
+        lastInferMs = (SystemClock.uptimeMillis() - startMs).toInt().coerceAtLeast(1)
         val doneNs = System.nanoTime()
         if (lastCompletedNs != 0L) {
             val dtSec = (doneNs - lastCompletedNs) / 1_000_000_000f
-            if (dtSec > 0.005f && dtSec < 2.0f) {
+            if (dtSec in 0.005f..2.0f) {
                 val instFps = 1f / dtSec
                 aiFps = if (aiFps < 0.5f) instFps else (aiFps * 0.8f + instFps * 0.2f)
             }
@@ -279,6 +280,10 @@ class HandTrackerHelper(
             validCount++
         }
 
+        if (validCount > 0) {
+            lastHandSeenMs = SystemClock.uptimeMillis()
+        }
+
         val triggeredGesture = NativeBridge.nativeOnHandLandmarks(validCount, packedFloats)
         if (triggeredGesture > 0) {
             uiHandler.post { onGestureDetected(triggeredGesture) }
@@ -293,8 +298,7 @@ class HandTrackerHelper(
             } catch (_: Throwable) {
             }
             handLandmarker = null
-            reusableBitmap?.recycle()
-            reusableBitmap = null
+            pinnedModelBuf = null
         }
         executor.shutdown()
     }

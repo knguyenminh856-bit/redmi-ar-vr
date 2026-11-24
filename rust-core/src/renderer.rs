@@ -6,8 +6,8 @@ use crate::hand_tracking::{
 };
 use crate::passthrough::{compute_quad_half_extents, PassthroughRenderer, PASSTHROUGH_DIST};
 use crate::room_scanner::{
-    parse_ar_planes, parse_detected_objects, project_room_labels, ObjectMarker, PlaneMarker,
-    ProjectedLabel, RoomScannerRenderer, OBJECT_TIMEOUT_MS, PLANE_TIMEOUT_MS,
+    project_room_labels, PlaneMarker, ProjectedLabel, RoomScannerRenderer, SpatialMemoryCache,
+    WorldObjectMarker,
 };
 use crate::scene_3d::Scene3D;
 use glam::{Mat4, Quat, Vec3};
@@ -26,6 +26,7 @@ pub struct PerfMetrics {
     pub index_tip_cam: [f32; 3],
     pub active_planes: u32,
     pub active_objects: u32,
+    pub cached_planes: u32,
 }
 
 /// Thread-safe input state updated by Android sensor/camera/UI threads.
@@ -62,10 +63,7 @@ pub struct SharedInputState {
     pub palette_idx: u32,
 
     pub room_scan_mode: i32,
-    pub planes: Vec<PlaneMarker>,
-    pub last_plane_instant: Option<Instant>,
-    pub objects: Vec<ObjectMarker>,
-    pub last_object_instant: Option<Instant>,
+    pub spatial_cache: SpatialMemoryCache,
     pub projected_labels: Vec<ProjectedLabel>,
 
     pub perf: PerfMetrics,
@@ -84,7 +82,7 @@ impl Default for SharedInputState {
             cam_tan_half_h: 0.67,
             cam_tan_half_v: 0.50,
             cam_uvs: [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
-            fov_scale: 0.78,
+            fov_scale: 0.85,
             ipd_meters: 0.064,
             recenter_requested: false,
             anchor_origin: None,
@@ -98,10 +96,7 @@ impl Default for SharedInputState {
             boost_until: None,
             palette_idx: 0,
             room_scan_mode: 2,
-            planes: Vec::new(),
-            last_plane_instant: None,
-            objects: Vec::new(),
-            last_object_instant: None,
+            spatial_cache: SpatialMemoryCache::default(),
             projected_labels: Vec::new(),
             perf: PerfMetrics::default(),
         }
@@ -186,33 +181,48 @@ impl SharedInputState {
         let clamped = mode.clamp(0, 2);
         self.room_scan_mode = clamped;
         if clamped == 0 {
-            self.planes.clear();
-            self.objects.clear();
+            self.spatial_cache.clear();
             self.projected_labels.clear();
             self.perf.active_planes = 0;
             self.perf.active_objects = 0;
+            self.perf.cached_planes = 0;
         } else if clamped == 1 {
-            self.objects.clear();
+            self.spatial_cache.clear_objects();
             self.perf.active_objects = 0;
         }
     }
 
     pub fn on_ar_planes(&mut self, count: usize, packed: &[f32]) {
         if self.room_scan_mode <= 0 {
-            self.planes.clear();
             return;
         }
-        self.planes = parse_ar_planes(count, packed, self.ar_pos.y, self.room_scan_mode);
-        self.last_plane_instant = Some(Instant::now());
+        self.spatial_cache
+            .ingest_ar_planes(count, packed, self.ar_pos.y, self.room_scan_mode);
+        self.perf.cached_planes = self.spatial_cache.cached_plane_count() as u32;
     }
 
-    pub fn on_detected_objects(&mut self, count: usize, packed: &[f32]) {
+    pub fn on_detected_objects(
+        &mut self,
+        count: usize,
+        packed: &[f32],
+        cam_pos: Vec3,
+        cam_rot: Quat,
+        tan_h: f32,
+        tan_v: f32,
+    ) {
         if self.room_scan_mode < 2 {
-            self.objects.clear();
+            self.spatial_cache.clear_objects();
             return;
         }
-        self.objects = parse_detected_objects(count, packed, self.room_scan_mode);
-        self.last_object_instant = Some(Instant::now());
+        self.spatial_cache.ingest_detected_objects(
+            count,
+            packed,
+            cam_pos,
+            cam_rot,
+            tan_h,
+            tan_v,
+            self.room_scan_mode,
+        );
     }
 
     pub fn set_projected_labels(&mut self, labels: Vec<ProjectedLabel>) {
@@ -348,42 +358,20 @@ impl SharedInputState {
         self.perf.current_gesture = self.current_gesture as i32;
         self.perf.stroke_vertices = self.finger_canvas.vertex_count() as u32;
         if let Some(h) = active_hands[0] {
-            let safe_h = self.cam_tan_half_h.clamp(0.2, 2.5) * self.fov_scale.clamp(0.45, 1.25);
-            let safe_v = self.cam_tan_half_v.clamp(0.2, 2.5) * self.fov_scale.clamp(0.45, 1.25);
+            let safe_h = self.cam_tan_half_h.clamp(0.2, 2.5);
+            let safe_v = self.cam_tan_half_v.clamp(0.2, 2.5);
             let d = h.hand_depth_m;
             self.perf.index_tip_cam = [h.ndc[8].x * safe_h * d, h.ndc[8].y * safe_v * d, d];
         } else {
             self.perf.index_tip_cam = [0.0, 0.0, 0.0];
         }
 
-        let planes_fresh = self
-            .last_plane_instant
-            .map(|t| now.duration_since(t).as_millis() <= PLANE_TIMEOUT_MS)
-            .unwrap_or(false);
-        let active_planes = if self.room_scan_mode > 0 && planes_fresh {
-            self.planes.clone()
-        } else {
-            if self.room_scan_mode > 0 && !planes_fresh {
-                self.planes.clear();
-            }
-            Vec::new()
-        };
-
-        let objects_fresh = self
-            .last_object_instant
-            .map(|t| now.duration_since(t).as_millis() <= OBJECT_TIMEOUT_MS)
-            .unwrap_or(false);
-        let active_objects = if self.room_scan_mode >= 2 && objects_fresh {
-            self.objects.clone()
-        } else {
-            if !objects_fresh {
-                self.objects.clear();
-            }
-            Vec::new()
-        };
+        let (active_planes, active_objects) =
+            self.spatial_cache.snapshot_visible(self.room_scan_mode, now);
 
         self.perf.active_planes = active_planes.len() as u32;
         self.perf.active_objects = active_objects.len() as u32;
+        self.perf.cached_planes = self.spatial_cache.cached_plane_count() as u32;
 
         let boost_factor = match self.boost_until {
             Some(until) if until > now => {
@@ -438,7 +426,7 @@ pub struct FrameSnapshot {
     pub draw_upload_gen: u64,
     pub draw_verts: Vec<DrawVertex>,
     pub room_planes: Vec<PlaneMarker>,
-    pub room_objects: Vec<ObjectMarker>,
+    pub room_objects: Vec<WorldObjectMarker>,
 }
 
 pub fn compute_yaw_aligned_anchor(head_pos: Vec3, head_rot: Quat) -> Mat4 {
@@ -452,6 +440,65 @@ pub fn compute_yaw_aligned_anchor(head_pos: Vec3, head_rot: Quat) -> Mat4 {
         Quat::IDENTITY
     };
     Mat4::from_rotation_translation(anchor_rot, head_pos)
+}
+
+pub fn compute_eye_projection(eye_aspect: f32, fov_scale: f32) -> Mat4 {
+    let scaled_tan_v = 42.5_f32.to_radians().tan() / fov_scale.clamp(0.45, 1.25);
+    Mat4::perspective_rh_gl(2.0 * scaled_tan_v.atan(), eye_aspect.max(0.2), 0.05, 50.0)
+}
+
+pub fn compute_quad_screen_bounds(
+    pass_mvp: &Mat4,
+    quad_hw: f32,
+    quad_hh: f32,
+    vp_x: i32,
+    eye_w: i32,
+    h: i32,
+) -> ((i32, i32, i32, i32), (f32, f32, f32, f32)) {
+    let corners = [
+        Vec3::new(-quad_hw, -quad_hh, -PASSTHROUGH_DIST),
+        Vec3::new(quad_hw, -quad_hh, -PASSTHROUGH_DIST),
+        Vec3::new(-quad_hw, quad_hh, -PASSTHROUGH_DIST),
+        Vec3::new(quad_hw, quad_hh, -PASSTHROUGH_DIST),
+    ];
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    let mut any_valid = false;
+    for c in corners {
+        let clip = *pass_mvp * c.extend(1.0);
+        if clip.w > 0.05 {
+            let nx = clip.x / clip.w;
+            let ny = clip.y / clip.w;
+            min_x = min_x.min(nx);
+            max_x = max_x.max(nx);
+            min_y = min_y.min(ny);
+            max_y = max_y.max(ny);
+            any_valid = true;
+        }
+    }
+    if !any_valid {
+        return ((vp_x, 0, eye_w, h), (0.04, 0.96, 0.14, 0.90));
+    }
+    let nx0 = min_x.clamp(-1.0, 1.0);
+    let nx1 = max_x.clamp(-1.0, 1.0);
+    let ny0 = min_y.clamp(-1.0, 1.0);
+    let ny1 = max_y.clamp(-1.0, 1.0);
+
+    let sx0 = (vp_x + ((nx0 * 0.5 + 0.5) * eye_w as f32).floor() as i32).clamp(vp_x, vp_x + eye_w);
+    let sx1 = (vp_x + ((nx1 * 0.5 + 0.5) * eye_w as f32).ceil() as i32).clamp(sx0, vp_x + eye_w);
+    let sy0 = (((ny0 * 0.5 + 0.5) * h as f32).floor() as i32).clamp(0, h);
+    let sy1 = (((ny1 * 0.5 + 0.5) * h as f32).ceil() as i32).clamp(sy0, h);
+
+    let u_min = (nx0 * 0.5 + 0.5).clamp(0.0, 1.0);
+    let u_max = (nx1 * 0.5 + 0.5).clamp(0.0, 1.0);
+    let v_min = (0.5 - ny1 * 0.5).clamp(0.0, 1.0);
+    let v_max = (0.5 - ny0 * 0.5).clamp(0.0, 1.0);
+    (
+        (sx0, sy0, (sx1 - sx0).max(1), (sy1 - sy0).max(1)),
+        (u_min, u_max, v_min, v_max),
+    )
 }
 
 pub fn compute_stereo_views(head_pos: Vec3, head_rot: Quat, ipd_meters: f32) -> (Mat4, Mat4) {
@@ -537,14 +584,14 @@ impl GlRenderer {
             &self.gl,
             snap.tan_half_h,
             snap.tan_half_v,
-            snap.fov_scale,
+            1.0,
             snap.uvs,
         );
         let (quad_hw, quad_hh) = compute_quad_half_extents(
             snap.tan_half_h,
             snap.tan_half_v,
             PASSTHROUGH_DIST,
-            snap.fov_scale,
+            1.0,
         );
         self.hand_overlay
             .update_hands(&self.gl, &snap.hands, quad_hw, quad_hh);
@@ -554,11 +601,11 @@ impl GlRenderer {
             &self.gl,
             &snap.room_planes,
             &snap.room_objects,
-            quad_hw,
-            quad_hh,
+            snap.head_pos_120hz,
+            snap.head_rot_120hz,
         );
 
-        let proj_eye = Mat4::perspective_rh_gl(85.0_f32.to_radians(), eye_aspect, 0.05, 50.0);
+        let proj_eye = compute_eye_projection(eye_aspect, snap.fov_scale);
         let (left_view, right_view) =
             compute_stereo_views(snap.head_pos_120hz, snap.head_rot_120hz, snap.ipd_meters);
 
@@ -578,6 +625,11 @@ impl GlRenderer {
         let right_vp = proj_eye * right_view;
         let right_pass_mvp = right_vp * t_cam_capture;
 
+        let (left_scissor, left_uv_bounds) =
+            compute_quad_screen_bounds(&left_pass_mvp, quad_hw, quad_hh, 0, half_w, h);
+        let (right_scissor, right_uv_bounds) =
+            compute_quad_screen_bounds(&right_pass_mvp, quad_hw, quad_hh, half_w, right_w, h);
+
         unsafe {
             self.gl.viewport(0, 0, w, h);
             self.gl.clear_color(0.0, 0.0, 0.0, 1.0);
@@ -595,10 +647,16 @@ impl GlRenderer {
                 &octa_model,
                 snap.palette_idx,
             );
-            self.room_scanner.draw_world_planes(&self.gl, &left_vp);
+            self.gl.enable(glow::SCISSOR_TEST);
+            self.gl.scissor(
+                left_scissor.0,
+                left_scissor.1,
+                left_scissor.2,
+                left_scissor.3,
+            );
+            self.room_scanner.draw_world_markers(&self.gl, &left_vp);
+            self.gl.disable(glow::SCISSOR_TEST);
             self.finger_draw.draw(&self.gl, &left_vp);
-            self.room_scanner
-                .draw_object_badges(&self.gl, &left_pass_mvp);
             self.hand_overlay.draw(&self.gl, &left_pass_mvp);
 
             // Right eye viewport
@@ -612,10 +670,16 @@ impl GlRenderer {
                 &octa_model,
                 snap.palette_idx,
             );
-            self.room_scanner.draw_world_planes(&self.gl, &right_vp);
+            self.gl.enable(glow::SCISSOR_TEST);
+            self.gl.scissor(
+                right_scissor.0,
+                right_scissor.1,
+                right_scissor.2,
+                right_scissor.3,
+            );
+            self.room_scanner.draw_world_markers(&self.gl, &right_vp);
+            self.gl.disable(glow::SCISSOR_TEST);
             self.finger_draw.draw(&self.gl, &right_vp);
-            self.room_scanner
-                .draw_object_badges(&self.gl, &right_pass_mvp);
             self.hand_overlay.draw(&self.gl, &right_pass_mvp);
 
             // Subtle 2px VR headset center ridge alignment guide
@@ -632,11 +696,10 @@ impl GlRenderer {
             project_room_labels(
                 &snap.room_planes,
                 &snap.room_objects,
-                &t_cam_capture,
-                quad_hw,
-                quad_hh,
                 &left_vp,
                 &right_vp,
+                left_uv_bounds,
+                right_uv_bounds,
             )
         };
 
@@ -665,5 +728,28 @@ mod tests {
         let left_world = left_view.inverse().w_axis.truncate();
         let right_world = right_view.inverse().w_axis.truncate();
         assert!(((right_world - left_world).length() - 0.064).abs() < 1e-4);
+    }
+
+    #[test]
+    fn passthrough_and_world_points_align_1_to_1_across_fov_scales() {
+        let eye_aspect = 1200.0 / 1080.0;
+        let tan_h = 0.65f32;
+        let tan_v = 0.50f32;
+        let (quad_hw, quad_hh) = compute_quad_half_extents(tan_h, tan_v, PASSTHROUGH_DIST, 1.0);
+
+        let world_pt = Vec3::new(0.42, -0.18, -1.35);
+        let cam_ndc_x = world_pt.x / (-world_pt.z * tan_h);
+        let cam_ndc_y = world_pt.y / (-world_pt.z * tan_v);
+        let quad_pt = Vec3::new(cam_ndc_x * quad_hw, cam_ndc_y * quad_hh, -PASSTHROUGH_DIST);
+
+        for fov_scale in [0.60f32, 0.78, 1.00] {
+            let proj = compute_eye_projection(eye_aspect, fov_scale);
+            let clip_world = proj * world_pt.extend(1.0);
+            let clip_quad = proj * quad_pt.extend(1.0);
+            let ndc_world = (clip_world.x / clip_world.w, clip_world.y / clip_world.w);
+            let ndc_quad = (clip_quad.x / clip_quad.w, clip_quad.y / clip_quad.w);
+            assert!((ndc_world.0 - ndc_quad.0).abs() < 1e-4);
+            assert!((ndc_world.1 - ndc_quad.1).abs() < 1e-4);
+        }
     }
 }

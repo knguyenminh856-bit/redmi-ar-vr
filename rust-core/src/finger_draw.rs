@@ -105,7 +105,7 @@ impl FingerCanvas {
         t_cam_capture: &Mat4,
         tan_half_h: f32,
         tan_half_v: f32,
-        fov_scale: f32,
+        _fov_scale: f32,
     ) {
         if mode == DrawMode::Off {
             self.break_strokes();
@@ -116,9 +116,8 @@ impl FingerCanvas {
             return;
         };
 
-        let clamped_scale = fov_scale.clamp(0.45, 1.25);
-        let safe_h = tan_half_h.clamp(0.2, 2.5) * clamped_scale;
-        let safe_v = tan_half_v.clamp(0.2, 2.5) * clamped_scale;
+        let safe_h = tan_half_h.clamp(0.2, 2.5);
+        let safe_v = tan_half_v.clamp(0.2, 2.5);
 
         match mode {
             DrawMode::Off => {}
