@@ -119,6 +119,9 @@ pub struct CanonicalPlane {
     pub weight: f32,
     pub last_seen_gen: u64,
     pub is_explicit_patch: bool,
+    pub carve_hits: u16,
+    pub detail_hits: u16,
+    pub demoted_to_object: bool,
 }
 
 impl CanonicalPlane {
@@ -134,6 +137,24 @@ impl CanonicalPlane {
 
     pub fn bounding_radius(&self) -> f32 {
         0.5 * (self.extent_x * self.extent_x + self.extent_z * self.extent_z).sqrt()
+    }
+
+    /// Strict Tier-1 architectural surface gate: ONLY genuine room-scale Floors (>=0.60m²),
+    /// Walls (>=1.15m² & >=1.25m×0.72m, never monitors/chairs/boxes/cabinets!), and Ceilings (>=0.90m²).
+    pub fn is_true_structural_tier1(&self) -> bool {
+        if self.demoted_to_object || self.is_explicit_patch {
+            return false;
+        }
+        match self.kind {
+            SurfaceKind::Floor => self.area >= 0.60,
+            SurfaceKind::Wall => {
+                let hi = self.extent_x.max(self.extent_z);
+                let lo = self.extent_x.min(self.extent_z);
+                self.area >= 1.15 && hi >= 1.25 && lo >= 0.72
+            }
+            SurfaceKind::Ceiling => self.area >= 0.90,
+            _ => false,
+        }
     }
 }
 
@@ -624,6 +645,9 @@ impl SpatialMeshMap {
                 weight: 1.0,
                 last_seen_gen: self.tick_gen,
                 is_explicit_patch: true,
+                carve_hits: 0,
+                detail_hits: 0,
+                demoted_to_object: false,
             });
             self.mesh_gen = self.mesh_gen.wrapping_add(1);
         }
@@ -733,6 +757,9 @@ impl SpatialMeshMap {
                     weight: area.clamp(0.15, 6.0),
                     last_seen_gen: self.tick_gen,
                     is_explicit_patch: false,
+                    carve_hits: 0,
+                    detail_hits: 0,
+                    demoted_to_object: false,
                 });
                 changed = true;
             }
@@ -752,7 +779,7 @@ impl SpatialMeshMap {
                     (ckey.2 as f32 + 0.5) * span,
                 );
                 let touches_struct = self.planes.iter().any(|p| {
-                    matches!(p.kind, SurfaceKind::Floor | SurfaceKind::Wall | SurfaceKind::Ceiling)
+                    p.is_true_structural_tier1()
                         && (cc - p.pos).dot(p.normal).abs() <= span * 0.70
                 });
                 if touches_struct {
@@ -814,8 +841,11 @@ impl SpatialMeshMap {
             old.weight = (old.weight + w_new * 0.25).min(20.0);
             old.is_explicit_patch = false;
             old.last_seen_gen = self.tick_gen;
-            old.kind =
-                classify_ar_plane(raw_type, old.pos.y, old.extent_x, old.extent_z, cam_y, floor_y);
+            old.kind = if old.demoted_to_object {
+                SurfaceKind::VerticalObject
+            } else {
+                classify_ar_plane(raw_type, old.pos.y, old.extent_x, old.extent_z, cam_y, floor_y)
+            };
         }
     }
 
@@ -1133,14 +1163,11 @@ impl SpatialMeshMap {
         carved
     }
 
-    /// Returns `true` if `pos` sits flush (`±4.2cm`) on a Tier-1 flat structural Floor, Wall, or Ceiling plane
-    /// (never Tables/Seats/Objects!). Used to separate sleek low-poly walls/floors from high-detail 3.5cm TSDF objects.
+    /// Returns `true` if `pos` sits flush (`±4.2cm`) on a genuine Tier-1 architectural Floor, Wall, or Ceiling
+    /// (`is_true_structural_tier1() == true`, NEVER small vertical furniture/monitors/boxes or demoted objects!).
     fn is_flush_structural_plane(&self, pos: Vec3, opt_normal: Option<Vec3>) -> bool {
         self.planes.iter().any(|p| {
-            if !matches!(
-                p.kind,
-                SurfaceKind::Floor | SurfaceKind::Wall | SurfaceKind::Ceiling
-            ) {
+            if !p.is_true_structural_tier1() {
                 return false;
             }
             if let Some(n) = opt_normal {
@@ -1156,6 +1183,91 @@ impl SpatialMeshMap {
             let lz = rel.dot(p.rot * Vec3::Z).abs();
             lx <= p.extent_x * 0.52 + 0.04 && lz <= p.extent_z * 0.52 + 0.04
         })
+    }
+
+    /// Dynamically validates vertical `Wall` planes against live dense depth rays:
+    /// - If depth rays pass >16cm BEHIND a supposed Wall -> increments `carve_hits` (opened door / moved object / fake wall).
+    /// - If high-curvature 3D detail hits ON a supposed Wall -> increments `detail_hits` (monitor / shelf / furniture, not a flat wall).
+    /// - Confirmed smooth flat wall rays decay both counters back to 0.
+    fn validate_vertical_planes_with_ray(
+        &mut self,
+        cam_pos: Vec3,
+        dir: Vec3,
+        dist: f32,
+        curv_mm: i32,
+    ) {
+        for p in &mut self.planes {
+            if p.kind != SurfaceKind::Wall || p.demoted_to_object {
+                continue;
+            }
+            let denom = dir.dot(p.normal);
+            if denom.abs() < 0.25 {
+                continue;
+            }
+            let t = (p.pos - cam_pos).dot(p.normal) / denom;
+            if !(0.25..=3.2).contains(&t) {
+                continue;
+            }
+            let hit = cam_pos + dir * t;
+            let rel = hit - p.pos;
+            let lx = rel.dot(p.rot * Vec3::X).abs();
+            let lz = rel.dot(p.rot * Vec3::Z).abs();
+            if lx > p.extent_x * 0.50 || lz > p.extent_z * 0.50 {
+                continue;
+            }
+            if t < dist - 0.16 {
+                p.carve_hits = p.carve_hits.saturating_add(1);
+            } else if (t - dist).abs() <= 0.06 {
+                if curv_mm >= 18 {
+                    p.detail_hits = p.detail_hits.saturating_add(1);
+                } else {
+                    p.carve_hits = p.carve_hits.saturating_sub(1);
+                    p.detail_hits = p.detail_hits.saturating_sub(1);
+                }
+            }
+        }
+    }
+
+    /// Removes vertical walls contradicted by ray-through depth (`carve_hits >= 36`) and demotes
+    /// bumpy furniture misclassified as a wall (`detail_hits >= 48`) back to `VerticalObject` so
+    /// high-detail `3.5cm` TSDF immediately wraps the real object!
+    fn prune_or_demote_invalid_walls(&mut self) {
+        let mut invalidated_planes: Vec<(Vec3, Vec3)> = Vec::new();
+        let mut i = 0;
+        while i < self.planes.len() {
+            if self.planes[i].kind == SurfaceKind::Wall && !self.planes[i].demoted_to_object {
+                if self.planes[i].carve_hits >= 36 {
+                    let removed = self.planes.swap_remove(i);
+                    invalidated_planes.push((removed.pos, removed.normal));
+                    continue;
+                } else if self.planes[i].detail_hits >= 48 {
+                    let p = &mut self.planes[i];
+                    p.demoted_to_object = true;
+                    p.kind = SurfaceKind::VerticalObject;
+                    p.carve_hits = 0;
+                    p.detail_hits = 0;
+                    invalidated_planes.push((p.pos, p.normal));
+                }
+            }
+            i += 1;
+        }
+        if !invalidated_planes.is_empty() {
+            let span = CHUNK_DIM as f32 * CELL_SIZE;
+            for (&ckey, chunk) in &mut self.chunks {
+                let cc = Vec3::new(
+                    (ckey.0 as f32 + 0.5) * span,
+                    (ckey.1 as f32 + 0.5) * span,
+                    (ckey.2 as f32 + 0.5) * span,
+                );
+                if invalidated_planes
+                    .iter()
+                    .any(|&(pos, norm)| (cc - pos).dot(norm).abs() <= span * 0.85)
+                {
+                    chunk.dirty = true;
+                }
+            }
+            self.mesh_gen = self.mesh_gen.wrapping_add(1);
+        }
     }
 
     /// Primary Two-Tier Conformal 3D Object Scanner: ingests ARCore 16-bit Dense Depth (`AUTOMATIC` or `RAW_DEPTH_ONLY`)
@@ -1312,6 +1424,9 @@ impl SpatialMeshMap {
                                 // Local depth 2nd-derivative curvature (mm): separates flat wall/floor patches from detailed objects
                                 let curv_mm = (dl1 as i32 + dr1 as i32 - 2 * d_mm as i32).abs()
                                     + (du1 as i32 + dd1 as i32 - 2 * d_mm as i32).abs();
+                                if allow_carve && (stats.valid_rays % 3 == 0) {
+                                    self.validate_vertical_planes_with_ray(cam_pos, dir, dist, curv_mm);
+                                }
                                 let flat_structural = curv_mm < 16
                                     && self.is_flush_structural_plane(hit_world, None);
 
@@ -1416,6 +1531,8 @@ impl SpatialMeshMap {
         if stats.valid_rays >= 24 {
             self.has_dense_depth = true;
         }
+
+        self.prune_or_demote_invalid_walls();
 
         if !border_flips.is_empty() {
             self.mark_border_neighbors_dirty(&border_flips);
@@ -2028,13 +2145,10 @@ impl SpatialMeshMap {
         }
         let detail_verts = out.len();
 
-        // Tier 1: Always draw clean coarse Floor / Wall / Ceiling structural sheets (zero stacking with Table planes!)
+        // Tier 1: Always draw genuine room-scale Floor / Wall / Ceiling sheets (never small furniture misclassified as walls!)
         let include_non_structural_fallback = !self.has_dense_depth && detail_verts < 30;
         for plane in &self.planes {
-            let is_structural = matches!(
-                plane.kind,
-                SurfaceKind::Floor | SurfaceKind::Wall | SurfaceKind::Ceiling
-            );
+            let is_structural = plane.is_true_structural_tier1();
             if !is_structural && !include_non_structural_fallback {
                 continue;
             }
@@ -2794,6 +2908,78 @@ mod tests {
             "flat wall should not waste TSDF detail tris: wall_micro={}, detail={}",
             wall_micro_tris,
             detail_tris
+        );
+    }
+
+    #[test]
+    fn fake_wall_on_object_erodes_or_demotes_when_depth_contradicts_it() {
+        let mut map = SpatialMeshMap::default();
+        let wall_rot = Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
+
+        // 1. Small monitor-sized vertical plane (0.85m x 0.55m = 0.46m²) must NEVER qualify as Tier-1 architectural Wall!
+        map.ingest_ar_plane_polygons(
+            &[RawArPlane {
+                raw_type: 1,
+                pos: Vec3::new(0.0, 0.0, -1.0),
+                rot: wall_rot,
+                extent_x: 0.85,
+                extent_z: 0.55,
+                polygon_xz: vec![[-0.425, -0.275], [0.425, -0.275], [0.425, 0.275], [-0.425, 0.275]],
+            }],
+            0.0,
+        );
+        assert!(!map.planes[0].is_true_structural_tier1());
+
+        // 2. Large wall (2.4m x 2.0m) at z = -1.0m that actually turns out to be an opened door / moved board
+        //    (dense depth sees straight through it to z = -2.2m) MUST be pruned dynamically!
+        map.clear();
+        map.ingest_ar_plane_polygons(
+            &[RawArPlane {
+                raw_type: 1,
+                pos: Vec3::new(0.0, 0.0, -1.0),
+                rot: wall_rot,
+                extent_x: 2.4,
+                extent_z: 2.0,
+                polygon_xz: vec![[-1.2, -1.0], [1.2, -1.0], [1.2, 1.0], [-1.2, 1.0]],
+            }],
+            0.0,
+        );
+        assert_eq!(map.canonical_plane_count(), 1);
+        assert!(map.planes[0].is_true_structural_tier1());
+
+        let dw = 80usize;
+        let dh = 60usize;
+        let depth_behind = make_synthetic_depth_image(dw, dh, |_, _| 2200u16);
+        let conf = vec![180u8; dw * dh];
+        for _ in 0..3 {
+            map.ingest_depth_map(
+                &depth_behind,
+                dw,
+                dh,
+                dw * 2,
+                2,
+                Some(&conf),
+                dw,
+                dh,
+                dw,
+                1,
+                false,
+                64.0,
+                64.0,
+                40.0,
+                30.0,
+                dw,
+                dh,
+                Vec3::ZERO,
+                Quat::IDENTITY,
+                true,
+                2,
+            );
+        }
+        assert_eq!(
+            map.canonical_plane_count(),
+            0,
+            "stale Wall contradicted by ray-through depth must be dynamically removed!"
         );
     }
 }

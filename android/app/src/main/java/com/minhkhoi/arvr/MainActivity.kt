@@ -112,9 +112,10 @@ class MainActivity : Activity(), SensorEventListener {
     private val fallbackTexMtx = FloatArray(16)
 
     private lateinit var handTracker: HandTrackerHelper
-    private lateinit var roomScanner: RoomScannerHelper
     private lateinit var roomStorage: RoomMapStorage
     private lateinit var appUpdater: AppUpdater
+    private var autoSaveRunnable: Runnable? = null
+    private var autoCacheLoadedAttempted = false
     private val imgBasis = floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f)
     private val ndcBasis = FloatArray(6)
     private val fallbackBasis90 = floatArrayOf(-1f, 1f, 1f, 1f, -1f, -1f)
@@ -251,7 +252,6 @@ class MainActivity : Activity(), SensorEventListener {
             showStereoGesturePopup(code)
         }
         handTracker.setMode(handMode)
-        roomScanner = RoomScannerHelper(this)
         roomStorage = RoomMapStorage(this, mainHandler)
         appUpdater = AppUpdater(mainHandler)
 
@@ -309,6 +309,7 @@ class MainActivity : Activity(), SensorEventListener {
         }
 
         mainHandler.postDelayed({ performUpdateCheck(manual = false) }, 2500L)
+        mainHandler.postDelayed({ maybeAutoLoadRoomCache() }, 900L)
     }
 
     private fun dp(v: Float): Int =
@@ -742,11 +743,106 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     private fun roomScanLabel(mode: Int): String = when (mode) {
-        1 -> "\uD83C\uDFE0 Lưới 3D"
         4 -> "\uD83D\uDD3A Lưới \u25B3"
-        3 -> "\uD83C\uDFE0 Ẩn lưới"
-        2 -> "\uD83C\uDFE0 +AI Vật"
-        else -> "\uD83C\uDFE0 TẮT"
+        3 -> "\uD83D\uDC41 Ẩn lưới"
+        else -> "\u23F9 TẮT"
+    }
+
+    private fun hasScannedRoomData(): Boolean {
+        NativeBridge.nativeGetPerfMetrics(metricsBuf)
+        val totalTris = metricsBuf[17].toInt()
+        val cachedPlanes = metricsBuf[10].toInt()
+        val chunks = metricsBuf[16].toInt()
+        return totalTris >= 12 || chunks >= 1 || cachedPlanes >= 1
+    }
+
+    private fun autoSaveRoomCache(showBanner: Boolean) {
+        if (relocPending || roomScanMode <= 0 || !hasScannedRoomData()) return
+        roomStorage.saveAutoCache { res ->
+            res.onSuccess { kb ->
+                if (showBanner) {
+                    showStereoBanner(
+                        "\uD83D\uDD12  Đã khóa & tự lưu cache vào máy (${kb} KB) cho lần sau!",
+                        "#00E676",
+                        2200L,
+                        strokeWidth = 4
+                    )
+                }
+            }
+        }
+    }
+
+    private fun maybeAutoLoadRoomCache() {
+        if (autoCacheLoadedAttempted) return
+        autoCacheLoadedAttempted = true
+        if (!roomStorage.hasAutoCache()) return
+        roomStorage.loadAutoCache { res ->
+            res.onSuccess { (p, v, k) ->
+                if (roomScanMode == 0) {
+                    roomScanMode = 4
+                    roomScanToggleBtn.text = roomScanLabel(roomScanMode)
+                    NativeBridge.nativeSetRoomScanMode(roomScanMode)
+                    updateArPlaneFindingMode()
+                    startRoomLabelLoop()
+                }
+                if (k > 0) {
+                    relocPending = true
+                    relocStatusLabel.text = "\u23F3 Tự khớp cache phòng cũ ($p mặt, $v ô)..."
+                    relocBar.visibility = View.VISIBLE
+                    showStereoBanner(
+                        "\uD83D\uDCBE  Đã tự nạp phòng cũ từ máy — lia nhẹ để khớp hoặc bấm [📍 Khớp ngay] / [🧹 Xóa cache]",
+                        "#FFB300",
+                        2800L,
+                        strokeWidth = 4
+                    )
+                } else {
+                    NativeBridge.nativeForceRelocalizeNow()
+                    relocPending = false
+                    relocBar.visibility = View.GONE
+                    scanTurbo = false
+                    updateScanTurboButtonUi()
+                    showStereoBanner("\uD83D\uDCBE  Đã tự nạp phòng cũ từ máy ([🔒 Khóa])", "#00E676", 2200L)
+                }
+            }
+        }
+    }
+
+    private fun clearRoomCacheAndReset() {
+        NativeBridge.nativeCancelRelocalize()
+        NativeBridge.nativeClearSpatialMesh()
+        relocPending = false
+        relocBar.visibility = View.GONE
+        lastDepthTimestampNs = 0L
+        scanTurbo = true
+        NativeBridge.nativeSetScanTurbo(true)
+        updateScanTurboButtonUi()
+        roomPanelLayout.visibility = View.GONE
+        panelLayout.visibility = View.GONE
+        roomStorage.clearAutoCache {
+            showStereoBanner(
+                "\uD83E\uDDF9  Đã xóa sạch cache cũ trên máy — bật [⚡ Quét mạnh] quét mới!",
+                "#FFB300",
+                2200L,
+                strokeWidth = 4
+            )
+        }
+    }
+
+    private fun startAutoSaveLoop() {
+        stopAutoSaveLoop()
+        val task = object : Runnable {
+            override fun run() {
+                autoSaveRoomCache(showBanner = false)
+                mainHandler.postDelayed(this, 35_000L)
+            }
+        }
+        autoSaveRunnable = task
+        mainHandler.postDelayed(task, 35_000L)
+    }
+
+    private fun stopAutoSaveLoop() {
+        autoSaveRunnable?.let { mainHandler.removeCallbacks(it) }
+        autoSaveRunnable = null
     }
 
     private fun updateScanTurboButtonUi() {
@@ -768,13 +864,25 @@ class MainActivity : Activity(), SensorEventListener {
         }
         NativeBridge.nativeSetScanTurbo(scanTurbo)
         updateScanTurboButtonUi()
-        if (showPopup) {
-            val banner = if (scanTurbo) {
-                "\u26A1  QUÉT MẠNH BẬT (9Hz): Lia chậm quanh đồ vật để bám lưới 3.5cm!"
-            } else {
-                "\uD83D\uDD12  ĐÃ KHÓA LƯỚI (2Hz): Không quét lung tung — chỉ sửa khi vật thật đổi >1.5s!"
+        if (!scanTurbo) {
+            // Locking room automatically persists current 3D map to on-phone cache for next launch!
+            if (hasScannedRoomData()) {
+                autoSaveRoomCache(showBanner = showPopup)
+            } else if (showPopup) {
+                showStereoBanner(
+                    "\uD83D\uDD12  ĐÃ KHÓA LƯỚI (2Hz): Không quét lung tung — chỉ sửa khi vật thật đổi >1.5s!",
+                    "#26C6DA",
+                    2100L,
+                    strokeWidth = 4
+                )
             }
-            showStereoBanner(banner, if (scanTurbo) "#FFB300" else "#26C6DA", 2100L, strokeWidth = 4)
+        } else if (showPopup) {
+            showStereoBanner(
+                "\u26A1  QUÉT MẠNH BẬT (9Hz): Lia chậm quanh đồ vật để bám lưới 3.5cm!",
+                "#FFB300",
+                2100L,
+                strokeWidth = 4
+            )
         }
     }
 
@@ -971,11 +1079,9 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun cycleRoomScanMode(showPopup: Boolean) {
         roomScanMode = when (roomScanMode) {
-            1 -> 4
             4 -> 3
-            3 -> 2
-            2 -> 0
-            else -> 1
+            3 -> 0
+            else -> 4
         }
         roomScanToggleBtn.text = roomScanLabel(roomScanMode)
         val btnBg = roomScanToggleBtn.background as? GradientDrawable
@@ -983,11 +1089,6 @@ class MainActivity : Activity(), SensorEventListener {
             if (roomScanMode == 4) Color.argb(215, 14, 138, 108) else Color.argb(175, 20, 24, 34)
         )
         NativeBridge.nativeSetRoomScanMode(roomScanMode)
-        if (roomScanMode == 2) {
-            roomScanner.initAsync()
-        } else {
-            roomScanner.resetMetrics()
-        }
         if (roomScanMode == 0) {
             cachedPlanesCount = 0
             reticleHitKind = 0
@@ -1000,8 +1101,10 @@ class MainActivity : Activity(), SensorEventListener {
 
         if (roomScanMode > 0) {
             startRoomLabelLoop()
+            startAutoSaveLoop()
         } else {
             stopRoomLabelLoop()
+            stopAutoSaveLoop()
             hideAllRoomTags()
             leftReticleHud.visibility = View.GONE
             rightReticleHud.visibility = View.GONE
@@ -1009,11 +1112,9 @@ class MainActivity : Activity(), SensorEventListener {
 
         if (showPopup) {
             val banner = when (roomScanMode) {
-                1 -> "\uD83C\uDFE0  Không gian: LƯỚI 3D SẠCH + HỒNG TÂM"
-                4 -> "\uD83D\uDD3A  Chế độ LƯỚI TAM GIÁC (Xem chính xác mọi vùng 3D đã dựng)"
-                3 -> "\uD83C\uDFE0  Không gian: ẨN LƯỚI (Chỉ hồng tâm + Vật lý)"
-                2 -> "\uD83C\uDFE0  Không gian: ĐẦY ĐỦ (Lưới 3D + AI Đồ vật)"
-                else -> "\uD83C\uDFE0  Đã TẮT quét không gian & hồng tâm"
+                4 -> "\uD83D\uDD3A  Lưới 3D tách 2 tầng: Vật chi tiết 3.5cm + Tường/Sàn phẳng"
+                3 -> "\uD83D\uDC41  Ẩn lưới (Giữ che khuất vật thật + Vật lý + Hồng tâm)"
+                else -> "\u23F9  Đã TẮT quét không gian & hồng tâm"
             }
             showStereoBanner(banner, if (roomScanMode == 4) "#2EE6A8" else "#2EE6E6", 1600L)
         }
@@ -1303,18 +1404,12 @@ class MainActivity : Activity(), SensorEventListener {
         val aiFps = handTracker.aiFps.toInt()
         val inferMs = handTracker.lastInferMs
         val yuvUs = handTracker.lastConvertUs
-        val scanInferMs = roomScanner.lastInferMs
         val shortSha = BuildConfig.GIT_COMMIT_SHA.take(7)
 
         val handAiText = if (handMode == 0) {
             "AI Tay: TẮT"
         } else {
             "AI Tay (${handTracker.delegateLabel}): $aiFps fps (${inferMs}ms | LUT ${yuvUs}µs)"
-        }
-        val objScanText = if (roomScanMode != 2) {
-            "Đồ vật: TẮT"
-        } else {
-            "$activeObjects đồ vật (${scanInferMs}ms CPU)"
         }
         val viewLabel = if (stereoMode) "2 Mắt VR" else "1 Mắt AR"
         val reticleSummary = if (hitKind > 0 && hitDist > 0.05f) {
@@ -1356,7 +1451,7 @@ class MainActivity : Activity(), SensorEventListener {
             .append(String.format(Locale.US, "GPU: %d fps (%.1fms) | %s | %s | %s\n", renderFps, frameMs, depthSrc, occTag, torchTag))
             .append("Track: $trackMode | $scanTag | Tâm: $reticleSummary | Vật lý: $physBodies\n")
             .append("Chi tiết: ${detailTris}\u25B3 ($meshChunks chunk) | Phẳng/Tường: ${planeTris}\u25B3 ($cachedPlanes mặt) | $relocTag\n")
-            .append("Tay ($activeHands): $gestureName | $handAiText | $objScanText")
+            .append("Tay ($activeHands): $gestureName | $handAiText")
             .toString()
 
         leftTelemetryCard.text = summary
@@ -1448,21 +1543,25 @@ class MainActivity : Activity(), SensorEventListener {
             if (ok) {
                 scanTurbo = false
                 updateScanTurboButtonUi()
-                showStereoBanner("\uD83D\uDCCD  Đã khớp phòng — chuyển sang [🛡 Duy trì] (chỉ quét khi đổi)!", "#00E676", 2400L)
+                showStereoBanner("\uD83D\uDCCD  Đã khớp phòng cũ — đang ở [🔒 Khóa]!", "#00E676", 2400L)
             }
+        }
+        val clearCacheRelocBtn = makeQuickButton("\uD83E\uDDF9 Xóa cache", fillColor = Color.argb(215, 165, 65, 24)) {
+            clearRoomCacheAndReset()
         }
         val cancelRelocBtn = makeQuickButton("\u2716", fillColor = Color.argb(190, 90, 35, 35)) {
             NativeBridge.nativeCancelRelocalize()
             relocPending = false
             relocBar.visibility = View.GONE
-            showStereoBanner("Đã hủy khớp phòng cũ", "#FFAB40", 1300L)
+            showStereoBanner("Bỏ qua khớp phòng cũ (vẫn giữ cache trong máy)", "#FFAB40", 1500L)
         }
         val rItemLp = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply { marginStart = dp(6f) }
+        ).apply { marginStart = dp(5f) }
         relocBar.addView(relocStatusLabel)
         relocBar.addView(lockNowBtn, rItemLp)
+        relocBar.addView(clearCacheRelocBtn, rItemLp)
         relocBar.addView(cancelRelocBtn, rItemLp)
 
         root.addView(
@@ -1538,14 +1637,8 @@ class MainActivity : Activity(), SensorEventListener {
                 }
             }
         }
-        val clearMeshBtn = makeQuickButton("\uD83E\uDDF9 Xóa lưới", fillColor = Color.argb(215, 165, 82, 24)) {
-            NativeBridge.nativeClearSpatialMesh()
-            lastDepthTimestampNs = 0L
-            scanTurbo = true
-            NativeBridge.nativeSetScanTurbo(true)
-            updateScanTurboButtonUi()
-            roomPanelLayout.visibility = View.GONE
-            showStereoBanner("\uD83E\uDDF9  Đã xóa lưới 3D cũ — bật [⚡ Quét mạnh] để quét lại!", "#FFB300", 1900L)
+        val clearMeshBtn = makeQuickButton("\uD83E\uDDF9 Xóa cache cũ", fillColor = Color.argb(225, 178, 56, 32)) {
+            clearRoomCacheAndReset()
         }
         val closeBtn = makeQuickButton("\u2716 Đóng", fillColor = Color.argb(200, 80, 35, 40)) {
             roomPanelLayout.visibility = View.GONE
@@ -1575,7 +1668,7 @@ class MainActivity : Activity(), SensorEventListener {
             setTextColor(Color.parseColor("#90A4AE"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 8.5f)
             setPadding(0, dp(4f), 0, 0)
-            text = "Thư mục lưu: .../Android/data/${packageName}/files/rooms/"
+            text = "Tự lưu cache vào bộ nhớ máy khi bấm [🔒 Khóa] / thoát app. Xuất .OBJ tại: ${roomStorage.storageFolderPath()}"
         }
 
         roomPanelLayout.addView(title)
@@ -1609,7 +1702,7 @@ class MainActivity : Activity(), SensorEventListener {
         val planes = metricsBuf[10].toInt()
         val chunks = metricsBuf[16].toInt()
         val kfs = metricsBuf[18].toInt()
-        roomStatusText.text = "Hiện tại: $planes mặt phẳng gộp | $chunks chunk 3D | $kfs/8 mốc ảnh định vị"
+        roomStatusText.text = "Hiện tại: $chunks chunk 3D | $planes mặt phẳng | $kfs/8 mốc ảnh\n${roomStorage.autoCacheSummaryText()}"
 
         roomStorage.listRooms { rooms ->
             roomListContainer.removeAllViews()
@@ -1762,6 +1855,13 @@ class MainActivity : Activity(), SensorEventListener {
             }
         }
 
+        val clearCacheSettingsBtn = Button(this).apply {
+            text = "\uD83E\uDDF9 Xóa cache phòng 3D cũ trên máy & quét mới"
+            setOnClickListener {
+                clearRoomCacheAndReset()
+            }
+        }
+
         val recenterBtn = Button(this).apply {
             text = "Đặt lại khối 3D sau 3 giây (Nhét vào hộp VR)"
             setOnClickListener {
@@ -1788,6 +1888,7 @@ class MainActivity : Activity(), SensorEventListener {
         panelLayout.addView(ipdLabel)
         panelLayout.addView(ipdBar)
         panelLayout.addView(occToggleBtn, btnParams)
+        panelLayout.addView(clearCacheSettingsBtn, btnParams)
         panelLayout.addView(recenterBtn, btnParams)
         panelLayout.addView(tipText)
 
@@ -1823,6 +1924,7 @@ class MainActivity : Activity(), SensorEventListener {
         }
         if (roomScanMode > 0) {
             startRoomLabelLoop()
+            startAutoSaveLoop()
         }
         if (telemetryVisible) {
             startTelemetryLoop()
@@ -1839,7 +1941,9 @@ class MainActivity : Activity(), SensorEventListener {
         recenterRunnable?.let { mainHandler.removeCallbacks(it) }
         hidePopupRunnable?.let { mainHandler.removeCallbacks(it) }
         stopRoomLabelLoop()
+        stopAutoSaveLoop()
         stopTelemetryLoop()
+        autoSaveRoomCache(showBanner = false)
         sensorManager.unregisterListener(this)
         if (torchEnabled) {
             torchEnabled = false
@@ -1853,7 +1957,6 @@ class MainActivity : Activity(), SensorEventListener {
 
     override fun onDestroy() {
         handTracker.close()
-        roomScanner.close()
         roomStorage.close()
         appUpdater.close()
         synchronized(sessionLock) {
@@ -2121,10 +2224,9 @@ class MainActivity : Activity(), SensorEventListener {
                     null
                 } ?: return@setOnImageAvailableListener
                 val wantHand = handMode > 0 && !handTracker.isBusy.get()
-                val wantRoom = roomScanMode == 2 && !roomScanner.isBusy.get()
                 var ingestedSeq = 0L
                 try {
-                    if (wantHand || wantRoom) {
+                    if (wantHand) {
                         val rot = displayRotation
                         val rotDeg = if (rot == Surface.ROTATION_270) 180 else 0
                         val basis = if (rot == Surface.ROTATION_270) fallbackBasis270 else fallbackBasis90
@@ -2133,9 +2235,8 @@ class MainActivity : Activity(), SensorEventListener {
                 } finally {
                     img.close()
                 }
-                if (ingestedSeq > 0L) {
-                    if (wantHand) handTracker.notifyFrameAvailable()
-                    if (wantRoom) roomScanner.notifyFrameAvailable()
+                if (ingestedSeq > 0L && wantHand) {
+                    handTracker.notifyFrameAvailable()
                 }
             }, handler)
         }
@@ -2665,12 +2766,11 @@ class MainActivity : Activity(), SensorEventListener {
                                     }
                                 }
 
-                                // Ingest single 480p YUV frame into Rust 4-slot RAM ring (<0.08ms), then wake workers / relocalizer
+                                // Ingest single 480p YUV frame into Rust 4-slot RAM ring (<0.08ms), then wake hand worker / relocalizer
                                 val wantHand = handMode > 0 && !handTracker.isBusy.get()
-                                val wantRoom = roomScanMode == 2 && !roomScanner.isBusy.get()
                                 val relocIntervalNs = if (relocPending) 250_000_000L else 1_000_000_000L
                                 val wantReloc = roomScanMode > 0 && valid && (nowNs - lastRelocIngestNs >= relocIntervalNs)
-                                if (wantHand || wantRoom || wantReloc) {
+                                if (wantHand || wantReloc) {
                                     var ingestedSeq = 0L
                                     try {
                                         frame.transformCoordinates2d(
@@ -2690,7 +2790,6 @@ class MainActivity : Activity(), SensorEventListener {
                                     }
                                     if (ingestedSeq > 0L) {
                                         if (wantHand) handTracker.notifyFrameAvailable()
-                                        if (wantRoom) roomScanner.notifyFrameAvailable()
                                         if (wantReloc) {
                                             lastRelocIngestNs = nowNs
                                             val rStatus = NativeBridge.nativeTickRelocalizer()

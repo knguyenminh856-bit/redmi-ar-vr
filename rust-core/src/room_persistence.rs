@@ -459,6 +459,9 @@ pub fn deserialize_room_arroom(data: &[u8]) -> Result<LoadedRoomMap, String> {
                 weight,
                 last_seen_gen: 0,
                 is_explicit_patch: false,
+                carve_hits: 0,
+                detail_hits: 0,
+                demoted_to_object: false,
             });
         }
     }

@@ -16,17 +16,24 @@ data class SavedRoomInfo(
 )
 
 /**
- * Rule 3 (Async Disk I/O Thread): Handles all `.arroom` binary room saves/loads and `.obj`
- * exports off the UI and 120Hz GL render threads so framing never stalls.
+ * Persistent on-phone 3D room cache & `.arroom` v2 (TSDF) + `.obj` storage on a dedicated I/O thread.
+ * Uses internal `context.filesDir/rooms` so saved maps ALWAYS persist across app restarts without
+ * external-storage permission issues, with automatic background cache (`auto_room_cache.arroom`).
  */
 class RoomMapStorage(
     context: Context,
     private val uiHandler: Handler
 ) {
-    private val roomsDir: File = File(
+    companion object {
+        const val AUTO_CACHE_FILENAME = "auto_room_cache.arroom"
+    }
+
+    private val roomsDir: File = File(context.filesDir, "rooms").apply { mkdirs() }
+    private val exportDir: File = File(
         context.getExternalFilesDir(null) ?: context.filesDir,
         "rooms"
     ).apply { mkdirs() }
+    private val autoCacheFile: File = File(roomsDir, AUTO_CACHE_FILENAME)
 
     private val ioExecutor = Executors.newSingleThreadExecutor { r ->
         Thread(r, "RoomDiskIoThread").apply { priority = Thread.NORM_PRIORITY - 1 }
@@ -34,13 +41,62 @@ class RoomMapStorage(
 
     private val dateFmt = SimpleDateFormat("dd/MM HH:mm", Locale.getDefault())
 
-    fun storageFolderPath(): String = roomsDir.absolutePath
+    fun storageFolderPath(): String = exportDir.absolutePath
+
+    fun hasAutoCache(): Boolean = autoCacheFile.isFile && autoCacheFile.length() >= 32L
+
+    fun autoCacheSummaryText(): String {
+        if (!hasAutoCache()) return "Chưa có cache tự lưu trên máy"
+        val kb = ((autoCacheFile.length() + 1023L) / 1024L).toInt().coerceAtLeast(1)
+        val dt = dateFmt.format(Date(autoCacheFile.lastModified()))
+        return "Cache đã lưu trên máy: ${kb} KB ($dt)"
+    }
+
+    fun saveAutoCache(onDone: ((Result<Int>) -> Unit)? = null) {
+        ioExecutor.execute {
+            try {
+                val bytes = NativeBridge.nativeSerializeRoom()
+                    ?: throw IllegalStateException("Chưa có dữ liệu 3D để lưu cache")
+                if (bytes.size < 36) {
+                    throw IllegalStateException("Chưa đủ dữ liệu 3D để lưu")
+                }
+                roomsDir.mkdirs()
+                val tmp = File(roomsDir, "$AUTO_CACHE_FILENAME.tmp")
+                tmp.writeBytes(bytes)
+                if (autoCacheFile.exists()) autoCacheFile.delete()
+                if (!tmp.renameTo(autoCacheFile)) {
+                    autoCacheFile.writeBytes(bytes)
+                    tmp.delete()
+                }
+                val kb = ((autoCacheFile.length() + 1023L) / 1024L).toInt().coerceAtLeast(1)
+                onDone?.let { cb -> uiHandler.post { cb(Result.success(kb)) } }
+            } catch (t: Throwable) {
+                onDone?.let { cb -> uiHandler.post { cb(Result.failure(t)) } }
+            }
+        }
+    }
+
+    fun loadAutoCache(onDone: (Result<Triple<Int, Int, Int>>) -> Unit) {
+        loadRoom(autoCacheFile, onDone)
+    }
+
+    fun clearAutoCache(onDone: () -> Unit) {
+        ioExecutor.execute {
+            try {
+                if (autoCacheFile.exists()) autoCacheFile.delete()
+                val tmp = File(roomsDir, "$AUTO_CACHE_FILENAME.tmp")
+                if (tmp.exists()) tmp.delete()
+            } catch (_: Throwable) {
+            }
+            uiHandler.post { onDone() }
+        }
+    }
 
     fun listRooms(onResult: (List<SavedRoomInfo>) -> Unit) {
         ioExecutor.execute {
-            val files = roomsDir.listFiles { f -> f.isFile && f.name.endsWith(".arroom") }
-                ?.sortedByDescending { it.lastModified() }
-                ?: emptyList()
+            val files = roomsDir.listFiles { f ->
+                f.isFile && f.name.endsWith(".arroom") && f.name != AUTO_CACHE_FILENAME
+            }?.sortedByDescending { it.lastModified() } ?: emptyList()
             val list = files.map { f ->
                 SavedRoomInfo(
                     name = f.name.removeSuffix(".arroom"),
@@ -54,10 +110,9 @@ class RoomMapStorage(
     }
 
     fun nextAutoRoomName(): String {
-        val existing = roomsDir.listFiles { f -> f.isFile && f.name.endsWith(".arroom") }
-            ?.map { it.name.removeSuffix(".arroom") }
-            ?.toSet()
-            ?: emptySet()
+        val existing = roomsDir.listFiles { f ->
+            f.isFile && f.name.endsWith(".arroom") && f.name != AUTO_CACHE_FILENAME
+        }?.map { it.name.removeSuffix(".arroom") }?.toSet() ?: emptySet()
         var idx = 1
         while (existing.contains("phong_$idx")) {
             idx++
@@ -71,7 +126,7 @@ class RoomMapStorage(
                 val safeName = name.replace(Regex("[^a-zA-Z0-9_-]"), "_").ifBlank { "phong_1" }
                 val bytes = NativeBridge.nativeSerializeRoom()
                     ?: throw IllegalStateException("Không thể đóng gói dữ liệu 3D")
-                if (bytes.size < 32) {
+                if (bytes.size < 36) {
                     throw IllegalStateException("Chưa có dữ liệu 3D để lưu")
                 }
                 roomsDir.mkdirs()
@@ -83,6 +138,10 @@ class RoomMapStorage(
                     dest.writeBytes(bytes)
                     tmp.delete()
                 }
+                // Also sync auto-cache so next startup immediately restores this saved room!
+                try {
+                    autoCacheFile.writeBytes(bytes)
+                } catch (_: Throwable) {}
                 val info = SavedRoomInfo(
                     name = safeName,
                     file = dest,
@@ -99,6 +158,9 @@ class RoomMapStorage(
     fun loadRoom(file: File, onDone: (Result<Triple<Int, Int, Int>>) -> Unit) {
         ioExecutor.execute {
             try {
+                if (!file.isFile || file.length() < 32L) {
+                    throw IllegalStateException("Không tìm thấy file phòng đã lưu")
+                }
                 val bytes = file.readBytes()
                 val counts = IntArray(3)
                 val ok = NativeBridge.nativeLoadRoomBytes(bytes, counts)
@@ -121,8 +183,8 @@ class RoomMapStorage(
                 if (objText.isBlank() || !objText.contains("\nv ")) {
                     throw IllegalStateException("Chưa có lưới tam giác 3D để xuất")
                 }
-                roomsDir.mkdirs()
-                val outFile = File(roomsDir, "$safeName.obj")
+                exportDir.mkdirs()
+                val outFile = File(exportDir, "$safeName.obj")
                 outFile.writeText(objText)
                 uiHandler.post { onDone(Result.success(outFile)) }
             } catch (t: Throwable) {
@@ -142,6 +204,6 @@ class RoomMapStorage(
     }
 
     fun close() {
-        ioExecutor.shutdownNow()
+        ioExecutor.shutdown()
     }
 }
