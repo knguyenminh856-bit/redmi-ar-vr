@@ -48,6 +48,8 @@ pub struct PerfMetrics {
     pub depth_source_mode: i32,
     pub scan_turbo: i32,
     pub last_diff_changed: u32,
+    pub detail_triangles: u32,
+    pub plane_triangles: u32,
 }
 
 /// Thread-safe input state updated by Android sensor/camera/UI threads.
@@ -101,6 +103,8 @@ pub struct SharedInputState {
     pub cached_tri_cull_pos: Vec3,
     pub cached_tri_chunks: u32,
     pub cached_tri_count: u32,
+    pub cached_detail_tris: u32,
+    pub cached_plane_tris: u32,
     pub keyframe_bank: KeyframeBank,
     pub pending_room: Option<LoadedRoomMap>,
     pub last_reloc_desc_seq: u64,
@@ -158,6 +162,8 @@ impl Default for SharedInputState {
             cached_tri_cull_pos: Vec3::ZERO,
             cached_tri_chunks: 0,
             cached_tri_count: 0,
+            cached_detail_tris: 0,
+            cached_plane_tris: 0,
             keyframe_bank: KeyframeBank::default(),
             pending_room: None,
             last_reloc_desc_seq: 0,
@@ -263,6 +269,8 @@ impl SharedInputState {
             self.cached_tri_upload_gen = self.cached_tri_upload_gen.wrapping_add(1);
             self.cached_tri_chunks = 0;
             self.cached_tri_count = 0;
+            self.cached_detail_tris = 0;
+            self.cached_plane_tris = 0;
             self.projected_labels.clear();
             self.reticle = ReticleHit::default();
             self.perf.active_planes = 0;
@@ -271,6 +279,8 @@ impl SharedInputState {
             self.perf.voxel_count = 0;
             self.perf.mesh_chunks = 0;
             self.perf.mesh_triangles = 0;
+        self.perf.detail_triangles = 0;
+        self.perf.plane_triangles = 0;
             self.perf.keyframe_count = 0;
             self.perf.reloc_status = 0;
             self.perf.reloc_best_pct = 0;
@@ -440,6 +450,8 @@ impl SharedInputState {
         self.perf.voxel_count = 0;
         self.perf.mesh_chunks = 0;
         self.perf.mesh_triangles = 0;
+        self.perf.detail_triangles = 0;
+        self.perf.plane_triangles = 0;
         self.perf.keyframe_count = 0;
         self.perf.reloc_status = 0;
         self.perf.reloc_best_pct = 0;
@@ -920,7 +932,7 @@ impl SharedInputState {
             let moved = (cam_pos_capture - self.cached_tri_cull_pos).length_squared() > 0.60 * 0.60;
             if self.cached_tri_src_gen != self.spatial_mesh.mesh_gen || moved || self.cached_tri_upload_gen == 0 {
                 let cam_fwd = (head_rot_120hz * -Vec3::Z).normalize_or_zero();
-                let (chunks, tris) = self.spatial_mesh.build_triangle_mesh_buffer(
+                let (chunks, detail_tris, plane_tris) = self.spatial_mesh.build_triangle_mesh_buffer(
                     cam_pos_capture,
                     cam_fwd,
                     &mut self.cached_tri_mesh,
@@ -928,7 +940,9 @@ impl SharedInputState {
                 self.cached_tri_src_gen = self.spatial_mesh.mesh_gen;
                 self.cached_tri_cull_pos = cam_pos_capture;
                 self.cached_tri_chunks = chunks;
-                self.cached_tri_count = tris;
+                self.cached_detail_tris = detail_tris;
+                self.cached_plane_tris = plane_tris;
+                self.cached_tri_count = detail_tris + plane_tris;
                 self.cached_tri_upload_gen = self.cached_tri_upload_gen.wrapping_add(1).max(1);
             }
             if self.last_sent_tri_gen != self.cached_tri_upload_gen {
@@ -966,6 +980,8 @@ impl SharedInputState {
         self.perf.physics_bodies = self.physics.bodies.len() as u32;
         self.perf.mesh_chunks = self.spatial_mesh.active_chunk_count() as u32;
         self.perf.mesh_triangles = self.cached_tri_count;
+        self.perf.detail_triangles = self.cached_detail_tris;
+        self.perf.plane_triangles = self.cached_plane_tris;
         self.perf.keyframe_count = self.keyframe_bank.len() as u32;
         self.perf.reloc_status = self.reloc_status;
         self.perf.reloc_best_pct = self.reloc_best_pct;

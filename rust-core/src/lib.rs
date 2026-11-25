@@ -343,6 +343,8 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeGetPerfMetrics(
         perf.depth_source_mode as f32,
         perf.scan_turbo as f32,
         perf.last_diff_changed as f32,
+        perf.detail_triangles as f32,
+        perf.plane_triangles as f32,
     ];
     let copy_len = env
         .get_array_length(&out_arr)

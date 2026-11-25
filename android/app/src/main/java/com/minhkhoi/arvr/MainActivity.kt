@@ -101,6 +101,7 @@ class MainActivity : Activity(), SensorEventListener {
     private var cameraHandler: Handler? = null
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
+    private var fallbackReqBuilder: CaptureRequest.Builder? = null
     private var fallbackSurfaceTexture: SurfaceTexture? = null
     private var fallbackPreviewSurface: Surface? = null
     private var fallbackImageReader: ImageReader? = null
@@ -157,7 +158,9 @@ class MainActivity : Activity(), SensorEventListener {
     @Volatile
     private var depthSupportLevel = 0 // 2=AUTOMATIC Dense Depth, 1=RAW_DEPTH_ONLY, 0=SLAM
     @Volatile
-    private var scanTurbo = true // true=⚡ Quét mạnh (10Hz liên tục), false=🛡 Duy trì (2.5Hz so sánh thay đổi)
+    private var scanTurbo = true // true=⚡ Quét mạnh (9Hz liên tục), false=🔒 Khóa (2Hz chỉ đổi khi thay đổi)
+    @Volatile
+    private var torchEnabled = false // Đèn flash LED chiếu sáng phòng khi quét chi tiết
     @Volatile
     private var drawMode = 0 // 0=Off, 1=1 Finger, 2=5 Fingers
     @Volatile
@@ -228,6 +231,7 @@ class MainActivity : Activity(), SensorEventListener {
     private lateinit var handModeBtn: Button
     private lateinit var roomScanToggleBtn: Button
     private lateinit var scanTurboBtn: Button
+    private lateinit var torchBtn: Button
     private lateinit var checkUpdateBtn: Button
     private lateinit var installUpdateBtn: Button
     private lateinit var telemetryToggleBtn: Button
@@ -236,7 +240,7 @@ class MainActivity : Activity(), SensorEventListener {
     private lateinit var roomListContainer: LinearLayout
     private lateinit var relocBar: LinearLayout
     private lateinit var relocStatusLabel: TextView
-    private val metricsBuf = FloatArray(24)
+    private val metricsBuf = FloatArray(26)
     private var cachedGpuName = ""
     private var telemetryRunnable: Runnable? = null
 
@@ -600,6 +604,9 @@ class MainActivity : Activity(), SensorEventListener {
         ) {
             toggleScanTurbo(showPopup = true)
         }
+        torchBtn = makeQuickButton("\uD83D\uDD26") {
+            toggleTorch(showPopup = true)
+        }
         val roomMgrBtn = makeQuickButton("\uD83D\uDCBE Phòng", fillColor = Color.argb(195, 36, 62, 110)) {
             toggleRoomManagerPanel()
         }
@@ -643,6 +650,7 @@ class MainActivity : Activity(), SensorEventListener {
 
         bar.addView(roomScanToggleBtn, itemParams)
         bar.addView(scanTurboBtn, itemParams)
+        bar.addView(torchBtn, itemParams)
         bar.addView(roomMgrBtn, itemParams)
         bar.addView(eyeModeBtn, itemParams)
         bar.addView(clearBtn, itemParams)
@@ -768,6 +776,66 @@ class MainActivity : Activity(), SensorEventListener {
             }
             showStereoBanner(banner, if (scanTurbo) "#FFB300" else "#26C6DA", 2100L, strokeWidth = 4)
         }
+    }
+
+    private fun updateTorchButtonUi() {
+        torchBtn.text = if (torchEnabled) "\uD83D\uDD26 BẬT" else "\uD83D\uDD26"
+        (torchBtn.background as? GradientDrawable)?.setColor(
+            if (torchEnabled) Color.argb(235, 234, 152, 12) else Color.argb(175, 20, 24, 34)
+        )
+    }
+
+    private fun toggleTorch(showPopup: Boolean) {
+        torchEnabled = !torchEnabled
+        val ok = applyTorchMode()
+        if (!ok && torchEnabled) {
+            torchEnabled = false
+        }
+        updateTorchButtonUi()
+        if (showPopup) {
+            val banner = if (!ok) {
+                "\u26A0\uFE0F  Không bật được đèn flash trên chế độ camera hiện tại"
+            } else if (torchEnabled) {
+                "\uD83D\uDD26  Đã BẬT đèn flash — camera nét hơn để quét chi tiết đồ vật!"
+            } else {
+                "\uD83D\uDD26  Đã TẮT đèn flash"
+            }
+            showStereoBanner(banner, if (torchEnabled) "#FFD54F" else "#90A4AE", 1700L)
+        }
+    }
+
+    private fun applyTorchMode(): Boolean {
+        synchronized(sessionLock) {
+            val session = arSession
+            if (session != null) {
+                return try {
+                    val cfg = session.config
+                    cfg.flashMode = if (torchEnabled) Config.FlashMode.TORCH else Config.FlashMode.OFF
+                    session.configure(cfg)
+                    true
+                } catch (t: Throwable) {
+                    Log.w(TAG, "ARCore FlashMode warning: ${t.message}")
+                    false
+                }
+            }
+            val cs = captureSession
+            val req = fallbackReqBuilder
+            val handler = cameraHandler
+            if (cs != null && req != null) {
+                return try {
+                    req.set(
+                        CaptureRequest.FLASH_MODE,
+                        if (torchEnabled) CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF
+                    )
+                    cs.setRepeatingRequest(req.build(), null, handler)
+                    true
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Camera2 FlashMode warning: ${t.message}")
+                    false
+                }
+            }
+        }
+        return true
     }
 
     private fun toggleStereoMode(showPopup: Boolean) {
@@ -1000,18 +1068,19 @@ class MainActivity : Activity(), SensorEventListener {
         if (roomScanMode == 4 || relocPending) {
             NativeBridge.nativeGetPerfMetrics(metricsBuf)
             if (roomScanMode == 4) {
-                val triCount = metricsBuf[17].toInt()
+                val detailTris = metricsBuf[24].toInt()
+                val planeTris = metricsBuf[25].toInt()
                 val diffChanged = metricsBuf[23].toInt()
                 meshPrefix = if (scanTurbo) {
                     if (blurSkipActive) {
-                        "\u26A1 Giữ chậm tay (${triCount}\u25B3) \u00B7 "
+                        "\u26A1 Giữ chậm (Vật:${detailTris}\u25B3) \u00B7 "
                     } else {
-                        "\u26A1 Quét (${triCount}\u25B3) \u00B7 "
+                        "\u26A1 Vật:${detailTris}\u25B3 \u00B7 Tường/Sàn:${planeTris}\u25B3 \u00B7 "
                     }
                 } else if (diffChanged > 0) {
-                    "\uD83D\uDD12 Đổi +${diffChanged} (${triCount}\u25B3) \u00B7 "
+                    "\uD83D\uDD12 Đổi +${diffChanged} (Vật:${detailTris}\u25B3) \u00B7 "
                 } else {
-                    "\uD83D\uDD12 Đã khóa (${triCount}\u25B3) \u00B7 "
+                    "\uD83D\uDD12 Khóa (Vật:${detailTris}\u25B3 \u00B7 Phẳng:${planeTris}\u25B3) \u00B7 "
                 }
             }
             if (relocPending) {
@@ -1263,6 +1332,8 @@ class MainActivity : Activity(), SensorEventListener {
 
         val depthModeAct = metricsBuf[21].toInt()
         val diffChanged = metricsBuf[23].toInt()
+        val detailTris = metricsBuf[24].toInt()
+        val planeTris = metricsBuf[25].toInt()
         val depthSrc = when {
             depthModeAct == 2 -> "DenseDepth 3.5cm"
             depthModeAct == 1 -> "RawDepth 3.5cm"
@@ -1278,12 +1349,13 @@ class MainActivity : Activity(), SensorEventListener {
             "\uD83D\uDD12Khóa(0 đổi)"
         }
         val occTag = if (meshOcclusionEnabled) "Che:BẬT" else "Che:TẮT"
+        val torchTag = if (torchEnabled) "Đèn:BẬT" else "Đèn:TẮT"
 
         val summary = StringBuilder()
             .append("v${BuildConfig.VERSION_NAME} ($shortSha) | $viewLabel | ${batPct}% ${String.format(Locale.US, "%.1f", tempC)}°C | ${totalRamMb}MB\n")
-            .append(String.format(Locale.US, "GPU: %d fps (%.1fms) | %s | %s\n", renderFps, frameMs, depthSrc, occTag))
+            .append(String.format(Locale.US, "GPU: %d fps (%.1fms) | %s | %s | %s\n", renderFps, frameMs, depthSrc, occTag, torchTag))
             .append("Track: $trackMode | $scanTag | Tâm: $reticleSummary | Vật lý: $physBodies\n")
-            .append("3D: $meshChunks chunk ($voxelCount ô) | ${meshTris}\u25B3 | $cachedPlanes phẳng | $relocTag\n")
+            .append("Chi tiết: ${detailTris}\u25B3 ($meshChunks chunk) | Phẳng/Tường: ${planeTris}\u25B3 ($cachedPlanes mặt) | $relocTag\n")
             .append("Tay ($activeHands): $gestureName | $handAiText | $objScanText")
             .toString()
 
@@ -1769,6 +1841,11 @@ class MainActivity : Activity(), SensorEventListener {
         stopRoomLabelLoop()
         stopTelemetryLoop()
         sensorManager.unregisterListener(this)
+        if (torchEnabled) {
+            torchEnabled = false
+            applyTorchMode()
+            updateTorchButtonUi()
+        }
         stopTrackingAndCamera()
         glView.onPause()
         super.onPause()
@@ -1903,6 +1980,7 @@ class MainActivity : Activity(), SensorEventListener {
                             depthSupportLevel == 1 -> Config.DepthMode.RAW_DEPTH_ONLY
                             else -> Config.DepthMode.DISABLED
                         }
+                        flashMode = if (torchEnabled) Config.FlashMode.TORCH else Config.FlashMode.OFF
                         updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
                     }
                     session.configure(config)
@@ -1952,9 +2030,11 @@ class MainActivity : Activity(), SensorEventListener {
                     depthSupportLevel == 1 -> Config.DepthMode.RAW_DEPTH_ONLY
                     else -> Config.DepthMode.DISABLED
                 }
-                if (cfg.planeFindingMode != target || cfg.depthMode != targetDepth) {
+                val targetFlash = if (torchEnabled) Config.FlashMode.TORCH else Config.FlashMode.OFF
+                if (cfg.planeFindingMode != target || cfg.depthMode != targetDepth || cfg.flashMode != targetFlash) {
                     cfg.planeFindingMode = target
                     cfg.depthMode = targetDepth
+                    cfg.flashMode = targetFlash
                     session.configure(cfg)
                 }
             } catch (t: Throwable) {
@@ -2110,6 +2190,13 @@ class MainActivity : Activity(), SensorEventListener {
                     CaptureRequest.CONTROL_AF_MODE,
                     CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
                 )
+                set(
+                    CaptureRequest.FLASH_MODE,
+                    if (torchEnabled) CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF
+                )
+            }
+            synchronized(sessionLock) {
+                fallbackReqBuilder = req
             }
             @Suppress("DEPRECATION")
             device.createCaptureSession(
@@ -2156,6 +2243,7 @@ class MainActivity : Activity(), SensorEventListener {
             captureSession?.close()
         } catch (_: Throwable) {}
         captureSession = null
+        fallbackReqBuilder = null
 
         try {
             cameraDevice?.close()
@@ -2493,8 +2581,8 @@ class MainActivity : Activity(), SensorEventListener {
                                 // - Locked Mode:    2.0Hz (500ms), TRUE LOCK — ignores wobble & unscanned space, 3-tick confirm!
                                 val depthIntervalNs = if (scanTurbo) 110_000_000L else 500_000_000L
                                 if (roomScanMode > 0 && valid && depthSupportLevel > 0 && nowNs - lastRawDepthNs >= depthIntervalNs) {
-                                    val maxAngVel = if (scanTurbo) 1.15f else 0.85f
-                                    val maxLinVel = if (scanTurbo) 1.10f else 0.80f
+                                    val maxAngVel = if (scanTurbo) 1.50f else 1.00f
+                                    val maxLinVel = if (scanTurbo) 1.35f else 0.90f
                                     if (camAngSpeedRadS > maxAngVel || camLinSpeedMS > maxLinVel) {
                                         // Motion-blur / fast-pan protection: skip blurred frame so mid-air ghosts NEVER spawn!
                                         blurSkipActive = true

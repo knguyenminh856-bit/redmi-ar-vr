@@ -17,8 +17,8 @@ pub const MAX_POLY_VERTS: usize = 24;
 pub const MAX_MESH_VERTICES: usize = 90_000; // 30,000 crisp conformal triangles (~4.68 MB VBO, sorted nearest-first)
 pub const MAX_RENDER_RADIUS_M: f32 = 6.0;
 
-pub const MESH_MIN_WEIGHT: u8 = 42; // Static lock: requires 3-5 independent depth frames so blur/air ghosts never lock
-pub const LOCK_CHANGE_CONFIRM: u8 = 3; // Locked/Maintain mode requires 3 consecutive ticks (~1.5s) of real change before mutating TSDF
+pub const MESH_MIN_WEIGHT: u8 = 28; // Locks in 2 frames high-conf / 3-4 frames smooth anchored interior; rejects 1-frame noise
+pub const LOCK_CHANGE_CONFIRM: u8 = 3; // Locked mode requires 3 consecutive ticks (~1.5s) of real change before mutating TSDF
 
 const TRI_MESH_VERT: &str = r#"#version 300 es
 precision highp float;
@@ -288,28 +288,20 @@ fn surface_rgb(kind: SurfaceKind) -> [f32; 3] {
     }
 }
 
-/// Colors conformal TSDF triangles by real 3D normal & height so floors, tabletops, and curved objects read clearly.
-fn tsdf_surface_color(pos: Vec3, normal: Vec3, floor_y: Option<f32>) -> [f32; 4] {
-    let ny = normal.y;
-    if ny >= 0.76 {
-        if let Some(fy) = floor_y {
-            if (pos.y - fy).abs() <= 0.16 {
-                return [0.14, 0.86, 0.92, 0.18]; // Floor: cyan
-            }
-        }
-        return [1.00, 0.74, 0.26, 0.22]; // Horizontal object/table top: warm amber-gold
+/// Colors Tier-2 high-detail TSDF object triangles clearly by 3D curvature so intricate/curved objects
+/// stand out sharply from smooth object faces and from Tier-1 cool cyan/blue flat Floors & Walls!
+fn tsdf_detail_color(curv: f32, normal: Vec3) -> [f32; 4] {
+    if curv >= 0.095 {
+        // High-detail edges, curved objects, mugs, laptop bezels, chair contours: vivid amber-gold
+        let t = ((curv - 0.095) / 0.22).clamp(0.0, 1.0);
+        [1.00, 0.72 - 0.24 * t, 0.18 + 0.08 * (1.0 - t), 0.26]
+    } else if normal.y >= 0.78 {
+        // Elevated horizontal detail tops (desk top, book, keyboard, chair seat): warm mint-gold
+        [0.42, 0.94, 0.56, 0.21]
+    } else {
+        // Smooth detail object sides / protruding entities: crisp emerald-teal
+        [0.12, 0.90, 0.68, 0.20]
     }
-    if ny <= -0.76 {
-        return [0.56, 0.64, 0.96, 0.16]; // Underside / ceiling: soft indigo
-    }
-    // Vertical / curved real-world entities (cups, laptops, chairs, walls, boxes): crisp emerald-teal
-    let horiz_tint = (normal.x * 0.5 + 0.5).clamp(0.0, 1.0);
-    [
-        0.14 + 0.14 * horiz_tint,
-        0.88 - 0.10 * horiz_tint,
-        0.74 + 0.20 * (1.0 - horiz_tint),
-        0.22,
-    ]
 }
 
 fn push_mesh_tri(
@@ -452,6 +444,65 @@ fn read_depth_mm(
         return 0;
     }
     u16::from_le_bytes([depth_bytes[off], depth_bytes[off + 1]])
+}
+
+#[inline]
+fn read_conf_u8(
+    cb: &[u8],
+    x: usize,
+    y: usize,
+    dw: usize,
+    dh: usize,
+    cw: usize,
+    ch: usize,
+    c_row_stride: usize,
+    c_pix_stride: usize,
+) -> u8 {
+    if cw == 0 || ch == 0 {
+        return 0;
+    }
+    let cx_i = (x * cw / dw).min(cw - 1);
+    let cy_i = (y * ch / dh).min(ch - 1);
+    let off = cy_i * c_row_stride + cx_i * c_pix_stride;
+    if off < cb.len() { cb[off] } else { 0 }
+}
+
+/// Checks if a smooth dense-depth pixel sits inside a REAL object anchored to confident stereo edges
+/// (sampling a fast ±2px / ±4px cross in `RawDepthConfidenceImage`), while still rejecting empty mid-air voids!
+#[allow(clippy::too_many_arguments)]
+fn max_nearby_conf(
+    cb: &[u8],
+    x: usize,
+    y: usize,
+    dw: usize,
+    dh: usize,
+    cw: usize,
+    ch: usize,
+    c_row_stride: usize,
+    c_pix_stride: usize,
+) -> u8 {
+    let mut best = 0u8;
+    for (dx, dy) in [
+        (-2isize, 0isize),
+        (2, 0),
+        (0, -2),
+        (0, 2),
+        (-4, 0),
+        (4, 0),
+        (0, -4),
+        (0, 4),
+    ] {
+        let nx = (x as isize + dx).clamp(0, (dw - 1) as isize) as usize;
+        let ny = (y as isize + dy).clamp(0, (dh - 1) as isize) as usize;
+        let c = read_conf_u8(cb, nx, ny, dw, dh, cw, ch, c_row_stride, c_pix_stride);
+        if c > best {
+            best = c;
+            if best >= 60 {
+                return best;
+            }
+        }
+    }
+    best
 }
 
 impl SpatialMeshMap {
@@ -689,9 +740,26 @@ impl SpatialMeshMap {
 
         if changed {
             self.coalesce_overlapping_planes(cam_y, floor_y);
-            if !self.has_dense_depth {
-                self.mesh_gen = self.mesh_gen.wrapping_add(1);
+            // Mark chunks touching structural Floor/Wall/Ceiling planes dirty so flat micro-tris yield cleanly to Tier-1 planes
+            for (&ckey, chunk) in &mut self.chunks {
+                if chunk.tris.is_empty() {
+                    continue;
+                }
+                let span = CHUNK_DIM as f32 * CELL_SIZE;
+                let cc = Vec3::new(
+                    (ckey.0 as f32 + 0.5) * span,
+                    (ckey.1 as f32 + 0.5) * span,
+                    (ckey.2 as f32 + 0.5) * span,
+                );
+                let touches_struct = self.planes.iter().any(|p| {
+                    matches!(p.kind, SurfaceKind::Floor | SurfaceKind::Wall | SurfaceKind::Ceiling)
+                        && (cc - p.pos).dot(p.normal).abs() <= span * 0.70
+                });
+                if touches_struct {
+                    chunk.dirty = true;
+                }
             }
+            self.mesh_gen = self.mesh_gen.wrapping_add(1);
         }
     }
 
@@ -1065,15 +1133,41 @@ impl SpatialMeshMap {
         carved
     }
 
-    /// Primary Conformal 3D Object Scanner: ingests ARCore 16-bit Dense Depth (`AUTOMATIC` or `RAW_DEPTH_ONLY`)
+    /// Returns `true` if `pos` sits flush (`±4.2cm`) on a Tier-1 flat structural Floor, Wall, or Ceiling plane
+    /// (never Tables/Seats/Objects!). Used to separate sleek low-poly walls/floors from high-detail 3.5cm TSDF objects.
+    fn is_flush_structural_plane(&self, pos: Vec3, opt_normal: Option<Vec3>) -> bool {
+        self.planes.iter().any(|p| {
+            if !matches!(
+                p.kind,
+                SurfaceKind::Floor | SurfaceKind::Wall | SurfaceKind::Ceiling
+            ) {
+                return false;
+            }
+            if let Some(n) = opt_normal {
+                if n.dot(p.normal) < 0.85 {
+                    return false;
+                }
+            }
+            let rel = pos - p.pos;
+            if rel.dot(p.normal).abs() > 0.042 {
+                return false;
+            }
+            let lx = rel.dot(p.rot * Vec3::X).abs();
+            let lz = rel.dot(p.rot * Vec3::Z).abs();
+            lx <= p.extent_x * 0.52 + 0.04 && lz <= p.extent_z * 0.52 + 0.04
+        })
+    }
+
+    /// Primary Two-Tier Conformal 3D Object Scanner: ingests ARCore 16-bit Dense Depth (`AUTOMATIC` or `RAW_DEPTH_ONLY`)
     /// directly using official `cam.imageIntrinsics` + `cam.pose` sensor-space unprojection.
     ///
-    /// - **Anti-Ghost Defenses:** rejects low-confidence inpainted air (`conf < 65` Turbo / `conf < 120` Locked),
-    ///   rejects `±1px` & `±2px` silhouette depth jumps & hole borders, restricts accurate range to `0.30m..2.85m`,
-    ///   and requires `MESH_MIN_WEIGHT >= 42` (3-5 independent depth frames).
-    /// - **`turbo == true` (`⚡ Quét mạnh`)**: continuous high-density 3.5cm TSDF fusion.
-    /// - **`turbo == false` (`🔒 Khóa / Duy trì`)**: TRUE LOCK — never scans unscanned space, ignores `±11cm` depth
-    ///   wobble (`0` writes!), and requires `3` consecutive confirmed change ticks before adding/removing an object.
+    /// - **Two-Tier Region Split:** Flat low-curvature pixels flush on canonical Floors/Walls/Ceilings yield to sleek
+    ///   Tier-1 architectural planes (while still carving empty air in front); protruding / high-curvature object regions
+    ///   (cups, laptops, chairs, tables, corners) fuse into crisp `3.5cm` Tier-2 TSDF Surface Nets!
+    /// - **Neighborhood-Anchored Soft Confidence:** accepts smooth object interiors anchored within `±4px` to confident
+    ///   stereo edges (`>=35`) while rejecting unanchored `conf=0` mid-air voids!
+    /// - **`turbo == false` (`🔒 Khóa`)**: TRUE LOCK — ignores `±11cm` depth wobble, never scans unscanned directions,
+    ///   and requires 3 consecutive confirmed change ticks before mutating TSDF.
     #[allow(clippy::too_many_arguments)]
     pub fn ingest_depth_map(
         &mut self,
@@ -1113,9 +1207,6 @@ impl SpatialMeshMap {
 
         if conf_bytes.is_some() {
             self.has_seen_conf = true;
-        } else if self.has_seen_conf {
-            // Device provides confidence maps: skip unverified frames so inpainted air never leaks in
-            return DepthIngestStats::default();
         }
 
         self.tick_gen = self.tick_gen.wrapping_add(1);
@@ -1130,16 +1221,9 @@ impl SpatialMeshMap {
         let cy_d = cy * sy;
 
         let step_px = stride.clamp(1, 4);
-        let pad_x = (dw / 20).max(3);
-        let pad_y = (dh / 20).max(3);
-        let max_depth_m = if turbo { 2.85f32 } else { 2.65f32 };
-        let min_conf: u8 = if !turbo {
-            120
-        } else if is_raw_only {
-            95
-        } else {
-            65
-        };
+        let pad_x = (dw / 24).max(2);
+        let pad_y = (dh / 24).max(2);
+        let max_depth_m = if turbo { 2.95f32 } else { 2.75f32 };
 
         let mut stats = DepthIngestStats::default();
         let mut border_flips: Vec<((i32, i32, i32), usize, usize, usize)> = Vec::with_capacity(256);
@@ -1149,33 +1233,54 @@ impl SpatialMeshMap {
             let mut x = pad_x;
             while x + pad_x < dw {
                 let d_mm = read_depth_mm(depth_bytes, x, y, d_row_stride, d_pix_stride);
-                if (300..=2850).contains(&d_mm) {
+                if (260..=2950).contains(&d_mm) {
                     let dm = d_mm as f32 * 0.001;
                     if dm <= max_depth_m {
-                        let conf_u8 = if let Some(cb) = conf_bytes {
-                            if cw > 0 && ch > 0 {
-                                let cx_i = (x * cw / dw).min(cw - 1);
-                                let cy_i = (y * ch / dh).min(ch - 1);
-                                let off = cy_i * c_row_stride + cx_i * c_pix_stride;
-                                if off < cb.len() {
-                                    cb[off]
+                        // Neighborhood-anchored soft confidence: wraps real smooth objects cleanly while blocking mid-air voids!
+                        let (conf_ok, base_w, allow_carve) = if let Some(cb) = conf_bytes {
+                            let c0 = read_conf_u8(cb, x, y, dw, dh, cw, ch, c_row_stride, c_pix_stride);
+                            if !turbo {
+                                if c0 >= 65 {
+                                    (true, 18.0f32, true)
+                                } else if c0 >= 30
+                                    && max_nearby_conf(cb, x, y, dw, dh, cw, ch, c_row_stride, c_pix_stride) >= 75
+                                {
+                                    (true, 14.0f32, true)
                                 } else {
-                                    0
+                                    (false, 0.0f32, false)
                                 }
+                            } else if is_raw_only {
+                                if c0 >= 65 {
+                                    (true, if c0 >= 130 { 18.0 } else { 13.0 }, c0 >= 85)
+                                } else {
+                                    (false, 0.0f32, false)
+                                }
+                            } else if c0 >= 95 {
+                                (true, 18.0f32, true)
+                            } else if c0 >= 35 {
+                                (true, 12.0f32, true)
                             } else {
-                                0
+                                let nb_c = max_nearby_conf(cb, x, y, dw, dh, cw, ch, c_row_stride, c_pix_stride);
+                                if nb_c >= 35 {
+                                    // Smooth object interior anchored to nearby confident stereo edge
+                                    (true, 9.5f32, nb_c >= 80)
+                                } else {
+                                    // Unanchored conf=0 void (blank mid-air hallucination) -> REJECT!
+                                    (false, 0.0f32, false)
+                                }
                             }
                         } else {
-                            160
+                            // Alternate ARCore frames when RawDepthConfidence throws NotYetAvailableException:
+                            // still fuse smooth depth gently (needs 3 independent frames to reach MESH_MIN_WEIGHT=28)
+                            (true, 10.5f32, true)
                         };
 
-                        // Strict anti-ghost gate: reject low-confidence inpainted/blurred mid-air guesses!
-                        if conf_bytes.is_some() && conf_u8 < min_conf {
+                        if !conf_ok {
                             x += step_px;
                             continue;
                         }
 
-                        // ±1px AND ±2px silhouette discontinuity & hole-border guard (eliminates mid-air edge halos!)
+                        // Smart ±1px silhouette jump guard: removes spiderwebs while preserving mugs/bottles/chair legs!
                         let dl1 = read_depth_mm(depth_bytes, x - 1, y, d_row_stride, d_pix_stride);
                         let dr1 = read_depth_mm(depth_bytes, x + 1, y, d_row_stride, d_pix_stride);
                         let du1 = read_depth_mm(depth_bytes, x, y - 1, d_row_stride, d_pix_stride);
@@ -1184,23 +1289,13 @@ impl SpatialMeshMap {
                             x += step_px;
                             continue;
                         }
-                        let max_jump_1 = ((d_mm as f32) * 0.060).clamp(35.0, 110.0) as i32;
-                        let edge_1 = (dl1 as i32 - d_mm as i32).abs() > max_jump_1
-                            || (dr1 as i32 - d_mm as i32).abs() > max_jump_1
-                            || (du1 as i32 - d_mm as i32).abs() > max_jump_1
-                            || (dd1 as i32 - d_mm as i32).abs() > max_jump_1;
+                        let max_jump = ((d_mm as f32) * 0.085).clamp(55.0, 160.0) as i32;
+                        let edge_jump = (dl1 as i32 - d_mm as i32).abs() > max_jump
+                            || (dr1 as i32 - d_mm as i32).abs() > max_jump
+                            || (du1 as i32 - d_mm as i32).abs() > max_jump
+                            || (dd1 as i32 - d_mm as i32).abs() > max_jump;
 
-                        let dl2 = read_depth_mm(depth_bytes, x - 2, y, d_row_stride, d_pix_stride);
-                        let dr2 = read_depth_mm(depth_bytes, x + 2, y, d_row_stride, d_pix_stride);
-                        let du2 = read_depth_mm(depth_bytes, x, y - 2, d_row_stride, d_pix_stride);
-                        let dd2 = read_depth_mm(depth_bytes, x, y + 2, d_row_stride, d_pix_stride);
-                        let max_jump_2 = ((d_mm as f32) * 0.105).clamp(60.0, 175.0) as i32;
-                        let edge_2 = (dl2 > 0 && (dl2 as i32 - d_mm as i32).abs() > max_jump_2)
-                            || (dr2 > 0 && (dr2 as i32 - d_mm as i32).abs() > max_jump_2)
-                            || (du2 > 0 && (du2 as i32 - d_mm as i32).abs() > max_jump_2)
-                            || (dd2 > 0 && (dd2 as i32 - d_mm as i32).abs() > max_jump_2);
-
-                        if !edge_1 && !edge_2 {
+                        if !edge_jump {
                             // Exact ARCore pinhole unprojection in `cam.pose` sensor frame (+X right, +Y up, -Z forward)
                             let p_cam = Vec3::new(
                                 (x as f32 - cx_d) / fx_d * dm,
@@ -1209,27 +1304,21 @@ impl SpatialMeshMap {
                             );
                             let world_vec = rot * p_cam;
                             let dist = world_vec.length();
-                            if dist >= 0.30 && dist.is_finite() {
+                            if dist >= 0.26 && dist.is_finite() {
                                 let dir = world_vec / dist;
                                 let hit_world = cam_pos + world_vec;
                                 stats.valid_rays += 1;
 
-                                let base_w = if conf_bytes.is_some() {
-                                    if conf_u8 >= 175 {
-                                        20.0f32
-                                    } else if conf_u8 >= 120 {
-                                        14.0f32
-                                    } else {
-                                        9.0f32
-                                    }
-                                } else {
-                                    16.0f32
-                                };
+                                // Local depth 2nd-derivative curvature (mm): separates flat wall/floor patches from detailed objects
+                                let curv_mm = (dl1 as i32 + dr1 as i32 - 2 * d_mm as i32).abs()
+                                    + (du1 as i32 + dd1 as i32 - 2 * d_mm as i32).abs();
+                                let flat_structural = curv_mm < 16
+                                    && self.is_flush_structural_plane(hit_world, None);
 
                                 if turbo {
-                                    // TURBO CONTINUOUS SCAN: fuse high-confidence rays into the 3.5cm TSDF volume
+                                    // TURBO CONTINUOUS SCAN: carve empty air along sightline, then fuse HIGH-DETAIL regions into TSDF
                                     stats.changed_rays += 1;
-                                    if conf_u8 >= 110 || conf_bytes.is_none() {
+                                    if allow_carve {
                                         stats.updated_voxels += self.carve_free_space_ray(
                                             cam_pos,
                                             dir,
@@ -1240,37 +1329,57 @@ impl SpatialMeshMap {
                                             &mut border_flips,
                                         );
                                     }
-                                    stats.updated_voxels += self.integrate_surface_band(
-                                        cam_pos,
-                                        dir,
-                                        dist,
-                                        base_w,
-                                        gen,
-                                        &mut border_flips,
-                                    );
+                                    if !flat_structural {
+                                        stats.updated_voxels += self.integrate_surface_band(
+                                            cam_pos,
+                                            dir,
+                                            dist,
+                                            base_w,
+                                            gen,
+                                            &mut border_flips,
+                                        );
+                                    }
                                 } else {
-                                    // TRUE LOCK & MAINTAIN MODE:
-                                    // 1. If depth matches an existing locked surface within ±11cm -> DO NOTHING!
-                                    if self.match_locked_surface_along_ray(cam_pos, dir, dist) {
+                                    // TRUE LOCK MODE:
+                                    // 1. If depth matches an existing locked TSDF surface (or flat structural plane) -> DO NOTHING!
+                                    if flat_structural || self.match_locked_surface_along_ray(cam_pos, dir, dist) {
+                                        // Even if hitting a flat wall behind a removed object, still allow 3-tick carving in front!
+                                        if flat_structural && allow_carve {
+                                            let carved = self.carve_free_space_ray(
+                                                cam_pos,
+                                                dir,
+                                                dist,
+                                                34.0,
+                                                true,
+                                                gen,
+                                                &mut border_flips,
+                                            );
+                                            if carved > 0 {
+                                                stats.changed_rays += 1;
+                                                stats.updated_voxels += carved;
+                                            }
+                                        }
                                         x += step_px;
                                         continue;
                                     }
-                                    // 2. Check if an old locked object in front of `dist` was removed (needs 3+ ticks!)
-                                    let carved = self.carve_free_space_ray(
-                                        cam_pos,
-                                        dir,
-                                        dist,
-                                        34.0,
-                                        true,
-                                        gen,
-                                        &mut border_flips,
-                                    );
-                                    if carved > 0 {
-                                        stats.changed_rays += 1;
-                                        stats.updated_voxels += carved;
+                                    // 2. Check if an old locked object in front of `dist` was removed (needs 3+ consecutive ticks!)
+                                    if allow_carve {
+                                        let carved = self.carve_free_space_ray(
+                                            cam_pos,
+                                            dir,
+                                            dist,
+                                            34.0,
+                                            true,
+                                            gen,
+                                            &mut border_flips,
+                                        );
+                                        if carved > 0 {
+                                            stats.changed_rays += 1;
+                                            stats.updated_voxels += carved;
+                                        }
                                     }
-                                    // 3. ONLY add a new object if a locked surface exists BEHIND it (inside mapped room)
-                                    //    AND the new object stays stationary for 3+ consecutive ticks!
+                                    // 3. ONLY add a new object if a locked surface (TSDF or Floor/Wall) exists BEHIND it
+                                    //    AND it stays stationary for 3+ consecutive ticks!
                                     if self.has_locked_surface_behind(cam_pos, dir, dist) {
                                         let (gx, gy, gz) = Self::world_to_cell(hit_world);
                                         let (ckey, lx, ly, lz) = Self::split_cell(gx, gy, gz);
@@ -1288,7 +1397,7 @@ impl SpatialMeshMap {
                                                 cam_pos,
                                                 dir,
                                                 dist,
-                                                24.0,
+                                                22.0,
                                                 gen,
                                                 &mut border_flips,
                                             );
@@ -1581,14 +1690,17 @@ impl SpatialMeshMap {
             }
         }
 
-        // Step B: Gentle 20% Laplacian polish on interior dual vertices (smooths depth ripple while keeping crisp object edges)
+        // Step B: Gentle 20% Laplacian polish + local 3D curvature estimation (separates high-detail edges from flat patches)
         let mut smooth_pos = dual_pos.clone();
+        let mut dual_curv = vec![0.0f32; D_VOL];
         for ly in 1..(D - 1) {
             for lz in 1..(D - 1) {
                 for lx in 1..(D - 1) {
                     let di = d_idx(lx, ly, lz);
                     let Some(cur) = dual_pos[di] else { continue };
+                    let n_cur = dual_norm[di];
                     let mut nb_sum = Vec3::ZERO;
+                    let mut curv_sum = 0.0f32;
                     let mut nb_cnt = 0u32;
                     for (ox, oy, oz) in [
                         (-1isize, 0, 0),
@@ -1605,11 +1717,13 @@ impl SpatialMeshMap {
                         );
                         if let Some(np) = dual_pos[ni] {
                             nb_sum += np;
+                            curv_sum += (1.0 - n_cur.dot(dual_norm[ni])).clamp(0.0, 1.0);
                             nb_cnt += 1;
                         }
                     }
                     if nb_cnt >= 2 {
                         smooth_pos[di] = Some(cur * 0.80 + (nb_sum / nb_cnt as f32) * 0.20);
+                        dual_curv[di] = curv_sum / (nb_cnt as f32);
                     }
                 }
             }
@@ -1617,6 +1731,7 @@ impl SpatialMeshMap {
 
         // Step C: Stitch single-sided outward-CCW quads across locked primal sign-changing edges (+X, +Y, +Z)
         let mut tris = Vec::with_capacity((chunk.surface_count as usize) * 6);
+        let _ = floor_y;
 
         for ly in 0..CHUNK_DIM {
             for lz in 0..CHUNK_DIM {
@@ -1626,7 +1741,7 @@ impl SpatialMeshMap {
                     if w0 < MESH_MIN_WEIGHT {
                         continue;
                     }
-                    // Anti-floater dust filter: strip isolated 1-voxel mid-air specks (< 2 locked surface neighbors)
+                    // Anti-floater dust filter: strip isolated 1-voxel specks (0 locked surface neighbors)
                     let mut nb_surf = 0u8;
                     for (ox, oy, oz) in [
                         (0usize, 1usize, 1usize),
@@ -1641,7 +1756,7 @@ impl SpatialMeshMap {
                             nb_surf += 1;
                         }
                     }
-                    if nb_surf < 2 {
+                    if nb_surf < 1 {
                         continue;
                     }
                     let t0 = h_tsdf[hi0];
@@ -1666,11 +1781,15 @@ impl SpatialMeshMap {
                             } else {
                                 Vec3::NEG_X
                             };
-                            let col = tsdf_surface_color((p0 + p2) * 0.5, n, floor_y);
-                            if s0_solid {
-                                push_mesh_quad(&mut tris, p0, p1, p2, p3, n, col);
-                            } else {
-                                push_mesh_quad(&mut tris, p0, p3, p2, p1, n, col);
+                            let mid = (p0 + p2) * 0.5;
+                            let curv = (dual_curv[i0] + dual_curv[i1] + dual_curv[i2] + dual_curv[i3]) * 0.25;
+                            if curv >= 0.085 || !self.is_flush_structural_plane(mid, Some(n)) {
+                                let col = tsdf_detail_color(curv, n);
+                                if s0_solid {
+                                    push_mesh_quad(&mut tris, p0, p1, p2, p3, n, col);
+                                } else {
+                                    push_mesh_quad(&mut tris, p0, p3, p2, p1, n, col);
+                                }
                             }
                         }
                     }
@@ -1694,11 +1813,15 @@ impl SpatialMeshMap {
                             } else {
                                 Vec3::NEG_Y
                             };
-                            let col = tsdf_surface_color((p0 + p2) * 0.5, n, floor_y);
-                            if s0_solid {
-                                push_mesh_quad(&mut tris, p0, p1, p2, p3, n, col);
-                            } else {
-                                push_mesh_quad(&mut tris, p0, p3, p2, p1, n, col);
+                            let mid = (p0 + p2) * 0.5;
+                            let curv = (dual_curv[i0] + dual_curv[i1] + dual_curv[i2] + dual_curv[i3]) * 0.25;
+                            if curv >= 0.085 || !self.is_flush_structural_plane(mid, Some(n)) {
+                                let col = tsdf_detail_color(curv, n);
+                                if s0_solid {
+                                    push_mesh_quad(&mut tris, p0, p1, p2, p3, n, col);
+                                } else {
+                                    push_mesh_quad(&mut tris, p0, p3, p2, p1, n, col);
+                                }
                             }
                         }
                     }
@@ -1722,11 +1845,15 @@ impl SpatialMeshMap {
                             } else {
                                 Vec3::NEG_Z
                             };
-                            let col = tsdf_surface_color((p0 + p2) * 0.5, n, floor_y);
-                            if s0_solid {
-                                push_mesh_quad(&mut tris, p0, p1, p2, p3, n, col);
-                            } else {
-                                push_mesh_quad(&mut tris, p0, p3, p2, p1, n, col);
+                            let mid = (p0 + p2) * 0.5;
+                            let curv = (dual_curv[i0] + dual_curv[i1] + dual_curv[i2] + dual_curv[i3]) * 0.25;
+                            if curv >= 0.085 || !self.is_flush_structural_plane(mid, Some(n)) {
+                                let col = tsdf_detail_color(curv, n);
+                                if s0_solid {
+                                    push_mesh_quad(&mut tris, p0, p1, p2, p3, n, col);
+                                } else {
+                                    push_mesh_quad(&mut tris, p0, p3, p2, p1, n, col);
+                                }
                             }
                         }
                     }
@@ -1849,15 +1976,16 @@ impl SpatialMeshMap {
         out
     }
 
-    /// Builds exact visible Triangle Mesh VBO:
-    /// - Prioritizes **closest-first conformal TSDF chunks** wrapping real objects tightly with ZERO stacked ARCore planes on top.
-    /// - Falls back to merged ARCore planes ONLY before dense depth arrives (or on devices without Depth API).
+    /// Builds Two-Tier Triangle Mesh VBO returning `(active_chunks, detail_object_tris, structural_plane_tris)`:
+    /// - **Tier 2 (High-Detail Objects):** Nearest-first `3.5cm` TSDF Surface Nets (emerald/gold, up to `82,000` verts).
+    /// - **Tier 1 (Flat Structural Floors / Walls / Ceilings):** Clean coarse architectural triangles (cyan/blue, recessed `-6mm`
+    ///   for zero Z-fighting where objects touch the floor/wall). Never stacks Table planes over TSDF objects!
     pub fn build_triangle_mesh_buffer(
         &self,
         cam_pos: Vec3,
         cam_fwd: Vec3,
         out: &mut Vec<TriMeshVertex>,
-    ) -> (u32, u32) {
+    ) -> (u32, u32, u32) {
         out.clear();
 
         let chunk_span = CHUNK_DIM as f32 * CELL_SIZE;
@@ -1885,33 +2013,43 @@ impl SpatialMeshMap {
         // Nearest-first sort ensures objects right in front of the user ALWAYS get full vertex priority!
         visible_chunks.sort_by(|a, b| a.0.total_cmp(&b.0));
 
+        let detail_vert_cap = MAX_MESH_VERTICES.saturating_sub(8_000);
         let mut active_chunks = 0u32;
         for (_, chunk) in visible_chunks {
             active_chunks += 1;
-            let remain = MAX_MESH_VERTICES.saturating_sub(out.len());
+            let remain = detail_vert_cap.saturating_sub(out.len());
             let copy_n = (chunk.tris.len().min(remain) / 3) * 3;
             if copy_n > 0 {
                 out.extend_from_slice(&chunk.tris[..copy_n]);
             }
-            if out.len() + 3 > MAX_MESH_VERTICES {
+            if out.len() + 3 > detail_vert_cap {
                 break;
             }
         }
+        let detail_verts = out.len();
 
-        // Only draw canonical flat planes if TSDF dense mesh hasn't populated yet (no stacked planes on top of TSDF!)
-        if !self.has_dense_depth && out.len() < 30 {
-            for plane in &self.planes {
-                if out.len() + 600 > MAX_MESH_VERTICES {
-                    break;
-                }
-                if (plane.pos - cam_pos).length() > MAX_RENDER_RADIUS_M + plane.bounding_radius() {
-                    continue;
-                }
-                triangulate_canonical_plane(plane, out);
+        // Tier 1: Always draw clean coarse Floor / Wall / Ceiling structural sheets (zero stacking with Table planes!)
+        let include_non_structural_fallback = !self.has_dense_depth && detail_verts < 30;
+        for plane in &self.planes {
+            let is_structural = matches!(
+                plane.kind,
+                SurfaceKind::Floor | SurfaceKind::Wall | SurfaceKind::Ceiling
+            );
+            if !is_structural && !include_non_structural_fallback {
+                continue;
             }
+            if out.len() + 600 > MAX_MESH_VERTICES {
+                break;
+            }
+            if (plane.pos - cam_pos).length() > MAX_RENDER_RADIUS_M + plane.bounding_radius() {
+                continue;
+            }
+            triangulate_canonical_plane(plane, out);
         }
 
-        (active_chunks, (out.len() / 3) as u32)
+        let detail_tris = (detail_verts / 3) as u32;
+        let plane_tris = ((out.len() - detail_verts) / 3) as u32;
+        (active_chunks, detail_tris, plane_tris)
     }
 
     /// Exports active TSDF narrow-band voxels (`weight >= MESH_MIN_WEIGHT && |tsdf| <= 118`) for `.arroom` v2 persistence.
@@ -2014,7 +2152,8 @@ impl SpatialMeshMap {
     }
 }
 
-/// Adaptive multi-ring triangulation (~24cm ring spacing) used for fallback planes when no Depth API exists.
+/// Clean coarse architectural triangulation (`~38cm` ring spacing, subtle cool fill, `-6mm` recessed
+/// so Tier-2 high-detail objects sitting on the floor or leaning against walls NEVER Z-fight!).
 pub fn triangulate_canonical_plane(plane: &CanonicalPlane, out: &mut Vec<TriMeshVertex>) {
     let n = plane.polygon_xz.len();
     if n < 3 {
@@ -2023,9 +2162,24 @@ pub fn triangulate_canonical_plane(plane: &CanonicalPlane, out: &mut Vec<TriMesh
     let ax_x = plane.rot * Vec3::X;
     let ax_z = plane.rot * Vec3::Z;
     let normal = plane.normal;
-    let origin = plane.pos + normal * 0.002;
+    let is_structural = matches!(
+        plane.kind,
+        SurfaceKind::Floor | SurfaceKind::Wall | SurfaceKind::Ceiling
+    );
+    // Slight -6mm recess on Floor/Wall/Ceiling keeps Tier-2 detail objects visually crisp in front
+    let origin = if is_structural {
+        plane.pos - normal * 0.006
+    } else {
+        plane.pos + normal * 0.002
+    };
     let rgb = surface_rgb(plane.kind);
-    let col = [rgb[0], rgb[1], rgb[2], 0.16];
+    let alpha = match plane.kind {
+        SurfaceKind::Floor => 0.085,
+        SurfaceKind::Wall => 0.095,
+        SurfaceKind::Ceiling => 0.065,
+        _ => 0.14,
+    };
+    let col = [rgb[0], rgb[1], rgb[2], alpha];
 
     let mut cx = 0.0f32;
     let mut cz = 0.0f32;
@@ -2043,7 +2197,8 @@ pub fn triangulate_canonical_plane(plane: &CanonicalPlane, out: &mut Vec<TriMesh
         .sum::<f32>()
         / (n as f32);
 
-    let rings = ((avg_r / 0.24).ceil() as usize).clamp(1, 5);
+    let ring_step = if is_structural { 0.38 } else { 0.24 };
+    let rings = ((avg_r / ring_step).ceil() as usize).clamp(1, 4);
     let to_world = |x: f32, z: f32| origin + ax_x * x + ax_z * z;
     let center_w = to_world(cx, cz);
 
@@ -2275,8 +2430,8 @@ mod tests {
         assert_eq!(map.planes[0].kind, SurfaceKind::Floor);
 
         let mut verts = Vec::new();
-        let (_, tris) = map.build_triangle_mesh_buffer(Vec3::ZERO, Vec3::NEG_Z, &mut verts);
-        assert!(tris >= 16);
+        let (_, _, plane_tris) = map.build_triangle_mesh_buffer(Vec3::ZERO, Vec3::NEG_Z, &mut verts);
+        assert!(plane_tris >= 8);
         assert_eq!(verts.len() % 3, 0);
     }
 
@@ -2366,7 +2521,7 @@ mod tests {
         assert!(rebuilt >= 1);
 
         let mut verts = Vec::new();
-        let (chunks, tris) = map.build_triangle_mesh_buffer(Vec3::ZERO, Vec3::NEG_Z, &mut verts);
+        let (chunks, tris, _plane_tris) = map.build_triangle_mesh_buffer(Vec3::ZERO, Vec3::NEG_Z, &mut verts);
         assert!(chunks >= 1);
         assert!(tris >= 40, "expected dense conformal triangles, got {}", tris);
 
@@ -2545,6 +2700,100 @@ mod tests {
             "removed object should be carved away: before={}, after={}",
             near_curved_obj,
             remaining_fg
+        );
+    }
+
+    #[test]
+    fn two_tier_separates_flat_wall_from_detail_object_and_smooth_anchored_interior_locks() {
+        let mut map = SpatialMeshMap::default();
+        // Register a canonical flat Wall plane at z = -2.0m (facing +Z toward camera)
+        let wall_rot = Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
+        map.ingest_ar_plane_polygons(
+            &[RawArPlane {
+                raw_type: 1,
+                pos: Vec3::new(0.0, 0.0, -2.0),
+                rot: wall_rot,
+                extent_x: 3.0,
+                extent_z: 2.4,
+                polygon_xz: vec![[-1.5, -1.2], [1.5, -1.2], [1.5, 1.2], [-1.5, 1.2]],
+            }],
+            0.0,
+        );
+        assert_eq!(map.canonical_plane_count(), 1);
+
+        let dw = 80usize;
+        let dh = 60usize;
+        let fx = 64.0f32;
+        let fy = 64.0f32;
+        let cx = 40.0f32;
+        let cy = 30.0f32;
+
+        // Protruding curved mug at z ~ -0.95m in front of the flat wall at z = -2.0m.
+        // Simulate realistic sparse ARCore RawDepthConfidence: high conf (160) on mug border, 0 on smooth mug center!
+        let depth = make_synthetic_depth_image(dw, dh, |x, y| {
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            if dx.abs() < 12.0 && dy.abs() < 12.0 {
+                (920.0 + (dx * dx) * 0.40) as u16
+            } else {
+                2000u16
+            }
+        });
+        let mut sparse_conf = vec![160u8; dw * dh];
+        for y in 0..dh {
+            for x in 0..dw {
+                let dx = (x as f32 - cx).abs();
+                let dy = (y as f32 - cy).abs();
+                // Smooth inner core of mug has conf = 0, but is anchored within ±4px to confident border!
+                if dx < 4.0 && dy < 4.0 {
+                    sparse_conf[y * dw + x] = 0;
+                }
+            }
+        }
+
+        for _ in 0..4 {
+            map.ingest_depth_map(
+                &depth,
+                dw,
+                dh,
+                dw * 2,
+                2,
+                Some(&sparse_conf),
+                dw,
+                dh,
+                dw,
+                1,
+                false,
+                fx,
+                fy,
+                cx,
+                cy,
+                dw,
+                dh,
+                Vec3::ZERO,
+                Quat::IDENTITY,
+                true,
+                1,
+            );
+        }
+        map.step_greedy_meshing(32);
+
+        let mut verts = Vec::new();
+        let (_, detail_tris, plane_tris) = map.build_triangle_mesh_buffer(Vec3::ZERO, Vec3::NEG_Z, &mut verts);
+        assert!(detail_tris >= 24, "detail object must build crisp TSDF tris, got {}", detail_tris);
+        assert!(plane_tris >= 8, "flat wall must stay sleek Tier-1 architectural plane, got {}", plane_tris);
+
+        // Almost ALL Tier-2 TSDF triangles should belong to the protruding mug (z > -1.3m), NOT the flat wall at z = -2.0m!
+        let detail_slice = &verts[..(detail_tris as usize) * 3];
+        let wall_micro_tris = detail_slice
+            .chunks_exact(3)
+            .filter(|tri| (tri[0].pos[2] + tri[1].pos[2] + tri[2].pos[2]) / 3.0 < -1.75)
+            .count();
+        assert!(
+            wall_micro_tris * 5 < detail_tris as usize,
+            "flat wall should not waste TSDF detail tris: wall_micro={}, detail={}",
+            wall_micro_tris,
+            detail_tris
         );
     }
 }
