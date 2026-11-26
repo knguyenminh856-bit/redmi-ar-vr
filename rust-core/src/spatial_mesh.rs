@@ -2,7 +2,7 @@ use crate::passthrough::compile_program;
 use crate::room_scanner::{
     classify_ar_plane, infer_floor_y, AabbCollider, PlaneMarker, SurfaceKind,
 };
-use glam::{Mat3, Mat4, Quat, Vec3};
+use glam::{Mat4, Quat, Vec3};
 use glow::HasContext;
 use std::collections::HashMap;
 use std::mem::size_of;
@@ -833,88 +833,238 @@ impl SpatialMeshMap {
             .reduce(f32::min)
     }
 
-    pub fn classify_surface_point(&self, pos: Vec3, normal: Vec3, cam_y: f32) -> SurfaceKind {
+    pub fn classify_surface_point(&self, _pos: Vec3, normal: Vec3, _cam_y: f32) -> SurfaceKind {
         let n = normal.normalize_or_zero();
-        if !pos.is_finite() || n.length_squared() < 1e-4 {
+        if n.length_squared() < 1e-4 {
             return SurfaceKind::Unknown;
         }
-        for p in &self.planes {
-            if p.normal.dot(n) < 0.80 {
-                continue;
-            }
-            let rel = pos - p.pos;
-            if rel.dot(p.normal).abs() > 0.12 {
-                continue;
-            }
-            let lx = rel.dot(p.rot * Vec3::X);
-            let lz = rel.dot(p.rot * Vec3::Z);
-            if lx.abs() <= p.extent_x * 0.55 + 0.10 && lz.abs() <= p.extent_z * 0.55 + 0.10 {
-                return p.kind;
-            }
-        }
-        let raw_type = if n.y >= 0.65 {
-            0
+        if n.y >= 0.65 {
+            SurfaceKind::Table
         } else if n.y <= -0.65 {
-            2
+            SurfaceKind::Ceiling
         } else {
-            1
-        };
-        let ext = if raw_type == 1 { 0.85 } else { 0.65 };
-        classify_ar_plane(raw_type, pos.y, ext, ext, cam_y, self.inferred_floor_y())
+            SurfaceKind::VerticalObject
+        }
     }
 
-    pub fn ensure_explicit_drop_patch(&mut self, pos: Vec3, normal: Vec3, cam_y: f32) -> SurfaceKind {
-        let n = normal.normalize_or_zero();
-        if !pos.is_finite() || n.length_squared() < 1e-4 {
-            return SurfaceKind::Unknown;
+    /// Reads normalized TSDF value `[-1.0..+1.0]` for cell `(gx, gy, gz)` ONLY if that voxel is locked
+    /// (`weight >= MESH_MIN_WEIGHT`) inside a chunk that actually has rendered triangles!
+    #[inline]
+    fn sample_locked_voxel_tsdf(&self, gx: i32, gy: i32, gz: i32) -> Option<f32> {
+        let (ckey, lx, ly, lz) = Self::split_cell(gx, gy, gz);
+        let chunk = self.chunks.get(&ckey)?;
+        if chunk.total_tris_len() == 0 {
+            return None;
         }
-        let kind = self.classify_surface_point(pos, n, cam_y);
-        if kind == SurfaceKind::Unknown {
-            return kind;
+        let idx = VoxelChunk::idx(lx, ly, lz);
+        if chunk.weight[idx] < MESH_MIN_WEIGHT {
+            return None;
         }
-        let already_covered = self.planes.iter().any(|old| {
-            if old.normal.dot(n) < 0.85 {
-                return false;
+        Some(chunk.tsdf[idx] as f32 / 127.0)
+    }
+
+    /// Computes smooth outward unit normal of the scanned TSDF isosurface at world point `p`.
+    fn sample_tsdf_gradient_normal(&self, p: Vec3) -> Vec3 {
+        let (gx, gy, gz) = Self::world_to_cell(p);
+        let center = self.sample_locked_voxel_tsdf(gx, gy, gz).unwrap_or(0.0);
+        let dx = match (
+            self.sample_locked_voxel_tsdf(gx + 1, gy, gz),
+            self.sample_locked_voxel_tsdf(gx - 1, gy, gz),
+        ) {
+            (Some(a), Some(b)) => a - b,
+            (Some(a), None) => (a - center) * 2.0,
+            (None, Some(b)) => (center - b) * 2.0,
+            (None, None) => 0.0,
+        };
+        let dy = match (
+            self.sample_locked_voxel_tsdf(gx, gy + 1, gz),
+            self.sample_locked_voxel_tsdf(gx, gy - 1, gz),
+        ) {
+            (Some(a), Some(b)) => a - b,
+            (Some(a), None) => (a - center) * 2.0,
+            (None, Some(b)) => (center - b) * 2.0,
+            (None, None) => 0.0,
+        };
+        let dz = match (
+            self.sample_locked_voxel_tsdf(gx, gy, gz + 1),
+            self.sample_locked_voxel_tsdf(gx, gy, gz - 1),
+        ) {
+            (Some(a), Some(b)) => a - b,
+            (Some(a), None) => (a - center) * 2.0,
+            (None, Some(b)) => (center - b) * 2.0,
+            (None, None) => 0.0,
+        };
+        Vec3::new(dx, dy, dz).normalize_or_zero()
+    }
+
+    /// Exact trilinear TSDF collision query for a rigid body sphere `(pos, radius)` against ONLY
+    /// real scanned geometry (`total_tris_len() > 0 && weight >= MESH_MIN_WEIGHT`).
+    /// Returns `Some((outward_normal, penetration))` when touching/penetrating a scanned surface,
+    /// or `None` in unscanned empty air (ZERO fake/auto-generated planes!).
+    pub fn sample_scanned_collision(&self, pos: Vec3, radius: f32) -> Option<(Vec3, f32)> {
+        if !pos.is_finite() || self.chunks.is_empty() {
+            return None;
+        }
+        let fx = pos.x / CELL_SIZE - 0.5;
+        let fy = pos.y / CELL_SIZE - 0.5;
+        let fz = pos.z / CELL_SIZE - 0.5;
+        let gx0 = fx.floor() as i32;
+        let gy0 = fy.floor() as i32;
+        let gz0 = fz.floor() as i32;
+        let tx = fx - gx0 as f32;
+        let ty = fy - gy0 as f32;
+        let tz = fz - gz0 as f32;
+
+        let mut sdf_sum = 0.0f32;
+        let mut w_sum = 0.0f32;
+        let mut valid_cnt = 0u32;
+        let mut grad = Vec3::ZERO;
+
+        for ox in 0..=1i32 {
+            let wx = if ox == 0 { 1.0 - tx } else { tx };
+            let sx = if ox == 0 { -1.0 } else { 1.0 };
+            for oy in 0..=1i32 {
+                let wy = if oy == 0 { 1.0 - ty } else { ty };
+                let sy = if oy == 0 { -1.0 } else { 1.0 };
+                for oz in 0..=1i32 {
+                    let wz = if oz == 0 { 1.0 - tz } else { tz };
+                    let sz = if oz == 0 { -1.0 } else { 1.0 };
+                    if let Some(s) = self.sample_locked_voxel_tsdf(gx0 + ox, gy0 + oy, gz0 + oz) {
+                        let w = wx * wy * wz;
+                        sdf_sum += s * w;
+                        w_sum += w;
+                        valid_cnt += 1;
+                        grad += Vec3::new(sx * wy * wz, sy * wx * wz, sz * wx * wy) * s;
+                    }
+                }
             }
-            let rel = pos - old.pos;
-            if rel.dot(old.normal).abs() > 0.10 {
-                return false;
+        }
+
+        if valid_cnt < 4 || w_sum < 0.35 {
+            return None;
+        }
+        let signed_dist = (sdf_sum / w_sum) * TSDF_TRUNC;
+        if signed_dist >= radius || signed_dist <= -0.062 {
+            return None;
+        }
+
+        let mut n = grad.normalize_or_zero();
+        if n.length_squared() < 1e-4 {
+            n = self.sample_tsdf_gradient_normal(pos);
+        }
+        if n.length_squared() < 1e-4 {
+            return None;
+        }
+
+        // Floor is never rendered -> never acts as an invisible fake floor collider!
+        if let Some(fy_floor) = self.inferred_floor_y() {
+            if n.y >= 0.78 && (pos.y - radius) <= fy_floor + 0.052 {
+                return None;
             }
-            let lx = rel.dot(old.rot * Vec3::X).abs();
-            let lz = rel.dot(old.rot * Vec3::Z).abs();
-            lx <= old.extent_x * 0.52 && lz <= old.extent_z * 0.52
-        });
-        if !already_covered {
-            let ref_axis = if n.z.abs() < 0.9 { Vec3::Z } else { Vec3::X };
-            let tx = ref_axis.cross(n).normalize_or_zero();
-            let tz = tx.cross(n).normalize_or_zero();
-            let rot = Quat::from_mat3(&Mat3::from_cols(tx, n, tz)).normalize();
-            let raw_type = if n.y >= 0.65 {
-                0
-            } else if n.y <= -0.65 {
-                2
-            } else {
-                1
+        }
+
+        // Confirm real rendered triangles exist at the surface contact point
+        let contact = pos - n * signed_dist.max(0.0);
+        let (cgx, cgy, cgz) = Self::world_to_cell(contact);
+        let (ckey, _, _, _) = Self::split_cell(cgx, cgy, cgz);
+        let has_mesh = self
+            .chunks
+            .get(&ckey)
+            .map(|c| c.total_tris_len() > 0)
+            .unwrap_or(false);
+        if !has_mesh {
+            return None;
+        }
+
+        Some((n, (radius - signed_dist).clamp(0.0, radius + 0.04)))
+    }
+
+    /// Raycasts directly through the ACTUAL SCANNED TSDF MESH (`total_tris_len() > 0`).
+    /// Returns `Some((hit_pos, outward_normal, hit_distance))` ONLY where real scanned mesh exists;
+    /// returns `None` in unscanned empty space (used by both the 120Hz aiming reticle and real contact shadows!).
+    pub fn raycast_scanned_surface(
+        &self,
+        origin: Vec3,
+        dir: Vec3,
+        min_dist: f32,
+        max_dist: f32,
+    ) -> Option<(Vec3, Vec3, f32)> {
+        if !origin.is_finite() || self.chunks.is_empty() || max_dist <= min_dist {
+            return None;
+        }
+        let d = dir.normalize_or_zero();
+        if d.length_squared() < 1e-4 {
+            return None;
+        }
+        let floor_y = self.inferred_floor_y();
+        let step = 0.018f32; // 1.8cm (< 2.5cm cell)
+        let mut t = min_dist.max(0.02);
+        let mut prev_valid = false;
+        let mut prev_t = t;
+        let mut prev_sdf = 1.0f32;
+        let mut miss_ckey = (i32::MAX, i32::MAX, i32::MAX);
+
+        while t <= max_dist {
+            let p = origin + d * t;
+            let (gx, gy, gz) = Self::world_to_cell(p);
+            let (ckey, lx, ly, lz) = Self::split_cell(gx, gy, gz);
+            if ckey == miss_ckey {
+                prev_valid = false;
+                t += step;
+                continue;
+            }
+            let Some(chunk) = self.chunks.get(&ckey) else {
+                miss_ckey = ckey;
+                prev_valid = false;
+                t += step;
+                continue;
             };
-            self.push_or_evict_plane(CanonicalPlane {
-                kind,
-                raw_type,
-                pos,
-                rot,
-                normal: n,
-                polygon_xz: rect_fallback_poly(0.36, 0.36),
-                extent_x: 0.36,
-                extent_z: 0.36,
-                area: 0.13,
-                weight: 1.0,
-                last_seen_gen: self.tick_gen,
-                is_explicit_patch: true,
-                carve_hits: 0,
-                detail_hits: 0,
-                demoted_to_object: false,
-            });
+            if chunk.total_tris_len() == 0 {
+                miss_ckey = ckey;
+                prev_valid = false;
+                t += step;
+                continue;
+            }
+
+            let idx = VoxelChunk::idx(lx, ly, lz);
+            if chunk.weight[idx] >= MESH_MIN_WEIGHT {
+                let cur_sdf = chunk.tsdf[idx] as f32 / 127.0;
+                let crossed = prev_valid && prev_sdf > 0.0 && cur_sdf <= 0.0;
+                let grazed_entry = !prev_valid && (-0.38..=0.06).contains(&cur_sdf);
+                if crossed || grazed_entry {
+                    let hit_t = if crossed {
+                        let denom = prev_sdf - cur_sdf;
+                        let frac = if denom > 1e-4 {
+                            (prev_sdf / denom).clamp(0.0, 1.0)
+                        } else {
+                            0.5
+                        };
+                        prev_t + (t - prev_t) * frac
+                    } else {
+                        t
+                    };
+                    let hit_pos = origin + d * hit_t;
+                    let mut n = self.sample_tsdf_gradient_normal(hit_pos);
+                    if n.length_squared() < 1e-4 {
+                        n = -d;
+                    }
+                    // Ignore bare floor level (never rendered visually)
+                    let on_suppressed_floor = floor_y
+                        .map(|fy| n.y >= 0.78 && hit_pos.y <= fy + 0.052)
+                        .unwrap_or(false);
+                    if !on_suppressed_floor && n.dot(-d) > -0.25 {
+                        return Some((hit_pos, n, hit_t));
+                    }
+                }
+                prev_valid = true;
+                prev_t = t;
+                prev_sdf = cur_sdf;
+            } else {
+                prev_valid = false;
+            }
+            t += step;
         }
-        kind
+        None
     }
 
     fn push_or_evict_plane(&mut self, plane: CanonicalPlane) {
@@ -2720,5 +2870,47 @@ mod tests {
             Vec3::ZERO, Quat::IDENTITY, false, 2,
         );
         assert_eq!(st_g1.updated_voxels, 0);
+    }
+
+    #[test]
+    fn scanned_raycast_and_collision_only_hit_scanned_mesh_and_ignore_unscanned_space() {
+        let mut map = SpatialMeshMap::default();
+        // Empty map -> zero fake hits or collisions!
+        assert!(map.raycast_scanned_surface(Vec3::ZERO, Vec3::NEG_Z, 0.15, 4.5).is_none());
+        assert!(map.sample_scanned_collision(Vec3::new(0.0, 0.0, -1.36), 0.048).is_none());
+
+        // Scan a real flat vertical wall at z = -1.40m
+        let dw = 80usize;
+        let dh = 60usize;
+        let depth_wall = make_synthetic_depth_image(dw, dh, |_, _| 1400u16);
+        let conf = vec![190u8; dw * dh];
+        for _ in 0..3 {
+            map.ingest_depth_map(
+                &depth_wall, dw, dh, dw * 2, 2,
+                Some(&conf), dw, dh, dw, 1, false,
+                64.0, 64.0, 40.0, 30.0, dw, dh,
+                Vec3::ZERO, Quat::IDENTITY, true, 1,
+            );
+        }
+        map.step_greedy_meshing(64);
+
+        // Ray straight at the scanned wall MUST hit near z = -1.40m with +Z outward normal
+        let (hit_pos, hit_n, hit_dist) = map
+            .raycast_scanned_surface(Vec3::ZERO, Vec3::NEG_Z, 0.15, 4.5)
+            .expect("must hit scanned wall");
+        assert!((hit_dist - 1.40).abs() < 0.04, "hit_dist={}", hit_dist);
+        assert!((hit_pos.z - (-1.40)).abs() < 0.04);
+        assert!(hit_n.z > 0.75, "normal should point toward camera (+Z), got {:?}", hit_n);
+
+        // Sphere touching the scanned wall at z = -1.36m (4cm from wall < 4.8cm radius) MUST collide
+        let (col_n, pen) = map
+            .sample_scanned_collision(Vec3::new(0.0, 0.0, -1.36), 0.048)
+            .expect("must collide with scanned wall");
+        assert!(col_n.z > 0.75);
+        assert!(pen > 0.0);
+
+        // Ray & sphere in unscanned direction (+X) MUST return None!
+        assert!(map.raycast_scanned_surface(Vec3::ZERO, Vec3::X, 0.15, 4.5).is_none());
+        assert!(map.sample_scanned_collision(Vec3::new(1.5, 0.0, 0.0), 0.048).is_none());
     }
 }

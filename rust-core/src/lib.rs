@@ -759,37 +759,6 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeIngestDepthMap(
 }
 
 #[no_mangle]
-#[allow(clippy::too_many_arguments)]
-pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeOnSurfaceReticle(
-    env: JNIEnv,
-    _class: JClass,
-    valid: jboolean,
-    hit_kind: jint,
-    px: jfloat,
-    py: jfloat,
-    pz: jfloat,
-    nx: jfloat,
-    ny: jfloat,
-    nz: jfloat,
-    dist: jfloat,
-    out_arr: JFloatArray,
-) {
-    let res = if let Ok(mut state) = input_state().lock() {
-        state.on_surface_reticle(
-            valid != 0,
-            hit_kind,
-            Vec3::new(px, py, pz),
-            Vec3::new(nx, ny, nz),
-            dist,
-        )
-    } else {
-        (0, 0, 0.0)
-    };
-    let out = [res.0 as f32, res.1 as f32, res.2];
-    let _ = env.set_float_array_region(&out_arr, 0, &out);
-}
-
-#[no_mangle]
 pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeDropPhysicsAtReticle(
     _env: JNIEnv,
     _class: JClass,

@@ -1,5 +1,6 @@
 use crate::passthrough::compile_program;
 use crate::room_scanner::{AabbCollider, PlaneMarker, SurfaceKind};
+use crate::spatial_mesh::SpatialMeshMap;
 use glam::{Mat4, Quat, Vec3};
 use glow::HasContext;
 use std::mem::size_of;
@@ -62,7 +63,7 @@ pub struct PhysicsBody {
     pub restitution: f32,
     pub impact_flash: f32,
     pub grounded: bool,
-    pub shadow_y: f32,
+    pub shadow_y: Option<f32>,
 }
 
 #[derive(Clone, Debug)]
@@ -171,11 +172,35 @@ impl PhysicsWorld {
             restitution,
             impact_flash: 0.45,
             grounded: false,
-            shadow_y: origin.y - 1.2,
+            shadow_y: None,
         });
     }
 
-    /// Spawns a rigid body ~14cm along `surface_normal` above the aimed 3D reticle surface so it drops straight down.
+    /// Spawns a rigid body directly at `pos` in free fall (zero fake surface below it).
+    pub fn spawn_free_drop(&mut self, pos: Vec3, shape_override: Option<BodyShape>) {
+        let (idx, shape, radius, restitution, color) = self.next_body_spec(shape_override);
+        let spin_sign = if idx % 2 == 0 { 1.0 } else { -1.0 };
+        let ang_vel = Vec3::new(0.35 * spin_sign, 0.65, -0.30 * spin_sign);
+
+        if self.bodies.len() >= MAX_BODIES {
+            self.bodies.remove(0);
+        }
+        self.bodies.push(PhysicsBody {
+            pos,
+            vel: Vec3::ZERO,
+            rot: Quat::IDENTITY,
+            ang_vel,
+            radius,
+            shape,
+            color,
+            restitution,
+            impact_flash: 0.20,
+            grounded: false,
+            shadow_y: None,
+        });
+    }
+
+    /// Spawns a rigid body ~14cm along `surface_normal` above an ACTUAL scanned surface so it drops straight onto it.
     pub fn spawn_drop(
         &mut self,
         surface_pos: Vec3,
@@ -209,7 +234,7 @@ impl PhysicsWorld {
             restitution,
             impact_flash: 0.25,
             grounded: false,
-            shadow_y: surface_pos.y,
+            shadow_y: Some(surface_pos.y),
         });
     }
 
@@ -249,16 +274,19 @@ impl PhysicsWorld {
             restitution,
             impact_flash: 0.45,
             grounded: false,
-            shadow_y: origin.y - 1.2,
+            shadow_y: None,
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn step(
         &mut self,
         dt_sec: f32,
+        scanned_mesh: Option<&SpatialMeshMap>,
         planes: &[PlaneMarker],
         aabbs: &[AabbCollider],
-        fallback_floor_y: f32,
+        fallback_floor_y: Option<f32>,
+        prune_below_y: Option<f32>,
         hand_world_pos: Option<Vec3>,
     ) {
         let dt = dt_sec.clamp(0.001, 0.025);
@@ -293,7 +321,20 @@ impl PhysicsWorld {
                 }
                 b.impact_flash = (b.impact_flash - sub_dt * 2.8).max(0.0);
 
-                // 1. ARCore plane collisions (exact Table/Seat boundaries so bodies fall cleanly off edges)
+                // 0. Exact Real Scanned TSDF Surface Collisions (ONLY geometry that was actually scanned!)
+                if let Some(mesh) = scanned_mesh {
+                    if let Some((push_n, pen)) = mesh.sample_scanned_collision(b.pos, b.radius) {
+                        b.pos += push_n * pen;
+                        if apply_contact_response(b, push_n, sub_dt) {
+                            pending_rings.push((b.pos - push_n * b.radius, push_n, b.color));
+                        }
+                        if push_n.y > 0.5 {
+                            b.grounded = true;
+                        }
+                    }
+                }
+
+                // 1. Optional explicit planes (empty at runtime -> zero auto-generated ARCore planes!)
                 for plane in planes {
                     let n = (plane.rot * Vec3::Y).normalize_or_zero();
                     if n.length_squared() < 1e-4 {
@@ -337,7 +378,7 @@ impl PhysicsWorld {
                     }
                 }
 
-                // 2. 2.5D Voxel & Extruded Object AABB Colliders
+                // 2. Optional AABB colliders (empty when TSDF direct collision is active)
                 for box_col in aabbs {
                     let closest = b.pos.clamp(box_col.min, box_col.max);
                     let diff = b.pos - closest;
@@ -371,13 +412,15 @@ impl PhysicsWorld {
                     }
                 }
 
-                // 3. Fallback floor plane prevents dropping to infinity before floor is mapped
-                if b.pos.y - b.radius < fallback_floor_y {
-                    b.pos.y = fallback_floor_y + b.radius;
-                    if apply_contact_response(b, Vec3::Y, sub_dt) {
-                        pending_rings.push((b.pos - Vec3::Y * b.radius, Vec3::Y, b.color));
+                // 3. Optional fallback floor (ALWAYS None at runtime -> unscanned space is true empty air!)
+                if let Some(fy) = fallback_floor_y {
+                    if b.pos.y - b.radius < fy {
+                        b.pos.y = fy + b.radius;
+                        if apply_contact_response(b, Vec3::Y, sub_dt) {
+                            pending_rings.push((b.pos - Vec3::Y * b.radius, Vec3::Y, b.color));
+                        }
+                        b.grounded = true;
                     }
-                    b.grounded = true;
                 }
 
                 // 4. Physical hand / fingertip slapping impulse
@@ -434,9 +477,23 @@ impl PhysicsWorld {
             self.push_ring(pos, normal, color);
         }
 
-        // Update contact shadow height for every body once per frame
+        // Despawn bodies that fell far into unscanned empty space
+        if let Some(min_y) = prune_below_y {
+            self.bodies.retain(|b| b.pos.y >= min_y && b.pos.is_finite());
+        }
+
+        // Update contact shadow height ONLY when a real scanned surface exists underneath!
         for b in &mut self.bodies {
-            let mut best_y = fallback_floor_y;
+            let mut best_y: Option<f32> = fallback_floor_y;
+            if let Some(mesh) = scanned_mesh {
+                if let Some((hit_pos, hit_n, _)) =
+                    mesh.raycast_scanned_surface(b.pos, Vec3::NEG_Y, b.radius * 0.4, 1.6)
+                {
+                    if hit_n.y > 0.35 && hit_pos.y <= b.pos.y + 0.02 {
+                        best_y = Some(best_y.map_or(hit_pos.y, |old| old.max(hit_pos.y)));
+                    }
+                }
+            }
             for plane in planes {
                 if !matches!(
                     plane.kind,
@@ -454,7 +511,7 @@ impl PhysicsWorld {
                 if rel.dot(plane.rot * Vec3::X).abs() <= plane.extent_x * 0.5 + extra
                     && rel.dot(plane.rot * Vec3::Z).abs() <= plane.extent_z * 0.5 + extra
                 {
-                    best_y = best_y.max(plane.pos.y);
+                    best_y = Some(best_y.map_or(plane.pos.y, |old| old.max(plane.pos.y)));
                 }
             }
             for box_col in aabbs {
@@ -464,10 +521,10 @@ impl PhysicsWorld {
                     && b.pos.z >= box_col.min.z - 0.04
                     && b.pos.z <= box_col.max.z + 0.04
                 {
-                    best_y = best_y.max(box_col.max.y);
+                    best_y = Some(best_y.map_or(box_col.max.y, |old| old.max(box_col.max.y)));
                 }
             }
-            b.shadow_y = best_y.min(b.pos.y - b.radius + 0.01);
+            b.shadow_y = best_y.map(|y| y.min(b.pos.y - b.radius + 0.01));
         }
     }
 }
@@ -770,7 +827,10 @@ impl PhysicsRenderer {
             if !bodies.is_empty() {
                 gl.bind_vertex_array(Some(self.shadow.vao));
                 for b in bodies {
-                    let h = (b.pos.y - b.radius - b.shadow_y).max(0.0);
+                    let Some(shadow_y) = b.shadow_y else {
+                        continue;
+                    };
+                    let h = (b.pos.y - b.radius - shadow_y).max(0.0);
                     let fade = (1.0 - h / 1.4).clamp(0.0, 1.0);
                     if fade <= 0.02 {
                         continue;
@@ -778,7 +838,7 @@ impl PhysicsRenderer {
                     let base_rad = b.radius * (1.15 - fade * 0.25).clamp(0.55, 1.2);
                     for (scale_mul, alpha_mul) in [(1.45f32, 0.18f32), (0.85f32, 0.34f32)] {
                         let s_rad = base_rad * scale_mul;
-                        let model = Mat4::from_translation(Vec3::new(b.pos.x, b.shadow_y + 0.004, b.pos.z))
+                        let model = Mat4::from_translation(Vec3::new(b.pos.x, shadow_y + 0.004, b.pos.z))
                             * Mat4::from_scale(Vec3::new(s_rad, 1.0, s_rad));
                         let mvp = *view_proj * model;
                         if let Some(loc) = &self.u_mvp {
@@ -894,7 +954,7 @@ mod tests {
         }];
 
         for _ in 0..180 {
-            world.step(1.0 / 60.0, &floor, &[], -1.5, None);
+            world.step(1.0 / 60.0, None, &floor, &[], Some(-1.5), None, None);
         }
         let b = &world.bodies[0];
         assert!(b.grounded);
@@ -918,7 +978,7 @@ mod tests {
 
         let mut hit_wall = false;
         for _ in 0..35 {
-            world.step(1.0 / 60.0, &wall, &[], -1.5, None);
+            world.step(1.0 / 60.0, None, &wall, &[], Some(-1.5), None, None);
             if world.bodies[0].vel.z > 0.1 {
                 hit_wall = true;
             }
@@ -940,7 +1000,7 @@ mod tests {
         }];
 
         for _ in 0..120 {
-            world.step(1.0 / 60.0, &[], &box_col, -1.5, None);
+            world.step(1.0 / 60.0, None, &[], &box_col, Some(-1.5), None, None);
         }
         let b = &world.bodies[0];
         assert!(b.grounded);
@@ -963,7 +1023,7 @@ mod tests {
         }];
 
         for _ in 0..120 {
-            world.step(1.0 / 60.0, &table, &[], -1.6, None);
+            world.step(1.0 / 60.0, None, &table, &[], Some(-1.6), None, None);
         }
         let b = &world.bodies[0];
         assert!(b.grounded);
@@ -1015,13 +1075,13 @@ mod tests {
         );
 
         for _ in 0..150 {
-            world.step(1.0 / 60.0, &table, &[], -1.6, None);
+            world.step(1.0 / 60.0, None, &table, &[], Some(-1.6), None, None);
         }
         let b = &world.bodies[0];
         // Beyond table extent (x > 0.25), sphere falls to the Floor at y = -1.10 + radius
         assert!(b.pos.x > 0.25);
         assert!((b.pos.y - (-1.10 + b.radius)).abs() < 0.02);
-        assert!((b.shadow_y - (-1.10)).abs() < 0.02);
+        assert!((b.shadow_y.unwrap() - (-1.10)).abs() < 0.02);
     }
 
     #[test]
@@ -1046,12 +1106,67 @@ mod tests {
 
         let mut saw_ring = false;
         for _ in 0..45 {
-            world.step(1.0 / 60.0, &wall, &[], -1.5, None);
+            world.step(1.0 / 60.0, None, &wall, &[], Some(-1.5), None, None);
             if !world.impact_rings.is_empty() {
                 saw_ring = true;
             }
             assert!(world.bodies[0].pos.z >= -1.0);
         }
         assert!(saw_ring);
+    }
+
+    #[test]
+    fn items_fall_through_unscanned_void_and_only_land_on_scanned_tsdf_surface() {
+        // 1. Unscanned empty map -> item falls freely with NO shadow and despawns below -4.0m!
+        let empty_map = SpatialMeshMap::default();
+        let mut world = PhysicsWorld::default();
+        world.spawn_free_drop(Vec3::new(0.0, 0.0, -1.0), Some(BodyShape::Cube));
+        for _ in 0..40 {
+            world.step(1.0 / 60.0, Some(&empty_map), &[], &[], None, Some(-4.0), None);
+        }
+        assert_eq!(world.bodies.len(), 1);
+        assert!(!world.bodies[0].grounded);
+        assert!(world.bodies[0].shadow_y.is_none(), "no fake shadow in unscanned air!");
+        assert!(world.bodies[0].pos.y < -1.5, "must fall straight through unscanned air!");
+        for _ in 0..60 {
+            world.step(1.0 / 60.0, Some(&empty_map), &[], &[], None, Some(-4.0), None);
+        }
+        assert!(world.bodies.is_empty(), "fallen body should despawn cleanly");
+
+        // 2. Scan a real horizontal tabletop at y = -0.50m (camera looking straight down from y = +0.50m -> 1000mm)
+        let mut scanned_map = SpatialMeshMap::default();
+        let dw = 80usize;
+        let dh = 60usize;
+        let mut depth = vec![0u8; dw * dh * 2];
+        for i in 0..(dw * dh) {
+            let le = 1000u16.to_le_bytes();
+            depth[i * 2] = le[0];
+            depth[i * 2 + 1] = le[1];
+        }
+        let conf = vec![190u8; dw * dh];
+        let look_down = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+        for _ in 0..3 {
+            scanned_map.ingest_depth_map(
+                &depth, dw, dh, dw * 2, 2,
+                Some(&conf), dw, dh, dw, 1, false,
+                64.0, 64.0, 40.0, 30.0, dw, dh,
+                Vec3::new(0.0, 0.50, -1.0), look_down, true, 1,
+            );
+        }
+        scanned_map.step_greedy_meshing(64);
+
+        // Drop a cube above the scanned tabletop -> lands directly on y = -0.50 + radius with real shadow!
+        world.spawn_free_drop(Vec3::new(0.0, -0.25, -1.0), Some(BodyShape::Cube));
+        for _ in 0..120 {
+            world.step(1.0 / 60.0, Some(&scanned_map), &[], &[], None, Some(-4.0), None);
+        }
+        let b = &world.bodies[0];
+        assert!(b.grounded, "cube must rest on scanned tabletop");
+        assert!(b.shadow_y.is_some(), "real scanned tabletop must receive contact shadow");
+        assert!(
+            (b.pos.y - (-0.50 + b.radius)).abs() < 0.035,
+            "cube should rest at y=-0.452, got {}",
+            b.pos.y
+        );
     }
 }

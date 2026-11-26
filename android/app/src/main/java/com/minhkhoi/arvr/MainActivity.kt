@@ -54,7 +54,6 @@ import com.google.ar.core.CameraConfigFilter
 import com.google.ar.core.Config
 import com.google.ar.core.Coordinates2d
 import com.google.ar.core.Plane
-import com.google.ar.core.Point
 import com.google.ar.core.Session
 import com.google.ar.core.TrackingState
 import java.nio.ByteBuffer
@@ -170,12 +169,6 @@ class MainActivity : Activity(), SensorEventListener {
     private var roomScanMode = 4 // 4=Lưới △ (Surface Nets mượt + Che khuất), 1=Lưới 3D, 3=Ẩn lưới, 2=+AI Vật, 0=TẮT
     @Volatile
     private var cachedPlanesCount = 0
-    @Volatile
-    private var reticleHitKind = 0
-    @Volatile
-    private var reticleSurfaceKind = 0
-    @Volatile
-    private var reticleDistanceM = 0f
     private var telemetryVisible = false
     private var availableUpdate: UpdateCheckResult? = null
     private var pendingInstallPermissionResume = false
@@ -195,7 +188,6 @@ class MainActivity : Activity(), SensorEventListener {
     private val depthFocalBuf = FloatArray(2)
     private val depthPpBuf = FloatArray(2)
     private val depthDimsBuf = IntArray(2)
-    private val reticleInfoBuf = FloatArray(3)
     private var lastPlaneExtractNs = 0L
     private var lastPointCloudNs = 0L
     private var lastRawDepthNs = 0L
@@ -1054,9 +1046,6 @@ class MainActivity : Activity(), SensorEventListener {
         NativeBridge.nativeSetRoomScanMode(roomScanMode)
         if (roomScanMode == 0) {
             cachedPlanesCount = 0
-            reticleHitKind = 0
-            reticleSurfaceKind = 0
-            reticleDistanceM = 0f
             relocPending = false
             relocBar.visibility = View.GONE
         }
@@ -1102,13 +1091,12 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     private fun surfaceShortName(kindId: Int): String = when (kindId) {
-        1 -> "Sàn"
         2 -> "Tường"
-        3 -> "Mặt bàn"
-        4 -> "Ghế"
+        3 -> "Mặt phẳng"
+        4 -> "Bề mặt"
         5 -> "Trần"
-        6 -> "Mặt đứng"
-        else -> "Bề mặt"
+        6 -> "Vật thể"
+        else -> "Đã quét"
     }
 
     private fun updateReticleHudPills() {
@@ -1117,44 +1105,37 @@ class MainActivity : Activity(), SensorEventListener {
             rightReticleHud.visibility = View.GONE
             return
         }
-        val hk = reticleHitKind
-        val sk = reticleSurfaceKind
-        val dist = reticleDistanceM
+        NativeBridge.nativeGetPerfMetrics(metricsBuf)
+        val hk = metricsBuf[13].toInt()
+        val sk = metricsBuf[14].toInt()
+        val dist = metricsBuf[15]
         var meshPrefix = ""
-        if (roomScanMode == 4 || relocPending) {
-            NativeBridge.nativeGetPerfMetrics(metricsBuf)
-            if (roomScanMode == 4) {
-                val detailTris = metricsBuf[24].toInt()
-                val flatTris = metricsBuf[25].toInt()
-                val diffChanged = metricsBuf[23].toInt()
-                meshPrefix = if (scanTurbo) {
-                    if (blurSkipActive) {
-                        "\u26A1 Giữ chậm (Chi tiết:${detailTris}\u25B3) \u00B7 "
-                    } else {
-                        "\u26A1 Chi tiết:${detailTris}\u25B3 \u00B7 Phẳng:${flatTris}\u25B3 \u00B7 "
-                    }
-                } else if (diffChanged > 0) {
-                    "\uD83D\uDD12 Đổi +${diffChanged} (Chi tiết:${detailTris}\u25B3) \u00B7 "
+        if (roomScanMode == 4) {
+            val detailTris = metricsBuf[24].toInt()
+            val flatTris = metricsBuf[25].toInt()
+            val diffChanged = metricsBuf[23].toInt()
+            meshPrefix = if (scanTurbo) {
+                if (blurSkipActive) {
+                    "\u26A1 Giữ chậm (Chi tiết:${detailTris}\u25B3) \u00B7 "
                 } else {
-                    "\uD83D\uDD12 Khóa (Chi tiết:${detailTris}\u25B3 \u00B7 Phẳng:${flatTris}\u25B3) \u00B7 "
+                    "\u26A1 Chi tiết:${detailTris}\u25B3 \u00B7 Phẳng:${flatTris}\u25B3 \u00B7 "
                 }
+            } else if (diffChanged > 0) {
+                "\uD83D\uDD12 Đổi +${diffChanged} (Chi tiết:${detailTris}\u25B3) \u00B7 "
+            } else {
+                "\uD83D\uDD12 Khóa (Chi tiết:${detailTris}\u25B3 \u00B7 Phẳng:${flatTris}\u25B3) \u00B7 "
             }
-            if (relocPending) {
-                val bestPct = metricsBuf[20].toInt()
-                relocStatusLabel.text = "\u23F3 Tự khớp phòng (${bestPct}%) — lia quanh phòng hoặc bấm:"
-                relocBar.visibility = View.VISIBLE
-            }
+        }
+        if (relocPending) {
+            val bestPct = metricsBuf[20].toInt()
+            relocStatusLabel.text = "\u23F3 Tự khớp phòng (${bestPct}%) — lia quanh phòng hoặc bấm:"
+            relocBar.visibility = View.VISIBLE
         }
         val (text, strokeCol) = if (hk > 0 && dist > 0.05f) {
             val sName = surfaceShortName(sk)
-            if (hk == 3 || hk == 4) {
-                val estLabel = if (hk == 4) "Ước lượng" else sName
-                String.format(Locale.US, "%s\uD83C\uDFAF %s (~%.2fm)", meshPrefix, estLabel, dist) to Color.argb(180, 255, 193, 7)
-            } else {
-                String.format(Locale.US, "%s\uD83C\uDFAF %s \u00B7 %.2fm", meshPrefix, sName, dist) to Color.argb(215, 46, 230, 200)
-            }
+            String.format(Locale.US, "%s\uD83C\uDFAF %s \u00B7 %.2fm", meshPrefix, sName, dist) to Color.argb(215, 46, 230, 200)
         } else {
-            "${meshPrefix}\uD83D\uDD0D Lại gần đồ vật để quét mịn..." to Color.argb(145, 160, 180, 200)
+            "${meshPrefix}\uD83D\uDD0D Chưa quét bề mặt tại tâm" to Color.argb(145, 160, 180, 200)
         }
 
         leftReticleHud.text = text
@@ -2017,12 +1998,12 @@ class MainActivity : Activity(), SensorEventListener {
                     val config = Config(session).apply {
                         focusMode = Config.FocusMode.AUTO
                         planeFindingMode = if (roomScanMode > 0) {
-                            Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
+                            Config.PlaneFindingMode.HORIZONTAL
                         } else {
                             Config.PlaneFindingMode.DISABLED
                         }
                         lightEstimationMode = Config.LightEstimationMode.DISABLED
-                        instantPlacementMode = Config.InstantPlacementMode.LOCAL_Y_UP
+                        instantPlacementMode = Config.InstantPlacementMode.DISABLED
                         depthMode = when {
                             roomScanMode <= 0 -> Config.DepthMode.DISABLED
                             depthSupportLevel == 2 -> Config.DepthMode.AUTOMATIC
@@ -2069,7 +2050,7 @@ class MainActivity : Activity(), SensorEventListener {
             try {
                 val cfg = session.config
                 val target = if (roomScanMode > 0) {
-                    Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
+                    Config.PlaneFindingMode.HORIZONTAL
                 } else {
                     Config.PlaneFindingMode.DISABLED
                 }
@@ -2450,102 +2431,8 @@ class MainActivity : Activity(), SensorEventListener {
                                     valid
                                 )
 
-                                // Live ARCore center HitTest -> 3D surface reticle + patch synthesis
-                                if (roomScanMode > 0) {
-                                    var hitMatched = false
-                                    if (valid) {
-                                        try {
-                                            val hitX = geomW * 0.5f
-                                            val hitY = viewHeight * 0.5f
-                                            var chosenKind = 0
-                                            var chosenPose: com.google.ar.core.Pose? = null
-                                            var chosenDist = 0f
-
-                                            val hits = frame.hitTest(hitX, hitY)
-                                            for (hit in hits) {
-                                                val tr = hit.trackable
-                                                if (tr is Plane &&
-                                                    tr.trackingState == TrackingState.TRACKING &&
-                                                    tr.isPoseInPolygon(hit.hitPose) &&
-                                                    hit.distance in 0.15f..8.0f
-                                                ) {
-                                                    chosenKind = 1
-                                                    chosenPose = hit.hitPose
-                                                    chosenDist = hit.distance
-                                                    break
-                                                }
-                                            }
-                                            if (chosenPose == null) {
-                                                for (hit in hits) {
-                                                    val tr = hit.trackable
-                                                    if (tr is Point &&
-                                                        tr.trackingState == TrackingState.TRACKING &&
-                                                        tr.orientationMode == Point.OrientationMode.ESTIMATED_SURFACE_NORMAL &&
-                                                        hit.distance in 0.15f..6.0f
-                                                    ) {
-                                                        chosenKind = 2
-                                                        chosenPose = hit.hitPose
-                                                        chosenDist = hit.distance
-                                                        break
-                                                    }
-                                                }
-                                            }
-                                            if (chosenPose == null) {
-                                                val instHits = frame.hitTestInstantPlacement(hitX, hitY, 1.1f)
-                                                for (hit in instHits) {
-                                                    if (hit.trackable.trackingState == TrackingState.TRACKING &&
-                                                        hit.distance in 0.15f..5.0f
-                                                    ) {
-                                                        chosenKind = 4 // Preview-only InstantPlacement (never auto-persisted)
-                                                        chosenPose = hit.hitPose
-                                                        chosenDist = hit.distance
-                                                        break
-                                                    }
-                                                }
-                                            }
-
-                                            if (chosenPose != null) {
-                                                val yAxis = chosenPose.yAxis
-                                                NativeBridge.nativeOnSurfaceReticle(
-                                                    true,
-                                                    chosenKind,
-                                                    chosenPose.tx(),
-                                                    chosenPose.ty(),
-                                                    chosenPose.tz(),
-                                                    yAxis[0],
-                                                    yAxis[1],
-                                                    yAxis[2],
-                                                    chosenDist,
-                                                    reticleInfoBuf
-                                                )
-                                                reticleHitKind = reticleInfoBuf[0].toInt()
-                                                reticleSurfaceKind = reticleInfoBuf[1].toInt()
-                                                reticleDistanceM = reticleInfoBuf[2]
-                                                hitMatched = true
-                                            }
-                                        } catch (_: Throwable) {
-                                        }
-                                    }
-                                    if (!hitMatched) {
-                                        NativeBridge.nativeOnSurfaceReticle(
-                                            false,
-                                            0,
-                                            0f,
-                                            0f,
-                                            0f,
-                                            0f,
-                                            1f,
-                                            0f,
-                                            0f,
-                                            reticleInfoBuf
-                                        )
-                                        reticleHitKind = reticleInfoBuf[0].toInt()
-                                        reticleSurfaceKind = reticleInfoBuf[1].toInt()
-                                        reticleDistanceM = reticleInfoBuf[2]
-                                    }
-                                }
-
-                                // Adaptive canonical polygon extraction: 4Hz during initial discovery, 1.25Hz once mapped
+                                // Silent floor-height elevation tracking ONLY (so bare floor isn't drawn);
+                                // NEVER used for physics colliders or reticle!
                                 val planeIntervalNs = if (cachedPlanesCount < 3) 250_000_000L else 800_000_000L
                                 if (roomScanMode > 0 && nowNs - lastPlaneExtractNs >= planeIntervalNs) {
                                     lastPlaneExtractNs = nowNs
@@ -2781,23 +2668,6 @@ class MainActivity : Activity(), SensorEventListener {
                                 fallbackTanHalfV,
                                 uvArray
                             )
-                            if (roomScanMode > 0) {
-                                NativeBridge.nativeOnSurfaceReticle(
-                                    false,
-                                    0,
-                                    0f,
-                                    0f,
-                                    0f,
-                                    0f,
-                                    1f,
-                                    0f,
-                                    0f,
-                                    reticleInfoBuf
-                                )
-                                reticleHitKind = reticleInfoBuf[0].toInt()
-                                reticleSurfaceKind = reticleInfoBuf[1].toInt()
-                                reticleDistanceM = reticleInfoBuf[2]
-                            }
                         } catch (t: Throwable) {
                             Log.w(TAG, "Fallback texture update warning: ${t.message}")
                         }

@@ -28,7 +28,7 @@
 | **Full-Screen 1:1 Scale** | Cover-fit `compute_eye_projection` (`tan_v = min(cam_tan_v, cam_tan_h / aspect) / (fov_scale * overscan)`) fills 100% edge-to-edge at `100%` while locking world-to-camera scale 1:1. |
 | **120Hz Async Timewarp** | `ArSession.update()` throttled to ~32Hz (`31ms`); `onDrawFrame()` runs at 120Hz (`preferredRefreshRate` + `Surface.setFrameRate`) using `ar_rot * (gyro_at_capture.inv() * gyro_latest)`. |
 | **RAM Vision Ring & Lazy AI** | Pre-allocated 2MB 3D YUV->RGBA LUT, 4KB YCbCr skin mask, 4-slot `RwLock` frame ring (`vision_ram.rs`); Hand AI (`handMode = 0` default) and Object AI (`roomScanMode = 2`) lazy-initialize TFLite/GPU delegates only when toggled ON. |
-| **Realistic 4x 3D Physics** | World-anchored `anchored_floor_y` (never chases `cam_pos.y`); **`⬇ Thả`** vertical reticle drop; **`🎯 Ném`** gravity-compensated ballistic throw; 4x substeps; exact Table/Seat horizontal edges (`extra = 0.0`); upright flat cube settling + static friction snap; dual-layer contact shadows & expanding impact ripple rings (`physics_3d.rs`). |
+| **Scanned-Only Reality (`physics_3d.rs`, `spatial_mesh.rs`)** | **Zero Auto-Generated Planes:** Deleted `ensure_explicit_drop_patch`, fake `fallback_floor_y` auto-floor, ARCore `Plane`/`InstantPlacement` hit-testing & colliders. Both the **120Hz aiming reticle** (`raycast_scanned_surface`) and **4x rigid-body physics & contact shadows** (`sample_scanned_collision`, trilinear `2.5cm` TSDF field) interact **100% exclusively** with actually scanned TSDF mesh (`total_tris_len() > 0 && weight >= MESH_MIN_WEIGHT`). Unscanned space is true empty air: items fall freely with no shadow and auto-despawn below `cam_pos.y - 5.0m`. |
 | **OTA Self-Updater** | Fixed `debug-fixed.keystore`, `BuildConfig.GIT_COMMIT_SHA` check vs GitHub Release `latest-apk`, streaming download + `ApkFileProvider` install intent. |
 
 ## 4. JNI Contract (`com.minhkhoi.arvr.NativeBridge`)
@@ -54,7 +54,6 @@
 | `nativeSetRoomScanMode` | `mode: Int` (`0=Off, 3=Ẩn lưới, 4=Lưới △`) | `Unit` |
 | `nativeOnArPlanePolygons` | `planeCount: Int, packedMeta(160), polyCounts(16), packedPolyXz(768)` | `Unit` |
 | `nativeOnPointCloud` | `pointCount: Int, packedXyzc: FloatArray(2048)` | `Unit` |
-| `nativeOnSurfaceReticle` | `valid, hitKind (1=Plane,2=Point,3=Floor,4=Instant), px..nz, dist, outInfo(3)` | `Unit` |
 | `nativeSpawnPhysicsBody` | `throwSpeed: Float` | `Unit` |
 | `nativeDropPhysicsAtReticle` | None | `Unit` |
 | `nativeThrowPhysicsAtReticle` | `throwSpeed: Float` | `Unit` |

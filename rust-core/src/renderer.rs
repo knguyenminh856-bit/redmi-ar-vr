@@ -11,7 +11,7 @@ use crate::room_persistence::{
     pick_manual_anchor_keyframe, serialize_room_arroom, try_auto_relocalize, KeyframeBank,
     LoadedRoomMap,
 };
-use crate::room_scanner::{ReticleHit, RoomScannerRenderer, SurfaceKind};
+use crate::room_scanner::{ReticleHit, RoomScannerRenderer};
 use crate::spatial_mesh::{RawArPlane, SpatialMeshMap, TriMeshRenderer, TriMeshVertex};
 use crate::vision_ram::extract_latest_luma_descriptor;
 use glam::{Mat4, Quat, Vec3};
@@ -68,7 +68,6 @@ pub struct SharedInputState {
     pub ipd_meters: f32,
     pub stereo_mode: bool,
     pub recenter_requested: bool,
-    pub anchored_floor_y: Option<f32>,
 
     pub hands: [Option<HandData>; MAX_HANDS],
     pub last_hand_instant: Option<Instant>,
@@ -123,7 +122,6 @@ impl Default for SharedInputState {
             ipd_meters: 0.064,
             stereo_mode: false,
             recenter_requested: false,
-            anchored_floor_y: None,
             hands: [None; MAX_HANDS],
             last_hand_instant: None,
             gesture_tracker: GestureTracker::default(),
@@ -195,9 +193,6 @@ impl SharedInputState {
                 self.ar_rot = q.normalize();
                 self.gyro_at_ar_capture = self.gyro_latest;
                 self.has_ar_pose = true;
-                if py.is_finite() {
-                    self.anchored_floor_y.get_or_insert(py - 1.35);
-                }
             }
         }
     }
@@ -329,10 +324,7 @@ impl SharedInputState {
         );
         self.keyframe_bank
             .transform_and_merge(&loaded.keyframes, q_align, t_align);
-        if let Some(fy) = self.spatial_mesh.inferred_floor_y() {
-            self.anchored_floor_y = Some(fy);
-        }
-        // Automatically switch loaded room into Compare & Maintain mode (user can re-enable Turbo anytime!)
+        // Automatically switch loaded room into Locked mode (user can re-enable Turbo anytime!)
         self.scan_turbo = false;
         self.last_diff_changed = 0;
         self.reloc_status = if is_auto { 2 } else { 3 };
@@ -512,89 +504,12 @@ impl SharedInputState {
         }
     }
 
-    pub fn on_surface_reticle(
-        &mut self,
-        valid: bool,
-        hit_kind: i32,
-        pos: Vec3,
-        normal: Vec3,
-        distance: f32,
-    ) -> (i32, i32, f32) {
-        if self.room_scan_mode <= 0 {
-            self.reticle = ReticleHit::default();
-            self.perf.reticle_hit_kind = 0;
-            self.perf.reticle_surface_kind = 0;
-            self.perf.reticle_dist = 0.0;
-            return (0, 0, 0.0);
-        }
-
-        let (cam_pos, cam_rot) = self.current_cam_pose();
-        if valid && pos.is_finite() && normal.is_finite() {
-            let n = {
-                let cand = normal.normalize_or_zero();
-                if cand.length_squared() > 1e-4 {
-                    cand
-                } else {
-                    Vec3::Y
-                }
-            };
-            // Rule 2: NEVER synthesize permanent patches during camera panning (eliminates floating phantom squares!)
-            let skind = self.spatial_mesh.classify_surface_point(pos, n, cam_pos.y);
-            let dist = if distance > 0.05 && distance.is_finite() {
-                distance
-            } else {
-                (pos - cam_pos).length()
-            };
-            self.reticle = ReticleHit {
-                valid: true,
-                hit_kind,
-                surface_kind: skind,
-                pos,
-                normal: n,
-                distance: dist,
-            };
-            self.perf.reticle_hit_kind = hit_kind;
-            self.perf.reticle_surface_kind = skind as i32;
-            self.perf.reticle_dist = dist;
-            return (hit_kind, skind as i32, dist);
-        }
-
-        // Ray-floor fallback when aiming downward below eye level
-        let dir = (cam_rot * -Vec3::Z).normalize_or_zero();
-        let floor_y = self
-            .spatial_mesh
-            .inferred_floor_y()
-            .unwrap_or_else(|| self.anchored_floor_y.unwrap_or(cam_pos.y - 1.35));
-        if dir.y < -0.08 {
-            let t = (floor_y - cam_pos.y) / dir.y;
-            if (0.35..=5.0).contains(&t) {
-                let hit_pos = cam_pos + dir * t;
-                self.reticle = ReticleHit {
-                    valid: true,
-                    hit_kind: 3,
-                    surface_kind: SurfaceKind::Floor,
-                    pos: hit_pos,
-                    normal: Vec3::Y,
-                    distance: t,
-                };
-                self.perf.reticle_hit_kind = 3;
-                self.perf.reticle_surface_kind = SurfaceKind::Floor as i32;
-                self.perf.reticle_dist = t;
-                return (3, SurfaceKind::Floor as i32, t);
-            }
-        }
-
-        self.reticle = ReticleHit::default();
-        self.perf.reticle_hit_kind = 0;
-        self.perf.reticle_surface_kind = 0;
-        self.perf.reticle_dist = 0.0;
-        (0, 0, 0.0)
-    }
-
     pub fn on_ar_plane_polygons(&mut self, planes: Vec<RawArPlane>) {
         if self.room_scan_mode <= 0 {
             return;
         }
+        // Stored ONLY to infer bare floor elevation so we never draw floor carpets;
+        // NEVER used as physics colliders or reticle surfaces!
         self.spatial_mesh
             .ingest_ar_plane_polygons(&planes, self.ar_pos.y);
         self.perf.cached_planes = self.spatial_mesh.canonical_plane_count() as u32;
@@ -614,27 +529,16 @@ impl SharedInputState {
         self.throw_physics_at_reticle(throw_speed);
     }
 
+    /// Drops an item strictly onto a REAL SCANNED TSDF surface if reticle is locked on one;
+    /// otherwise drops in free-fall 0.65m ahead with ZERO synthetic planes or fake floors!
     pub fn drop_physics_at_reticle(&mut self) {
         let (cam_pos, cam_rot) = self.current_cam_pose();
         if self.reticle.valid && self.reticle.pos.is_finite() {
-            // Only synthesize an explicit 36cm support patch when user explicitly drops onto a real Point normal
-            if self.reticle.hit_kind == 2 {
-                self.spatial_mesh.ensure_explicit_drop_patch(
-                    self.reticle.pos,
-                    self.reticle.normal,
-                    cam_pos.y,
-                );
-            }
             self.physics
                 .spawn_drop(self.reticle.pos, self.reticle.normal, None);
         } else {
             let dir = (cam_rot * -Vec3::Z).normalize_or_zero();
-            let floor_y = self
-                .spatial_mesh
-                .inferred_floor_y()
-                .unwrap_or_else(|| self.anchored_floor_y.unwrap_or(cam_pos.y - 1.35));
-            let pos = Vec3::new(cam_pos.x + dir.x * 0.75, floor_y, cam_pos.z + dir.z * 0.75);
-            self.physics.spawn_drop(pos, Vec3::Y, None);
+            self.physics.spawn_free_drop(cam_pos + dir * 0.65, None);
         }
     }
 
@@ -773,7 +677,6 @@ impl SharedInputState {
         };
 
         if self.recenter_requested {
-            self.anchored_floor_y = Some(cam_pos_capture.y - 1.35);
             self.recenter_requested = false;
         }
 
@@ -818,17 +721,39 @@ impl SharedInputState {
             self.spatial_mesh.step_greedy_meshing(max_dirty);
         }
 
-        // Invisible floor/table planes + TSDF AABBs kept strictly for realistic physics collisions
-        let active_planes = if self.room_scan_mode > 0 {
-            self.spatial_mesh.snapshot_plane_markers(false)
+        // 120Hz Reticle Raycast strictly against REAL SCANNED TSDF MESH (ZERO ARCore/InstantPlacement fake planes!)
+        let cam_fwd = (head_rot_120hz * -Vec3::Z).normalize_or_zero();
+        if self.room_scan_mode > 0 {
+            if let Some((hit_pos, hit_n, hit_dist)) =
+                self.spatial_mesh
+                    .raycast_scanned_surface(cam_pos_capture, cam_fwd, 0.16, 4.8)
+            {
+                let skind = self
+                    .spatial_mesh
+                    .classify_surface_point(hit_pos, hit_n, cam_pos_capture.y);
+                self.reticle = ReticleHit {
+                    valid: true,
+                    hit_kind: 1,
+                    surface_kind: skind,
+                    pos: hit_pos,
+                    normal: hit_n,
+                    distance: hit_dist,
+                };
+                self.perf.reticle_hit_kind = 1;
+                self.perf.reticle_surface_kind = skind as i32;
+                self.perf.reticle_dist = hit_dist;
+            } else {
+                self.reticle = ReticleHit::default();
+                self.perf.reticle_hit_kind = 0;
+                self.perf.reticle_surface_kind = 0;
+                self.perf.reticle_dist = 0.0;
+            }
         } else {
-            Vec::new()
-        };
-        let blocks_25d = if self.room_scan_mode > 0 {
-            self.spatial_mesh.collect_physics_chunk_aabbs(cam_pos_capture)
-        } else {
-            Vec::new()
-        };
+            self.reticle = ReticleHit::default();
+            self.perf.reticle_hit_kind = 0;
+            self.perf.reticle_surface_kind = 0;
+            self.perf.reticle_dist = 0.0;
+        }
 
         // Rebuild Adaptive TSDF Mesh VBO when either Triangle View (mode 4) OR Hardware Depth Occlusion is active
         let tri_mesh_mode = self.room_scan_mode == 4;
@@ -837,7 +762,6 @@ impl SharedInputState {
         let tri_mesh_verts = if need_mesh_vbo {
             let moved = (cam_pos_capture - self.cached_tri_cull_pos).length_squared() > 0.60 * 0.60;
             if self.cached_tri_src_gen != self.spatial_mesh.mesh_gen || moved || self.cached_tri_upload_gen == 0 {
-                let cam_fwd = (head_rot_120hz * -Vec3::Z).normalize_or_zero();
                 let (chunks, detail_tris, plane_tris) = self.spatial_mesh.build_triangle_mesh_buffer(
                     cam_pos_capture,
                     cam_fwd,
@@ -861,25 +785,25 @@ impl SharedInputState {
             None
         };
 
+        // Pure Scanned-Only Physics: ZERO ARCore planes, ZERO synthetic patches, ZERO fake floor!
         let dt_phys = now.duration_since(self.last_physics_step).as_secs_f32();
         self.last_physics_step = now;
-        let fallback_floor_y = if let Some(inferred) = self.spatial_mesh.inferred_floor_y() {
-            self.anchored_floor_y = Some(inferred);
-            inferred
+        let scanned_ref = if self.room_scan_mode > 0 {
+            Some(&self.spatial_mesh)
         } else {
-            *self
-                .anchored_floor_y
-                .get_or_insert(cam_pos_capture.y - 1.35)
+            None
         };
         self.physics.step(
             dt_phys,
-            &active_planes,
-            &blocks_25d,
-            fallback_floor_y,
+            scanned_ref,
+            &[],
+            &[],
+            None,
+            Some(cam_pos_capture.y - 5.0),
             hand_world_pos,
         );
 
-        self.perf.active_planes = active_planes.len() as u32;
+        self.perf.active_planes = 0;
         self.perf.active_objects = 0;
         self.perf.cached_planes = self.spatial_mesh.canonical_plane_count() as u32;
         self.perf.voxel_count = self.spatial_mesh.confirmed_voxel_count() as u32;
@@ -1294,6 +1218,7 @@ impl GlRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::room_scanner::SurfaceKind;
 
     #[test]
     fn stereo_views_offset_along_head_x_axis() {
@@ -1341,49 +1266,49 @@ mod tests {
     }
 
     #[test]
-    fn anchored_floor_locks_in_world_and_reticle_drop_does_not_chase_camera() {
+    fn reticle_and_physics_only_interact_with_scanned_tsdf_mesh() {
         let mut state = SharedInputState::default();
         assert!(!state.stereo_mode);
         assert_eq!(state.room_scan_mode, 4);
 
-        // Camera starts at y = 0.0 -> world floor anchors at -1.35
+        // Camera looking forward into unscanned empty space -> reticle MUST be invalid (no fake floor/plane!)
         state.on_ar_frame(
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            1.0,
-            0.67,
-            0.50,
-            [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
-            true,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            0.67, 0.50, [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0], true,
         );
-        let snap1 = state.snapshot_frame();
-        assert_eq!(state.anchored_floor_y, Some(-1.35));
+        let snap_empty = state.snapshot_frame();
+        assert!(!snap_empty.reticle.valid, "unscanned air must never produce a fake reticle hit");
 
-        // Walk closer / crouch lower: anchored floor does NOT shift downward with camera!
-        state.on_ar_frame(
-            0.0,
-            -0.45,
-            -0.40,
-            0.0,
-            0.0,
-            0.0,
-            1.0,
-            0.67,
-            0.50,
-            [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
-            true,
-        );
-        state.on_surface_reticle(true, 2, Vec3::new(0.0, -0.35, -0.75), Vec3::Y, 0.37);
+        // Scan a real vertical surface 1.20m ahead via dense depth
+        let dw = 64usize;
+        let dh = 48usize;
+        let mut depth = vec![0u8; dw * dh * 2];
+        for i in 0..(dw * dh) {
+            let le = 1200u16.to_le_bytes();
+            depth[i * 2] = le[0];
+            depth[i * 2 + 1] = le[1];
+        }
+        let conf = vec![190u8; dw * dh];
+        for _ in 0..3 {
+            state.on_depth_map(
+                &depth, dw, dh, dw * 2, 2,
+                Some(&conf), dw, dh, dw, 1, false,
+                56.0, 56.0, 32.0, 24.0, dw, dh,
+                Vec3::ZERO, Quat::IDENTITY,
+            );
+        }
+        let mut snap_scanned = state.snapshot_frame();
+        for _ in 0..8 {
+            snap_scanned = state.snapshot_frame();
+        }
+        assert!(snap_scanned.reticle.valid, "reticle must snap onto real scanned TSDF surface");
+        assert!((snap_scanned.reticle.distance - 1.20).abs() < 0.05);
+        assert_eq!(snap_scanned.reticle.surface_kind, SurfaceKind::VerticalObject);
+
+        // Dropping an item onto the reticle creates ZERO synthetic planes!
         state.drop_physics_at_reticle();
-        let snap2 = state.snapshot_frame();
-        assert_eq!(state.anchored_floor_y, Some(-1.35));
-        assert_eq!(snap2.physics_bodies.len(), 1);
-        assert!(snap2.reticle.valid);
-        assert_eq!(snap2.reticle.surface_kind, SurfaceKind::Table);
-        let _ = snap1;
+        let snap_drop = state.snapshot_frame();
+        assert_eq!(snap_drop.physics_bodies.len(), 1);
+        assert_eq!(state.spatial_mesh.canonical_plane_count(), 0);
     }
 }

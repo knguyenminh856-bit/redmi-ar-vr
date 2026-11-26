@@ -83,18 +83,6 @@ object NativeBridge {
         qz: Float,
         qw: Float
     ): Int
-    external fun nativeOnSurfaceReticle(
-        valid: Boolean,
-        hitKind: Int,
-        px: Float,
-        py: Float,
-        pz: Float,
-        nx: Float,
-        ny: Float,
-        nz: Float,
-        dist: Float,
-        outInfo: FloatArray
-    )
     external fun nativeDropPhysicsAtReticle()
     external fun nativeThrowPhysicsAtReticle(throwSpeed: Float)
     external fun nativeClearPhysicsBodies()
