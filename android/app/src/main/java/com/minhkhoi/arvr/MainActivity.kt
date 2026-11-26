@@ -181,7 +181,6 @@ class MainActivity : Activity(), SensorEventListener {
     private var pendingInstallPermissionResume = false
 
     private lateinit var panelLayout: LinearLayout
-    private var recenterRunnable: Runnable? = null
     private lateinit var leftGesturePopup: TextView
     private lateinit var rightGesturePopup: TextView
     private lateinit var leftReticleHud: TextView
@@ -189,11 +188,6 @@ class MainActivity : Activity(), SensorEventListener {
     private var hidePopupRunnable: Runnable? = null
     private lateinit var leftRoomPane: FrameLayout
     private lateinit var rightRoomPane: FrameLayout
-    private val leftRoomTags = ArrayList<TextView>(6)
-    private val rightRoomTags = ArrayList<TextView>(6)
-    private val leftTagTextCache = Array(6) { "" }
-    private val rightTagTextCache = Array(6) { "" }
-    private val roomLabelsBuf = FloatArray(36)
     private val packedPlanesBuf = FloatArray(16 * 10)
     private val packedPolyCountsBuf = IntArray(16)
     private val packedPolyXzBuf = FloatArray(16 * 24 * 2)
@@ -224,7 +218,7 @@ class MainActivity : Activity(), SensorEventListener {
     private var blurSkipActive = false
     @Volatile
     private var relocPending = false
-    private var roomLabelRunnable: Runnable? = null
+    private var reticleHudRunnable: Runnable? = null
     private lateinit var leftTelemetryCard: TextView
     private lateinit var rightTelemetryCard: TextView
     private lateinit var eyeModeBtn: Button
@@ -422,11 +416,6 @@ class MainActivity : Activity(), SensorEventListener {
         val leftPane = FrameLayout(this).apply {
             isClickable = false
             isFocusable = false
-            for (i in 0 until 6) {
-                val tag = createRoomTagView()
-                leftRoomTags.add(tag)
-                addView(tag)
-            }
             addView(leftTelemetryCard)
             addView(leftGesturePopup)
             addView(leftReticleHud)
@@ -434,11 +423,6 @@ class MainActivity : Activity(), SensorEventListener {
         val rightPane = FrameLayout(this).apply {
             isClickable = false
             isFocusable = false
-            for (i in 0 until 6) {
-                val tag = createRoomTagView()
-                rightRoomTags.add(tag)
-                addView(tag)
-            }
             addView(rightTelemetryCard)
             addView(rightGesturePopup)
             addView(rightReticleHud)
@@ -467,23 +451,23 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun createReticleHudPill(nasalShiftPx: Int): TextView {
         val bg = GradientDrawable().apply {
-            cornerRadius = 24f
-            setColor(Color.argb(170, 10, 16, 26))
-            setStroke(2, Color.argb(170, 46, 230, 230))
+            cornerRadius = 26f
+            setColor(Color.argb(182, 10, 16, 26))
+            setStroke(2, Color.argb(185, 46, 230, 230))
         }
         return TextView(this).apply {
             visibility = View.GONE
             background = bg
             setTextColor(Color.parseColor("#E0F7FA"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
             typeface = Typeface.DEFAULT_BOLD
-            setPadding(dp(10f), dp(4f), dp(10f), dp(4f))
+            setPadding(dp(12f), dp(5f), dp(12f), dp(5f))
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
             ).apply {
-                bottomMargin = dp(10f)
+                bottomMargin = dp(12f)
             }
             translationX = nasalShiftPx.toFloat()
         }
@@ -515,47 +499,26 @@ class MainActivity : Activity(), SensorEventListener {
         rightTelemetryCard.visibility = if (stereoMode && telemetryVisible) View.VISIBLE else View.GONE
     }
 
-    private fun createRoomTagView(): TextView {
-        val bg = GradientDrawable().apply {
-            cornerRadius = 12f
-            setColor(Color.argb(118, 12, 18, 28))
-            setStroke(1, Color.argb(150, 0, 229, 255))
-        }
-        return TextView(this).apply {
-            visibility = View.GONE
-            background = bg
-            setTextColor(Color.argb(232, 240, 250, 255))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 9.5f)
-            typeface = Typeface.DEFAULT_BOLD
-            setPadding(12, 4, 12, 4)
-            layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                Gravity.TOP or Gravity.START
-            )
-        }
-    }
-
     private fun createPopupPill(nasalShiftPx: Int): TextView {
         val pillBg = GradientDrawable().apply {
             cornerRadius = 32f
-            setColor(Color.argb(226, 14, 20, 34))
+            setColor(Color.argb(232, 14, 20, 34))
             setStroke(3, Color.parseColor("#00E5FF"))
         }
         return TextView(this).apply {
             visibility = View.GONE
             background = pillBg
             setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
             typeface = Typeface.DEFAULT_BOLD
-            setPadding(dp(12f), dp(6f), dp(12f), dp(6f))
+            setPadding(dp(14f), dp(7f), dp(14f), dp(7f))
             gravity = Gravity.CENTER
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
             ).apply {
-                bottomMargin = dp(42f)
+                bottomMargin = dp(52f)
             }
             translationX = nasalShiftPx.toFloat()
         }
@@ -563,25 +526,25 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun createTelemetryCard(nasalShiftPx: Int): TextView {
         val cardBg = GradientDrawable().apply {
-            cornerRadius = 14f
-            setColor(Color.argb(188, 10, 15, 25))
-            setStroke(2, Color.argb(135, 0, 229, 255))
+            cornerRadius = 16f
+            setColor(Color.argb(196, 10, 15, 25))
+            setStroke(2, Color.argb(145, 0, 229, 255))
         }
         return TextView(this).apply {
             visibility = View.GONE
             background = cardBg
             setTextColor(Color.parseColor("#E0F7FA"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 8.5f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 9.0f)
             typeface = Typeface.MONOSPACE
-            setPadding(dp(7f), dp(4f), dp(7f), dp(4f))
-            setLineSpacing(1f, 1.04f)
+            setPadding(dp(8f), dp(5f), dp(8f), dp(5f))
+            setLineSpacing(1f, 1.06f)
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 Gravity.TOP or Gravity.START
             ).apply {
-                topMargin = dp(38f)
-                leftMargin = dp(8f)
+                topMargin = dp(54f)
+                leftMargin = dp(10f)
             }
             translationX = nasalShiftPx.toFloat()
         }
@@ -595,48 +558,34 @@ class MainActivity : Activity(), SensorEventListener {
 
         roomScanToggleBtn = makeQuickButton(
             roomScanLabel(roomScanMode),
-            fillColor = if (roomScanMode == 4) Color.argb(215, 14, 138, 108) else Color.argb(175, 20, 24, 34)
+            fillColor = if (roomScanMode == 4) Color.argb(225, 14, 138, 108) else Color.argb(190, 24, 30, 42)
         ) {
             cycleRoomScanMode(showPopup = true)
         }
         scanTurboBtn = makeQuickButton(
             if (scanTurbo) "\u26A1 Quét mạnh" else "\uD83D\uDD12 Khóa",
-            fillColor = if (scanTurbo) Color.argb(225, 217, 119, 6) else Color.argb(210, 14, 116, 144)
+            fillColor = if (scanTurbo) Color.argb(232, 217, 119, 6) else Color.argb(220, 14, 116, 144)
         ) {
             toggleScanTurbo(showPopup = true)
         }
-        torchBtn = makeQuickButton("\uD83D\uDD26") {
+        torchBtn = makeQuickButton("\uD83D\uDD26 Đèn") {
             toggleTorch(showPopup = true)
         }
-        val roomMgrBtn = makeQuickButton("\uD83D\uDCBE Phòng", fillColor = Color.argb(195, 36, 62, 110)) {
+        val clearCacheTopBtn = makeQuickButton("\uD83E\uDDF9 Xóa cache", fillColor = Color.argb(215, 165, 58, 28)) {
+            clearRoomCacheAndReset()
+        }
+        val roomMgrBtn = makeQuickButton("\uD83D\uDCBE Phòng", fillColor = Color.argb(215, 36, 70, 128)) {
             toggleRoomManagerPanel()
-        }
-        eyeModeBtn = makeQuickButton(if (stereoMode) "\uD83E\uDD7D 2 Mắt" else "\uD83D\uDC41 1 Mắt") {
-            toggleStereoMode(showPopup = true)
-        }
-        val clearBtn = makeQuickButton("\uD83D\uDDD1") {
-            NativeBridge.nativeClearDrawings()
-            NativeBridge.nativeClearPhysicsBodies()
-            showStereoBanner("\uD83E\uDDF9  Đã xóa vật thể vật lý & nét vẽ", "#FF5252", 1200L)
-        }
-        handModeBtn = makeQuickButton(handModeLabel(handMode)) {
-            cycleHandMode(showPopup = true)
-        }
-        drawToggleBtn = makeQuickButton("\u270F TẮT") {
-            cycleDrawMode(showPopup = false)
         }
         checkUpdateBtn = makeQuickButton("\uD83D\uDD04") {
             performUpdateCheck(manual = true)
         }
-        installUpdateBtn = makeQuickButton("\u2B07 C.Nhật", fillColor = Color.argb(220, 0, 180, 80)) {
+        installUpdateBtn = makeQuickButton("\u2B07 C.Nhật", fillColor = Color.argb(230, 0, 180, 80)) {
             triggerApkDownloadAndInstall()
         }.apply {
             visibility = View.GONE
         }
-        telemetryToggleBtn = makeQuickButton("\uD83D\uDCCA") {
-            toggleTelemetryHud()
-        }
-        val gearBtn = makeQuickButton("\u2699") {
+        val gearBtn = makeQuickButton("\u2699 Cài đặt", fillColor = Color.argb(205, 42, 48, 64)) {
             roomPanelLayout.visibility = View.GONE
             panelLayout.visibility =
                 if (panelLayout.visibility == View.VISIBLE) View.GONE else View.VISIBLE
@@ -646,20 +595,16 @@ class MainActivity : Activity(), SensorEventListener {
             LinearLayout.LayoutParams.WRAP_CONTENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
         ).apply {
-            marginStart = dp(2.5f)
+            marginStart = dp(5f)
         }
 
         bar.addView(roomScanToggleBtn, itemParams)
         bar.addView(scanTurboBtn, itemParams)
         bar.addView(torchBtn, itemParams)
+        bar.addView(clearCacheTopBtn, itemParams)
         bar.addView(roomMgrBtn, itemParams)
-        bar.addView(eyeModeBtn, itemParams)
-        bar.addView(clearBtn, itemParams)
-        bar.addView(handModeBtn, itemParams)
-        bar.addView(drawToggleBtn, itemParams)
         bar.addView(checkUpdateBtn, itemParams)
         bar.addView(installUpdateBtn, itemParams)
-        bar.addView(telemetryToggleBtn, itemParams)
         bar.addView(gearBtn, itemParams)
 
         val barParams = FrameLayout.LayoutParams(
@@ -667,36 +612,53 @@ class MainActivity : Activity(), SensorEventListener {
             FrameLayout.LayoutParams.WRAP_CONTENT,
             Gravity.TOP or Gravity.END
         ).apply {
-            topMargin = dp(6f)
-            marginEnd = dp(6f)
+            topMargin = dp(8f)
+            marginEnd = dp(8f)
         }
         root.addView(bar, barParams)
 
-        // Ergonomic thumb-reach bottom-right action dock for Drop & Throw
+        // Large, thumb-friendly bottom-right physics action dock (Clear | Drop | Throw)
         val actionDock = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        val dropBtn = makeQuickButton("\u2B07 Thả", fillColor = Color.argb(215, 16, 130, 142)) {
+        val clearPhysBtn = makeQuickButton("\uD83D\uDDD1", fillColor = Color.argb(205, 90, 36, 42)) {
+            NativeBridge.nativeClearDrawings()
+            NativeBridge.nativeClearPhysicsBodies()
+            showStereoBanner("\uD83E\uDDF9  Đã xóa bóng vật lý & nét vẽ", "#FF5252", 1200L)
+        }.apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
+            minHeight = dp(46f)
+            minimumHeight = dp(46f)
+            minWidth = dp(46f)
+            minimumWidth = dp(46f)
+            setPadding(dp(12f), dp(10f), dp(12f), dp(10f))
+        }
+        val dropBtn = makeQuickButton("\u2B07 Thả", fillColor = Color.argb(230, 16, 136, 148)) {
             NativeBridge.nativeDropPhysicsAtReticle()
         }.apply {
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
             typeface = Typeface.DEFAULT_BOLD
-            setPadding(dp(12f), dp(8f), dp(12f), dp(8f))
+            minHeight = dp(46f)
+            minimumHeight = dp(46f)
+            setPadding(dp(16f), dp(10f), dp(16f), dp(10f))
         }
-        val throwBtn = makeQuickButton("\uD83C\uDFAF Ném", fillColor = Color.argb(215, 184, 96, 24)) {
+        val throwBtn = makeQuickButton("\uD83C\uDFAF Ném", fillColor = Color.argb(230, 192, 98, 22)) {
             NativeBridge.nativeThrowPhysicsAtReticle(2.4f)
         }.apply {
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
             typeface = Typeface.DEFAULT_BOLD
-            setPadding(dp(12f), dp(8f), dp(12f), dp(8f))
+            minHeight = dp(46f)
+            minimumHeight = dp(46f)
+            setPadding(dp(16f), dp(10f), dp(16f), dp(10f))
         }
         val dockItemParams = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
         ).apply {
-            marginStart = dp(6f)
+            marginStart = dp(7f)
         }
+        actionDock.addView(clearPhysBtn, dockItemParams)
         actionDock.addView(dropBtn, dockItemParams)
         actionDock.addView(throwBtn, dockItemParams)
 
@@ -705,45 +667,46 @@ class MainActivity : Activity(), SensorEventListener {
             FrameLayout.LayoutParams.WRAP_CONTENT,
             Gravity.BOTTOM or Gravity.END
         ).apply {
-            bottomMargin = dp(10f)
-            marginEnd = dp(10f)
+            bottomMargin = dp(12f)
+            marginEnd = dp(12f)
         }
         root.addView(actionDock, dockParams)
     }
 
     private fun makeQuickButton(
         label: String,
-        fillColor: Int = Color.argb(175, 20, 24, 34),
+        fillColor: Int = Color.argb(190, 24, 30, 42),
         onClick: () -> Unit
     ): Button {
         val bg = GradientDrawable().apply {
-            cornerRadius = 18f
+            cornerRadius = 24f
             setColor(fillColor)
-            setStroke(2, Color.argb(130, 255, 255, 255))
+            setStroke(2, Color.argb(150, 255, 255, 255))
         }
         return Button(this).apply {
             text = label
             isAllCaps = false
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 9.0f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+            typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.WHITE)
             background = bg
-            minHeight = 0
-            minimumHeight = 0
-            minWidth = 0
-            minimumWidth = 0
-            setPadding(dp(4.5f), dp(3.5f), dp(4.5f), dp(3.5f))
+            minHeight = dp(38f)
+            minimumHeight = dp(38f)
+            minWidth = dp(40f)
+            minimumWidth = dp(40f)
+            setPadding(dp(10f), dp(6f), dp(10f), dp(6f))
             setOnClickListener { onClick() }
         }
     }
 
     private fun handModeLabel(mode: Int): String = when (mode) {
-        2 -> "\uD83D\uDD90 NHANH"
-        1 -> "\uD83D\uDD90 T.Đ"
-        else -> "\uD83D\uDD90 TẮT"
+        2 -> "\uD83D\uDD90 AI Tay: NHANH"
+        1 -> "\uD83D\uDD90 AI Tay: T.Đ"
+        else -> "\uD83D\uDD90 AI Tay: TẮT"
     }
 
     private fun roomScanLabel(mode: Int): String = when (mode) {
-        4 -> "\uD83D\uDD3A Lưới \u25B3"
+        4 -> "\uD83D\uDD3A Lưới"
         3 -> "\uD83D\uDC41 Ẩn lưới"
         else -> "\u23F9 TẮT"
     }
@@ -783,7 +746,7 @@ class MainActivity : Activity(), SensorEventListener {
                     roomScanToggleBtn.text = roomScanLabel(roomScanMode)
                     NativeBridge.nativeSetRoomScanMode(roomScanMode)
                     updateArPlaneFindingMode()
-                    startRoomLabelLoop()
+                    startReticleHudLoop()
                 }
                 if (k > 0) {
                     relocPending = true
@@ -860,7 +823,7 @@ class MainActivity : Activity(), SensorEventListener {
             (roomScanToggleBtn.background as? GradientDrawable)?.setColor(Color.argb(215, 14, 138, 108))
             NativeBridge.nativeSetRoomScanMode(roomScanMode)
             updateArPlaneFindingMode()
-            startRoomLabelLoop()
+            startReticleHudLoop()
         }
         NativeBridge.nativeSetScanTurbo(scanTurbo)
         updateScanTurboButtonUi()
@@ -878,7 +841,7 @@ class MainActivity : Activity(), SensorEventListener {
             }
         } else if (showPopup) {
             showStereoBanner(
-                "\u26A1  QUÉT MẠNH BẬT (9Hz): Lia chậm quanh đồ vật để bám lưới 3.5cm!",
+                "\u26A1  QUÉT MẠNH BẬT (9Hz): Lại gần (<1m) quét lưới 2.5cm siêu mịn & tự xóa lỗi lơ lửng!",
                 "#FFB300",
                 2100L,
                 strokeWidth = 4
@@ -887,9 +850,9 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     private fun updateTorchButtonUi() {
-        torchBtn.text = if (torchEnabled) "\uD83D\uDD26 BẬT" else "\uD83D\uDD26"
+        torchBtn.text = if (torchEnabled) "\uD83D\uDD26 BẬT" else "\uD83D\uDD26 Đèn"
         (torchBtn.background as? GradientDrawable)?.setColor(
-            if (torchEnabled) Color.argb(235, 234, 152, 12) else Color.argb(175, 20, 24, 34)
+            if (torchEnabled) Color.argb(235, 234, 152, 12) else Color.argb(190, 24, 30, 42)
         )
     }
 
@@ -950,7 +913,7 @@ class MainActivity : Activity(), SensorEventListener {
         stereoMode = !stereoMode
         viewportDirty = true
         NativeBridge.nativeSetStereoMode(stereoMode)
-        eyeModeBtn.text = if (stereoMode) "\uD83E\uDD7D 2 Mắt" else "\uD83D\uDC41 1 Mắt"
+        eyeModeBtn.text = if (stereoMode) "\uD83E\uDD7D 2 Mắt VR" else "\uD83D\uDC41 1 Mắt AR"
         applyStereoUiLayout()
         if (showPopup) {
             val banner = if (stereoMode) {
@@ -1043,9 +1006,9 @@ class MainActivity : Activity(), SensorEventListener {
     private fun cycleDrawMode(showPopup: Boolean) {
         drawMode = (drawMode + 1) % 3
         val modeLabel = when (drawMode) {
-            1 -> "\u270F 1 NGÓN"
-            2 -> "\u270F 5 NGÓN"
-            else -> "\u270F TẮT"
+            1 -> "\u270F Vẽ: 1 NGÓN"
+            2 -> "\u270F Vẽ: 5 NGÓN"
+            else -> "\u270F Vẽ: TẮT"
         }
         drawToggleBtn.text = modeLabel
         NativeBridge.nativeSetDrawMode(drawMode)
@@ -1100,50 +1063,42 @@ class MainActivity : Activity(), SensorEventListener {
         updateArPlaneFindingMode()
 
         if (roomScanMode > 0) {
-            startRoomLabelLoop()
+            startReticleHudLoop()
             startAutoSaveLoop()
         } else {
-            stopRoomLabelLoop()
+            stopReticleHudLoop()
             stopAutoSaveLoop()
-            hideAllRoomTags()
             leftReticleHud.visibility = View.GONE
             rightReticleHud.visibility = View.GONE
         }
 
         if (showPopup) {
             val banner = when (roomScanMode) {
-                4 -> "\uD83D\uDD3A  Lưới 3D tách 2 tầng: Vật chi tiết 3.5cm + Tường/Sàn phẳng"
+                4 -> "\uD83D\uDD3A  Lưới thích ứng 2.5cm: Lại gần siêu mịn · Phẳng tự gộp 1 tấm · Đã bỏ sàn"
                 3 -> "\uD83D\uDC41  Ẩn lưới (Giữ che khuất vật thật + Vật lý + Hồng tâm)"
                 else -> "\u23F9  Đã TẮT quét không gian & hồng tâm"
             }
-            showStereoBanner(banner, if (roomScanMode == 4) "#2EE6A8" else "#2EE6E6", 1600L)
+            showStereoBanner(banner, if (roomScanMode == 4) "#2EE6A8" else "#2EE6E6", 1700L)
         }
     }
 
-    private fun startRoomLabelLoop() {
-        stopRoomLabelLoop()
+    private fun startReticleHudLoop() {
+        stopReticleHudLoop()
         if (roomScanMode <= 0) return
         val task = object : Runnable {
             override fun run() {
                 if (roomScanMode <= 0) return
-                updateRoomLabels()
-                mainHandler.postDelayed(this, 68L)
+                updateReticleHudPills()
+                mainHandler.postDelayed(this, 70L)
             }
         }
-        roomLabelRunnable = task
+        reticleHudRunnable = task
         mainHandler.post(task)
     }
 
-    private fun stopRoomLabelLoop() {
-        roomLabelRunnable?.let { mainHandler.removeCallbacks(it) }
-        roomLabelRunnable = null
-    }
-
-    private fun hideAllRoomTags() {
-        for (i in 0 until 6) {
-            leftRoomTags[i].visibility = View.GONE
-            rightRoomTags[i].visibility = View.GONE
-        }
+    private fun stopReticleHudLoop() {
+        reticleHudRunnable?.let { mainHandler.removeCallbacks(it) }
+        reticleHudRunnable = null
     }
 
     private fun surfaceShortName(kindId: Int): String = when (kindId) {
@@ -1170,18 +1125,18 @@ class MainActivity : Activity(), SensorEventListener {
             NativeBridge.nativeGetPerfMetrics(metricsBuf)
             if (roomScanMode == 4) {
                 val detailTris = metricsBuf[24].toInt()
-                val planeTris = metricsBuf[25].toInt()
+                val flatTris = metricsBuf[25].toInt()
                 val diffChanged = metricsBuf[23].toInt()
                 meshPrefix = if (scanTurbo) {
                     if (blurSkipActive) {
-                        "\u26A1 Giữ chậm (Vật:${detailTris}\u25B3) \u00B7 "
+                        "\u26A1 Giữ chậm (Chi tiết:${detailTris}\u25B3) \u00B7 "
                     } else {
-                        "\u26A1 Vật:${detailTris}\u25B3 \u00B7 Tường/Sàn:${planeTris}\u25B3 \u00B7 "
+                        "\u26A1 Chi tiết:${detailTris}\u25B3 \u00B7 Phẳng:${flatTris}\u25B3 \u00B7 "
                     }
                 } else if (diffChanged > 0) {
-                    "\uD83D\uDD12 Đổi +${diffChanged} (Vật:${detailTris}\u25B3) \u00B7 "
+                    "\uD83D\uDD12 Đổi +${diffChanged} (Chi tiết:${detailTris}\u25B3) \u00B7 "
                 } else {
-                    "\uD83D\uDD12 Khóa (Vật:${detailTris}\u25B3 \u00B7 Phẳng:${planeTris}\u25B3) \u00B7 "
+                    "\uD83D\uDD12 Khóa (Chi tiết:${detailTris}\u25B3 \u00B7 Phẳng:${flatTris}\u25B3) \u00B7 "
                 }
             }
             if (relocPending) {
@@ -1199,7 +1154,7 @@ class MainActivity : Activity(), SensorEventListener {
                 String.format(Locale.US, "%s\uD83C\uDFAF %s \u00B7 %.2fm", meshPrefix, sName, dist) to Color.argb(215, 46, 230, 200)
             }
         } else {
-            "${meshPrefix}\uD83D\uDD0D Quét chậm quanh phòng..." to Color.argb(140, 160, 180, 200)
+            "${meshPrefix}\uD83D\uDD0D Lại gần đồ vật để quét mịn..." to Color.argb(145, 160, 180, 200)
         }
 
         leftReticleHud.text = text
@@ -1215,103 +1170,11 @@ class MainActivity : Activity(), SensorEventListener {
         }
     }
 
-    private fun updateRoomLabels() {
-        updateReticleHudPills()
-        if (roomScanMode == 3) {
-            hideAllRoomTags()
-            return
-        }
-        val lw = leftRoomPane.width
-        val lh = leftRoomPane.height
-        val rw = rightRoomPane.width
-        val rh = rightRoomPane.height
-        if (lw <= 0 || lh <= 0 || (stereoMode && (rw <= 0 || rh <= 0))) {
-            hideAllRoomTags()
-            return
-        }
-
-        val count = NativeBridge.nativeGetRoomLabels(roomLabelsBuf).coerceIn(0, 6)
-        for (i in 0 until 6) {
-            if (i >= count) {
-                leftRoomTags[i].visibility = View.GONE
-                rightRoomTags[i].visibility = View.GONE
-                continue
-            }
-
-            val base = i * 6
-            val kindId = roomLabelsBuf[base].toInt()
-            val lu = roomLabelsBuf[base + 1]
-            val lv = roomLabelsBuf[base + 2]
-            val ru = roomLabelsBuf[base + 3]
-            val rv = roomLabelsBuf[base + 4]
-            val pct = (roomLabelsBuf[base + 5] * 100f).toInt()
-            val (labelText, accentColor) = resolveRoomTagStyle(kindId, pct)
-
-            applyRoomTag(leftRoomTags[i], leftTagTextCache, i, labelText, accentColor, lu, lv, lw, lh)
-            if (stereoMode) {
-                applyRoomTag(rightRoomTags[i], rightTagTextCache, i, labelText, accentColor, ru, rv, rw, rh)
-            } else {
-                rightRoomTags[i].visibility = View.GONE
-            }
-        }
-    }
-
-    private fun applyRoomTag(
-        tag: TextView,
-        cache: Array<String>,
-        idx: Int,
-        labelText: String,
-        accentColor: Int,
-        u: Float,
-        v: Float,
-        paneW: Int,
-        paneH: Int
-    ) {
-        if (cache[idx] != labelText) {
-            cache[idx] = labelText
-            tag.text = labelText
-            (tag.background as? GradientDrawable)?.setStroke(1, accentColor)
-        }
-        val tagW = if (tag.width > 0) tag.width else 88
-        val tagH = if (tag.height > 0) tag.height else 30
-        val minTy = dp(44f).toFloat()
-        val maxTy = (paneH - tagH - dp(8f)).coerceAtLeast(dp(44f)).toFloat()
-        val minTx = dp(6f).toFloat()
-        val maxTx = (paneW - tagW - dp(6f)).coerceAtLeast(dp(6f)).toFloat()
-        val tx = (u * paneW - tagW * 0.5f).coerceIn(minTx, maxTx)
-        val ty = (v * paneH - tagH * 0.5f).coerceIn(minTy, maxTy)
-        tag.translationX = tx
-        tag.translationY = ty
-        if (tag.visibility != View.VISIBLE) {
-            tag.visibility = View.VISIBLE
-        }
-    }
-
-    private fun resolveRoomTagStyle(kindId: Int, pct: Int): Pair<String, Int> {
-        return when (kindId) {
-            1 -> "Sàn" to Color.argb(180, 46, 230, 230)
-            2 -> "Tường" to Color.argb(180, 87, 173, 255)
-            3 -> "Mặt bàn" to Color.argb(180, 255, 184, 61)
-            4 -> "Bề mặt ghế" to Color.argb(180, 194, 133, 255)
-            5 -> "Trần nhà" to Color.argb(180, 148, 166, 245)
-            6 -> "Mặt đứng" to Color.argb(180, 153, 189, 230)
-            11 -> "Bàn ${pct}%" to Color.argb(190, 61, 240, 163)
-            12 -> "Ghế ${pct}%" to Color.argb(190, 61, 240, 163)
-            13 -> "Sofa ${pct}%" to Color.argb(190, 61, 240, 163)
-            14 -> "Giường ${pct}%" to Color.argb(190, 61, 240, 163)
-            15 -> "Màn hình ${pct}%" to Color.argb(190, 61, 219, 255)
-            16 -> "Cửa / Tủ ${pct}%" to Color.argb(190, 255, 208, 77)
-            17 -> "Chai / Cốc ${pct}%" to Color.argb(190, 255, 208, 77)
-            18 -> "Cây xanh ${pct}%" to Color.argb(190, 61, 240, 163)
-            else -> "Đồ vật ${pct}%" to Color.argb(190, 255, 208, 77)
-        }
-    }
-
     private fun toggleTelemetryHud() {
         telemetryVisible = !telemetryVisible
         leftTelemetryCard.visibility = if (telemetryVisible) View.VISIBLE else View.GONE
         rightTelemetryCard.visibility = if (telemetryVisible && stereoMode) View.VISIBLE else View.GONE
-        telemetryToggleBtn.text = if (telemetryVisible) "\uD83D\uDCCA*" else "\uD83D\uDCCA"
+        telemetryToggleBtn.text = if (telemetryVisible) "\uD83D\uDCCA Thông số: BẬT" else "\uD83D\uDCCA Thông số: TẮT"
         if (telemetryVisible) {
             startTelemetryLoop()
         } else {
@@ -1428,10 +1291,10 @@ class MainActivity : Activity(), SensorEventListener {
         val depthModeAct = metricsBuf[21].toInt()
         val diffChanged = metricsBuf[23].toInt()
         val detailTris = metricsBuf[24].toInt()
-        val planeTris = metricsBuf[25].toInt()
+        val flatTris = metricsBuf[25].toInt()
         val depthSrc = when {
-            depthModeAct == 2 -> "DenseDepth 3.5cm"
-            depthModeAct == 1 -> "RawDepth 3.5cm"
+            depthModeAct == 2 -> "DenseDepth 2.5cm"
+            depthModeAct == 1 -> "RawDepth 2.5cm"
             depthSupportLevel == 2 -> "DenseDepth(chờ)"
             depthSupportLevel == 1 -> "RawDepth(chờ)"
             else -> "SLAM"
@@ -1450,7 +1313,7 @@ class MainActivity : Activity(), SensorEventListener {
             .append("v${BuildConfig.VERSION_NAME} ($shortSha) | $viewLabel | ${batPct}% ${String.format(Locale.US, "%.1f", tempC)}°C | ${totalRamMb}MB\n")
             .append(String.format(Locale.US, "GPU: %d fps (%.1fms) | %s | %s | %s\n", renderFps, frameMs, depthSrc, occTag, torchTag))
             .append("Track: $trackMode | $scanTag | Tâm: $reticleSummary | Vật lý: $physBodies\n")
-            .append("Chi tiết: ${detailTris}\u25B3 ($meshChunks chunk) | Phẳng/Tường: ${planeTris}\u25B3 ($cachedPlanes mặt) | $relocTag\n")
+            .append("Chi tiết: ${detailTris}\u25B3 ($meshChunks chunk) | Phẳng gộp: ${flatTris}\u25B3 (Không sàn) | $relocTag\n")
             .append("Tay ($activeHands): $gestureName | $handAiText")
             .toString()
 
@@ -1532,7 +1395,7 @@ class MainActivity : Activity(), SensorEventListener {
         }
         relocStatusLabel = TextView(this).apply {
             setTextColor(Color.parseColor("#FFE082"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 9.5f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
             typeface = Typeface.DEFAULT_BOLD
             text = "\u23F3 Tự khớp phòng..."
         }
@@ -1597,8 +1460,8 @@ class MainActivity : Activity(), SensorEventListener {
         }
         roomStatusText = TextView(this).apply {
             setTextColor(Color.parseColor("#B2EBF2"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
-            setPadding(0, dp(3f), 0, dp(8f))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+            setPadding(0, dp(4f), 0, dp(8f))
             text = "Đang tải..."
         }
 
@@ -1680,7 +1543,7 @@ class MainActivity : Activity(), SensorEventListener {
         root.addView(
             roomPanelLayout,
             FrameLayout.LayoutParams(
-                dp(430f),
+                dp(520f),
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 Gravity.CENTER
             )
@@ -1740,7 +1603,7 @@ class MainActivity : Activity(), SensorEventListener {
                                 roomScanToggleBtn.text = roomScanLabel(roomScanMode)
                                 NativeBridge.nativeSetRoomScanMode(roomScanMode)
                                 updateArPlaneFindingMode()
-                                startRoomLabelLoop()
+                                startReticleHudLoop()
                             }
                             if (k > 0) {
                                 relocPending = true
@@ -1757,7 +1620,7 @@ class MainActivity : Activity(), SensorEventListener {
                                 relocBar.visibility = View.GONE
                                 scanTurbo = false
                                 updateScanTurboButtonUi()
-                                showStereoBanner("\uD83D\uDCCD  Đã nạp & khớp ${info.name} — đang ở [🛡 Duy trì]", "#00E676", 2200L)
+                                showStereoBanner("\uD83D\uDCCD  Đã nạp & khớp ${info.name} — đang ở [🔒 Khóa]", "#00E676", 2200L)
                             }
                         }.onFailure { err ->
                             showStereoBanner("\u26A0\uFE0F  ${err.message}", "#FF5252", 2200L)
@@ -1797,15 +1660,131 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     private fun addCalibrationOverlay(root: FrameLayout) {
+        val drawerBg = GradientDrawable().apply {
+            cornerRadius = 26f
+            setColor(Color.argb(242, 16, 20, 30))
+            setStroke(2, Color.argb(175, 0, 229, 255))
+        }
         panelLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
-            setBackgroundColor(Color.argb(232, 16, 18, 24))
-            setPadding(32, 24, 32, 24)
+            background = drawerBg
+            setPadding(dp(16f), dp(14f), dp(16f), dp(14f))
+        }
+
+        val headerRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val titleTxt = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14.5f)
+            typeface = Typeface.DEFAULT_BOLD
+            text = "\u2699 Cài đặt & Tùy chọn nâng cao"
+        }
+        val closeSettingsBtn = makeQuickButton("\u2716 Đóng", fillColor = Color.argb(215, 110, 36, 44)) {
+            panelLayout.visibility = View.GONE
+        }
+        headerRow.addView(titleTxt, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        headerRow.addView(closeSettingsBtn)
+
+        val contentBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(8f), 0, dp(4f))
+        }
+
+        // Row 1: 1/2 Eye Mode + Hand Tracking AI (BIG touch targets!)
+        val row1 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            weightSum = 2f
+        }
+        eyeModeBtn = makeQuickButton(if (stereoMode) "\uD83E\uDD7D 2 Mắt VR" else "\uD83D\uDC41 1 Mắt AR", Color.argb(220, 26, 72, 118)) {
+            toggleStereoMode(showPopup = true)
+        }.apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+            minHeight = dp(44f)
+            minimumHeight = dp(44f)
+        }
+        handModeBtn = makeQuickButton(handModeLabel(handMode), Color.argb(220, 32, 82, 74)) {
+            cycleHandMode(showPopup = true)
+        }.apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+            minHeight = dp(44f)
+            minimumHeight = dp(44f)
+        }
+        val halfLpL = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+            marginEnd = dp(6f)
+        }
+        val halfLpR = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+            marginStart = dp(6f)
+        }
+        row1.addView(eyeModeBtn, halfLpL)
+        row1.addView(handModeBtn, halfLpR)
+
+        // Row 2: Finger Draw + Telemetry HUD
+        val row2 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            weightSum = 2f
+        }
+        drawToggleBtn = makeQuickButton("\u270F Vẽ: TẮT", Color.argb(220, 62, 52, 108)) {
+            cycleDrawMode(showPopup = true)
+        }.apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+            minHeight = dp(44f)
+            minimumHeight = dp(44f)
+        }
+        telemetryToggleBtn = makeQuickButton(
+            if (telemetryVisible) "\uD83D\uDCCA Thông số: BẬT" else "\uD83D\uDCCA Thông số: TẮT",
+            Color.argb(220, 44, 62, 86)
+        ) {
+            toggleTelemetryHud()
+        }.apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+            minHeight = dp(44f)
+            minimumHeight = dp(44f)
+        }
+        row2.addView(drawToggleBtn, halfLpL)
+        row2.addView(telemetryToggleBtn, halfLpR)
+
+        val rowLp = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(8f) }
+
+        val occToggleBtn = makeQuickButton(
+            if (meshOcclusionEnabled) "\uD83D\uDEE1 Che khuất vật thật (Z-Buffer): ĐANG BẬT" else "\uD83D\uDEE1 Che khuất vật thật: ĐANG TẮT",
+            Color.argb(220, 16, 108, 124)
+        ) {}.apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+            minHeight = dp(44f)
+            minimumHeight = dp(44f)
+            setOnClickListener {
+                meshOcclusionEnabled = !meshOcclusionEnabled
+                NativeBridge.nativeSetMeshOcclusion(meshOcclusionEnabled)
+                text = if (meshOcclusionEnabled) "\uD83D\uDEE1 Che khuất vật thật (Z-Buffer): ĐANG BẬT" else "\uD83D\uDEE1 Che khuất vật thật: ĐANG TẮT"
+                showStereoBanner(
+                    if (meshOcclusionEnabled) "\uD83D\uDEE1  Đã BẬT che khuất theo lưới 3D thật" else "\uD83D\uDEE1  Đã TẮT che khuất (chế độ xuyên thấu lưới)",
+                    "#00E5FF",
+                    1500L
+                )
+            }
+        }
+
+        val clearCacheSettingsBtn = makeQuickButton(
+            "\uD83E\uDDF9 Xóa cache phòng 3D cũ trên máy & quét mới",
+            Color.argb(225, 178, 56, 32)
+        ) {
+            clearRoomCacheAndReset()
+        }.apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+            minHeight = dp(44f)
+            minimumHeight = dp(44f)
         }
 
         val fovLabel = TextView(this).apply {
             setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setPadding(0, dp(10f), 0, 0)
             text = "Tỷ lệ khung hình (100% = Full màn): $fovPct%"
         }
         val fovBar = SeekBar(this).apply {
@@ -1824,8 +1803,9 @@ class MainActivity : Activity(), SensorEventListener {
 
         val ipdLabel = TextView(this).apply {
             setTextColor(Color.WHITE)
-            setPadding(0, 16, 0, 0)
-            text = "Khoảng cách 2 mắt (IPD): $ipdMm mm"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setPadding(0, dp(8f), 0, 0)
+            text = "Khoảng cách 2 mắt VR (IPD): $ipdMm mm"
         }
         val ipdBar = SeekBar(this).apply {
             max = 16
@@ -1833,7 +1813,7 @@ class MainActivity : Activity(), SensorEventListener {
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
                     ipdMm = 56 + p
-                    ipdLabel.text = "Khoảng cách 2 mắt (IPD): $ipdMm mm"
+                    ipdLabel.text = "Khoảng cách 2 mắt VR (IPD): $ipdMm mm"
                     saveCalibration()
                 }
                 override fun onStartTrackingTouch(sb: SeekBar?) {}
@@ -1841,74 +1821,41 @@ class MainActivity : Activity(), SensorEventListener {
             })
         }
 
-        val occToggleBtn = Button(this).apply {
-            text = if (meshOcclusionEnabled) "\uD83D\uDEE1 Che khuất vật thật (Z-Buffer): ĐANG BẬT" else "\uD83D\uDEE1 Che khuất vật thật: ĐANG TẮT"
-            setOnClickListener {
-                meshOcclusionEnabled = !meshOcclusionEnabled
-                NativeBridge.nativeSetMeshOcclusion(meshOcclusionEnabled)
-                text = if (meshOcclusionEnabled) "\uD83D\uDEE1 Che khuất vật thật (Z-Buffer): ĐANG BẬT" else "\uD83D\uDEE1 Che khuất vật thật: ĐANG TẮT"
-                showStereoBanner(
-                    if (meshOcclusionEnabled) "\uD83D\uDEE1  Đã BẬT che khuất theo lưới 3D thật" else "\uD83D\uDEE1  Đã TẮT che khuất (chế độ xuyên thấu lưới)",
-                    "#00E5FF",
-                    1500L
-                )
-            }
-        }
-
-        val clearCacheSettingsBtn = Button(this).apply {
-            text = "\uD83E\uDDF9 Xóa cache phòng 3D cũ trên máy & quét mới"
-            setOnClickListener {
-                clearRoomCacheAndReset()
-            }
-        }
-
-        val recenterBtn = Button(this).apply {
-            text = "Đặt lại khối 3D sau 3 giây (Nhét vào hộp VR)"
-            setOnClickListener {
-                panelLayout.visibility = View.GONE
-                scheduleDelayedRecenter(this)
-            }
-        }
-        val btnParams = LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply {
-            topMargin = 14
-        }
-
         val tipText = TextView(this).apply {
-            setTextColor(Color.LTGRAY)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
-            setPadding(0, 12, 0, 0)
-            text = "Điều khiển AR/VR 3D: [⬇ Thả] thả thẳng xuống hồng tâm | [🎯 Ném] ném theo quỹ đạo | [👁 1 Mắt / 🥽 2 Mắt]\nMẹo VR: Volume+ = Định tâm 3D | Volume- = Chuyển chế độ vẽ tay"
+            setTextColor(Color.parseColor("#B0BEC5"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setPadding(0, dp(8f), 0, 0)
+            text = "Lưới thích ứng 2.5cm: Đưa máy lại gần đồ vật (<1m) để quét mịn & tự sửa lỗi lơ lửng; tường/mặt phẳng tự gộp thành 1 tấm sạch, không vẽ sàn.\nMẹo VR: Volume+ = Đặt lại mốc sàn | Volume- = Đổi chế độ vẽ tay"
         }
 
-        panelLayout.addView(fovLabel)
-        panelLayout.addView(fovBar)
-        panelLayout.addView(ipdLabel)
-        panelLayout.addView(ipdBar)
-        panelLayout.addView(occToggleBtn, btnParams)
-        panelLayout.addView(clearCacheSettingsBtn, btnParams)
-        panelLayout.addView(recenterBtn, btnParams)
-        panelLayout.addView(tipText)
+        contentBox.addView(row1)
+        contentBox.addView(row2, rowLp)
+        contentBox.addView(occToggleBtn, rowLp)
+        contentBox.addView(clearCacheSettingsBtn, rowLp)
+        contentBox.addView(fovLabel)
+        contentBox.addView(fovBar)
+        contentBox.addView(ipdLabel)
+        contentBox.addView(ipdBar)
+        contentBox.addView(tipText)
+
+        val settingsScroll = ScrollView(this).apply {
+            addView(contentBox)
+        }
+        panelLayout.addView(headerRow)
+        panelLayout.addView(
+            settingsScroll,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(275f)
+            )
+        )
 
         val panelParams = FrameLayout.LayoutParams(
-            820,
+            dp(500f),
             FrameLayout.LayoutParams.WRAP_CONTENT,
             Gravity.CENTER
         )
         root.addView(panelLayout, panelParams)
-    }
-
-    private fun scheduleDelayedRecenter(btn: Button) {
-        recenterRunnable?.let { mainHandler.removeCallbacks(it) }
-        Toast.makeText(this, "Hãy đặt máy vào hộp VR — định tâm sau 3 giây...", Toast.LENGTH_SHORT).show()
-        val task = Runnable {
-            NativeBridge.nativeRecenter()
-            btn.text = "Đặt lại khối 3D sau 3 giây (Nhét vào hộp VR)"
-        }
-        recenterRunnable = task
-        mainHandler.postDelayed(task, 3000L)
     }
 
     override fun onResume() {
@@ -1923,7 +1870,7 @@ class MainActivity : Activity(), SensorEventListener {
             startTrackingAndCamera()
         }
         if (roomScanMode > 0) {
-            startRoomLabelLoop()
+            startReticleHudLoop()
             startAutoSaveLoop()
         }
         if (telemetryVisible) {
@@ -1938,9 +1885,8 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     override fun onPause() {
-        recenterRunnable?.let { mainHandler.removeCallbacks(it) }
         hidePopupRunnable?.let { mainHandler.removeCallbacks(it) }
-        stopRoomLabelLoop()
+        stopReticleHudLoop()
         stopAutoSaveLoop()
         stopTelemetryLoop()
         autoSaveRoomCache(showBanner = false)
@@ -2802,7 +2748,7 @@ class MainActivity : Activity(), SensorEventListener {
                                                     NativeBridge.nativeGetPerfMetrics(metricsBuf)
                                                     val pct = metricsBuf[20].toInt()
                                                     showStereoBanner(
-                                                        "\u2705  Đã tự khớp phòng (${pct}%) — chuyển sang [🛡 Duy trì]!",
+                                                        "\u2705  Đã tự khớp phòng (${pct}%) — chuyển sang [🔒 Khóa]!",
                                                         "#00E676",
                                                         2400L,
                                                         strokeWidth = 4

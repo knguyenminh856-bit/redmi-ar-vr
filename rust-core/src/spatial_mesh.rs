@@ -9,16 +9,17 @@ use std::mem::size_of;
 
 pub const CHUNK_DIM: usize = 16;
 pub const CHUNK_VOLUME: usize = CHUNK_DIM * CHUNK_DIM * CHUNK_DIM; // 4096 voxels/chunk
-pub const CELL_SIZE: f32 = 0.035; // 3.5cm TSDF grid -> 0.56m cube/chunk, sub-cm surface precision via zero-crossing interpolation
-pub const TSDF_TRUNC: f32 = CELL_SIZE * 3.0; // ±10.5cm signed distance band around real object surfaces
-pub const MAX_ACTIVE_CHUNKS: usize = 256; // Hard RAM cap (~2.0 MB raw TSDF + cached surface tris)
-pub const MAX_CANONICAL_PLANES: usize = 32;
+pub const CELL_SIZE: f32 = 0.025; // 2.5cm ultra-fine base grid -> 0.40m cube/chunk (close-up bumpy detail!)
+pub const TSDF_TRUNC: f32 = CELL_SIZE * 3.0; // ±7.5cm narrow band (eliminates carving dead-zone!)
+pub const CLOSE_DETAIL_DIST_CM: u8 = 95; // <= 0.95m camera distance unlocks ultra-fine 2.5cm triangles; > 0.95m merges 2x2 (5cm)
+pub const MAX_ACTIVE_CHUNKS: usize = 320; // ~5.1 MB TSDF RAM cap (fits effortlessly in 6-8 GB phone RAM)
+pub const MAX_CANONICAL_PLANES: usize = 24;
 pub const MAX_POLY_VERTS: usize = 24;
-pub const MAX_MESH_VERTICES: usize = 90_000; // 30,000 crisp conformal triangles (~4.68 MB VBO, sorted nearest-first)
-pub const MAX_RENDER_RADIUS_M: f32 = 6.0;
+pub const MAX_MESH_VERTICES: usize = 90_000; // 30,000 triangles sorted nearest-first (~4.68 MB VBO)
+pub const MAX_RENDER_RADIUS_M: f32 = 5.5;
 
-pub const MESH_MIN_WEIGHT: u8 = 28; // Locks in 2 frames high-conf / 3-4 frames smooth anchored interior; rejects 1-frame noise
-pub const LOCK_CHANGE_CONFIRM: u8 = 3; // Locked mode requires 3 consecutive ticks (~1.5s) of real change before mutating TSDF
+pub const MESH_MIN_WEIGHT: u8 = 24; // Locks in 2 frames close/high-conf or 3 frames smooth; rejects 1-frame noise
+pub const LOCK_CHANGE_CONFIRM: u8 = 3; // True Lock mode requires 3 consecutive frames (~1.5s) before mutating TSDF
 
 const TRI_MESH_VERT: &str = r#"#version 300 es
 precision highp float;
@@ -50,12 +51,12 @@ void main() {
     float edge_factor = 1.0 - min(min(a3.x, a3.y), a3.z);
 
     vec3 n = normalize(v_normal);
-    float shade = 0.52 + 0.48 * clamp(dot(n, normalize(vec3(0.32, 0.86, 0.40))) * 0.5 + 0.5, 0.0, 1.0);
+    float shade = 0.54 + 0.46 * clamp(dot(n, normalize(vec3(0.32, 0.86, 0.40))) * 0.5 + 0.5, 0.0, 1.0);
     vec3 fill_rgb = v_color.rgb * shade;
-    vec3 wire_rgb = mix(v_color.rgb, vec3(1.0), 0.46);
+    vec3 wire_rgb = mix(v_color.rgb, vec3(1.0), 0.48);
 
     float fill_a = v_color.a;
-    float wire_a = clamp(v_color.a * 2.4 + 0.46, 0.52, 0.90);
+    float wire_a = clamp(v_color.a * 2.5 + 0.46, 0.50, 0.90);
 
     vec3 out_rgb = mix(fill_rgb, wire_rgb, edge_factor);
     float out_a = mix(fill_a, wire_a, edge_factor);
@@ -63,9 +64,6 @@ void main() {
 }
 "#;
 
-// Pass 0 Hardware Depth-Buffer Pre-Pass: pushes static real-world TSDF surfaces back by `u_normal_bias` (1.4cm)
-// so objects resting ON top of desks/floors never clip while everything BEHIND real furniture/mugs/walls
-// (both occluded back-scan mesh layers AND virtual 3D balls/cubes/drawings) is cleanly hidden by Z-buffer.
 const DEPTH_OCC_VERT: &str = r#"#version 300 es
 precision highp float;
 in vec3 a_pos;
@@ -105,6 +103,8 @@ pub struct RawArPlane {
     pub polygon_xz: Vec<[f32; 2]>,
 }
 
+/// ARCore planes kept silently for invisible floor elevation (`physics_3d.rs`) and reticle hit classification.
+/// NEVER rendered visually as giant floor carpets or stuck blue walls!
 #[derive(Clone, Debug)]
 pub struct CanonicalPlane {
     pub kind: SurfaceKind,
@@ -138,24 +138,6 @@ impl CanonicalPlane {
     pub fn bounding_radius(&self) -> f32 {
         0.5 * (self.extent_x * self.extent_x + self.extent_z * self.extent_z).sqrt()
     }
-
-    /// Strict Tier-1 architectural surface gate: ONLY genuine room-scale Floors (>=0.60m²),
-    /// Walls (>=1.15m² & >=1.25m×0.72m, never monitors/chairs/boxes/cabinets!), and Ceilings (>=0.90m²).
-    pub fn is_true_structural_tier1(&self) -> bool {
-        if self.demoted_to_object || self.is_explicit_patch {
-            return false;
-        }
-        match self.kind {
-            SurfaceKind::Floor => self.area >= 0.60,
-            SurfaceKind::Wall => {
-                let hi = self.extent_x.max(self.extent_z);
-                let lo = self.extent_x.min(self.extent_z);
-                self.area >= 1.15 && hi >= 1.25 && lo >= 0.72
-            }
-            SurfaceKind::Ceiling => self.area >= 0.90,
-            _ => false,
-        }
-    }
 }
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -173,13 +155,15 @@ pub struct SavedTsdfVoxel {
 }
 
 struct VoxelChunk {
-    tsdf: Box<[i8; CHUNK_VOLUME]>,        // Quantized [-127..127] => [-1.0..+1.0] (+ = air, 0 = surface, - = inside)
-    weight: Box<[u8; CHUNK_VOLUME]>,      // Multi-view fusion confidence weight (0 = unobserved, >= MESH_MIN_WEIGHT = locked)
-    change_hits: Box<[u8; CHUNK_VOLUME]>, // Consecutive diff votes in Locked/Maintain mode (must reach LOCK_CHANGE_CONFIRM)
-    surface_count: u16,                   // Approximate count of locked near-surface voxels
+    tsdf: Box<[i8; CHUNK_VOLUME]>,        // [-127..127] => [-1.0..+1.0] (+ air, 0 surface, - inside)
+    weight: Box<[u8; CHUNK_VOLUME]>,      // Multi-view weight (0..=80, >= MESH_MIN_WEIGHT locked)
+    min_dist_cm: Box<[u8; CHUNK_VOLUME]>, // Closest observation distance in cm (0..=255): drives adaptive LOD & close-up override!
+    change_hits: Box<[u8; CHUNK_VOLUME]>, // Bit-packed consecutive-frame vote tracker `[5b tag | 3b count]`
+    surface_count: u16,
     dirty: bool,
     last_touched_gen: u64,
-    tris: Vec<TriMeshVertex>,
+    detail_tris: Vec<TriMeshVertex>, // High-detail bumpy/curved triangles (2.5cm close-up / 5cm mid-range)
+    flat_tris: Vec<TriMeshVertex>,   // Coplanar greedy-merged flat sheets (1 crisp quad per flat face!)
     aabbs: Vec<AabbCollider>,
 }
 
@@ -188,11 +172,13 @@ impl VoxelChunk {
         Self {
             tsdf: Box::new([127i8; CHUNK_VOLUME]),
             weight: Box::new([0u8; CHUNK_VOLUME]),
+            min_dist_cm: Box::new([255u8; CHUNK_VOLUME]),
             change_hits: Box::new([0u8; CHUNK_VOLUME]),
             surface_count: 0,
             dirty: false,
             last_touched_gen: gen,
-            tris: Vec::new(),
+            detail_tris: Vec::new(),
+            flat_tris: Vec::new(),
             aabbs: Vec::new(),
         }
     }
@@ -204,12 +190,15 @@ impl VoxelChunk {
 
     #[inline]
     fn is_near_surface(tsdf: i8, weight: u8) -> bool {
-        weight >= MESH_MIN_WEIGHT && (-100..=28).contains(&tsdf)
+        weight >= MESH_MIN_WEIGHT && (-102..=26).contains(&tsdf)
     }
 
-    /// Bit-packed consecutive-frame vote tracker in 1 byte (`[5-bit tick_tag | 3-bit vote_count]`):
-    /// - Deduplicates multiple rays hitting the same voxel within the SAME frame (`tick_tag == cur_tag`).
-    /// - Increments only across distinct consecutive frames (`diff == 1 || diff == 2`), resetting on long gaps!
+    #[inline]
+    fn total_tris_len(&self) -> usize {
+        self.detail_tris.len() + self.flat_tris.len()
+    }
+
+    /// Bit-packed consecutive-frame vote tracker in 1 byte (`[5-bit tick_tag | 3-bit vote_count]`).
     #[inline]
     fn vote_change(&mut self, idx: usize, gen: u64) -> u8 {
         let cur_tag = (gen & 0x1F) as u8;
@@ -221,7 +210,7 @@ impl VoxelChunk {
         }
         let prev_tag = entry >> 3;
         if prev_tag == cur_tag {
-            return prev_cnt; // Already voted this frame -> never double-count adjacent rays!
+            return prev_cnt;
         }
         let delta = cur_tag.wrapping_sub(prev_tag) & 0x1F;
         let next_cnt = if delta <= 2 {
@@ -233,14 +222,42 @@ impl VoxelChunk {
         next_cnt
     }
 
+    /// Distance-adaptive TSDF fusion:
+    /// - Moving **closer** (`obs_dist_cm + 18 < old_min_dist_cm`) decays stale distant weight so close-up
+    ///   high-accuracy depth immediately overwrites old distant errors and refines triangles to `2.5cm`!
+    /// - Moving **farther** (`obs_dist_cm > old_min_dist_cm + 35`) down-weights noisy far rays so close-up
+    ///   scans stay crisp forever!
     #[inline]
-    fn fuse_voxel(&mut self, idx: usize, sdf_norm: f32, add_w: f32, gen: u64) -> bool {
+    fn fuse_voxel(
+        &mut self,
+        idx: usize,
+        sdf_norm: f32,
+        mut add_w: f32,
+        obs_dist_cm: u8,
+        is_carve: bool,
+        gen: u64,
+    ) -> bool {
         let old_t = self.tsdf[idx];
         let old_w = self.weight[idx];
+        let old_d = self.min_dist_cm[idx];
         let was_surf = Self::is_near_surface(old_t, old_w);
 
-        let old_wf = old_w as f32;
-        let new_wf = (old_wf + add_w).min(100.0);
+        let mut old_wf = old_w as f32;
+        if is_carve {
+            // Instant self-healing: cap old weight aggressively so floating errors vanish in 1-2 frames!
+            old_wf = old_wf.min(16.0);
+        } else if old_w > 0 && obs_dist_cm < 250 {
+            if (obs_dist_cm as u16) + 18 < (old_d as u16) {
+                // Much closer view -> override stale distant error cleanly!
+                old_wf = old_wf.min(12.0);
+                add_w = (add_w * 1.45).min(30.0);
+            } else if (obs_dist_cm as u16) > (old_d as u16) + 35 {
+                // Distant view looking at an already close-up detailed voxel -> barely perturb it!
+                add_w *= 0.25;
+            }
+        }
+
+        let new_wf = (old_wf + add_w).min(80.0);
         let old_tf = old_t as f32 / 127.0;
         let fused = if old_w == 0 {
             sdf_norm
@@ -249,12 +266,25 @@ impl VoxelChunk {
         };
 
         let new_t = (fused * 127.0).round().clamp(-127.0, 127.0) as i8;
-        let new_w = new_wf.round().clamp(1.0, 100.0) as u8;
+        let new_w = new_wf.round().clamp(1.0, 80.0) as u8;
 
         self.tsdf[idx] = new_t;
         self.weight[idx] = new_w;
         self.change_hits[idx] = 0;
         self.last_touched_gen = gen;
+
+        let mut lod_refined = false;
+        if is_carve {
+            if new_t > 20 {
+                self.min_dist_cm[idx] = 255;
+            }
+        } else if obs_dist_cm < old_d {
+            let crossed_close = old_d > CLOSE_DETAIL_DIST_CM && obs_dist_cm <= CLOSE_DETAIL_DIST_CM;
+            self.min_dist_cm[idx] = obs_dist_cm;
+            if crossed_close && new_w >= MESH_MIN_WEIGHT {
+                lod_refined = true;
+            }
+        }
 
         let now_surf = Self::is_near_surface(new_t, new_w);
         if !was_surf && now_surf {
@@ -263,11 +293,10 @@ impl VoxelChunk {
             self.surface_count = self.surface_count.saturating_sub(1);
         }
 
-        // Only mark chunk dirty when lock status, sign, or significant surface displacement changes
         let lock_changed = (old_w < MESH_MIN_WEIGHT) != (new_w < MESH_MIN_WEIGHT);
         let sign_changed = (old_t > 0) != (new_t > 0);
         let shifted = new_w >= MESH_MIN_WEIGHT && (new_t as i16 - old_t as i16).abs() >= 6;
-        if lock_changed || sign_changed || shifted {
+        if lock_changed || sign_changed || shifted || lod_refined {
             self.dirty = true;
             return true;
         }
@@ -279,49 +308,21 @@ pub struct SpatialMeshMap {
     pub planes: Vec<CanonicalPlane>,
     chunks: HashMap<(i32, i32, i32), VoxelChunk>,
     pub has_dense_depth: bool,
-    pub has_seen_conf: bool,
     pub tick_gen: u64,
     pub mesh_gen: u64,
+    last_floor_y: Option<f32>,
 }
 
 impl Default for SpatialMeshMap {
     fn default() -> Self {
         Self {
             planes: Vec::with_capacity(MAX_CANONICAL_PLANES),
-            chunks: HashMap::with_capacity(96),
+            chunks: HashMap::with_capacity(128),
             has_dense_depth: false,
-            has_seen_conf: false,
             tick_gen: 0,
             mesh_gen: 1,
+            last_floor_y: None,
         }
-    }
-}
-
-fn surface_rgb(kind: SurfaceKind) -> [f32; 3] {
-    match kind {
-        SurfaceKind::Floor => [0.16, 0.86, 0.92],
-        SurfaceKind::Wall => [0.34, 0.68, 1.00],
-        SurfaceKind::Table => [1.00, 0.72, 0.24],
-        SurfaceKind::Seat => [0.76, 0.52, 1.00],
-        SurfaceKind::Ceiling => [0.58, 0.65, 0.96],
-        SurfaceKind::VerticalObject => [0.52, 0.78, 0.92],
-        SurfaceKind::Unknown => [0.75, 0.85, 0.92],
-    }
-}
-
-/// Colors Tier-2 high-detail TSDF object triangles clearly by 3D curvature so intricate/curved objects
-/// stand out sharply from smooth object faces and from Tier-1 cool cyan/blue flat Floors & Walls!
-fn tsdf_detail_color(curv: f32, normal: Vec3) -> [f32; 4] {
-    if curv >= 0.095 {
-        // High-detail edges, curved objects, mugs, laptop bezels, chair contours: vivid amber-gold
-        let t = ((curv - 0.095) / 0.22).clamp(0.0, 1.0);
-        [1.00, 0.72 - 0.24 * t, 0.18 + 0.08 * (1.0 - t), 0.26]
-    } else if normal.y >= 0.78 {
-        // Elevated horizontal detail tops (desk top, book, keyboard, chair seat): warm mint-gold
-        [0.42, 0.94, 0.56, 0.21]
-    } else {
-        // Smooth detail object sides / protruding entities: crisp emerald-teal
-        [0.12, 0.90, 0.68, 0.20]
     }
 }
 
@@ -370,7 +371,25 @@ fn push_mesh_quad(
     push_mesh_tri(out, p0, p2, p3, normal, color);
 }
 
-/// Computes a deduplicated CCW 2D Convex Hull using Andrew's Monotone Chain, capped to `MAX_POLY_VERTS`.
+/// Colors adaptive mesh regions distinctly:
+/// - **Flat / Simple Merged Surfaces:** clean architectural cool blue/cyan (`alpha = 0.12`)
+/// - **Close-Up Ultra-Fine Bumpy Detail (`2.5cm`):** vivid warm amber-gold (`alpha = 0.25`)
+/// - **Mid-Range Bumpy Detail (`5.0cm`):** crisp emerald-mint (`alpha = 0.20`)
+fn adaptive_region_color(is_flat_merged: bool, is_close_fine: bool, curv: f32, normal: Vec3) -> [f32; 4] {
+    if is_flat_merged {
+        if normal.y >= 0.78 {
+            return [0.22, 0.80, 0.92, 0.14]; // Flat tabletop / horizontal simple surface: clean sky-cyan
+        }
+        return [0.30, 0.62, 0.98, 0.12]; // Flat wall / box side / cabinet door: clean architectural blue
+    }
+    if is_close_fine {
+        let t = ((curv - 0.08) / 0.24).clamp(0.0, 1.0);
+        return [1.00, 0.74 - 0.28 * t, 0.16 + 0.10 * (1.0 - t), 0.25]; // Close-up 2.5cm fine detail: warm gold/amber
+    }
+    [0.14, 0.90, 0.68, 0.20] // Mid-range 5.0cm bumpy detail: crisp emerald-mint
+}
+
+/// Computes a deduplicated CCW 2D Convex Hull using Andrew's Monotone Chain.
 pub fn convex_hull_2d(pts: &[[f32; 2]]) -> Vec<[f32; 2]> {
     let mut clean: Vec<[f32; 2]> = pts
         .iter()
@@ -397,7 +416,6 @@ pub fn convex_hull_2d(pts: &[[f32; 2]]) -> Vec<[f32; 2]> {
         }
         lower.push(p);
     }
-
     let mut upper: Vec<[f32; 2]> = Vec::with_capacity(clean.len());
     for &p in clean.iter().rev() {
         while upper.len() >= 2 && cross(upper[upper.len() - 2], upper[upper.len() - 1], p) <= 1e-5 {
@@ -409,7 +427,6 @@ pub fn convex_hull_2d(pts: &[[f32; 2]]) -> Vec<[f32; 2]> {
     lower.pop();
     upper.pop();
     lower.extend(upper);
-
     if lower.len() > MAX_POLY_VERTS {
         let step = lower.len() as f32 / MAX_POLY_VERTS as f32;
         let mut decimated = Vec::with_capacity(MAX_POLY_VERTS);
@@ -453,13 +470,7 @@ fn rect_fallback_poly(ex: f32, ez: f32) -> Vec<[f32; 2]> {
 }
 
 #[inline]
-fn read_depth_mm(
-    depth_bytes: &[u8],
-    x: usize,
-    y: usize,
-    row_stride: usize,
-    pix_stride: usize,
-) -> u16 {
+fn read_depth_mm(depth_bytes: &[u8], x: usize, y: usize, row_stride: usize, pix_stride: usize) -> u16 {
     let off = y * row_stride + x * pix_stride;
     if off + 1 >= depth_bytes.len() {
         return 0;
@@ -488,8 +499,6 @@ fn read_conf_u8(
     if off < cb.len() { cb[off] } else { 0 }
 }
 
-/// Checks if a smooth dense-depth pixel sits inside a REAL object anchored to confident stereo edges
-/// (sampling a fast ±2px / ±4px cross in `RawDepthConfidenceImage`), while still rejecting empty mid-air voids!
 #[allow(clippy::too_many_arguments)]
 fn max_nearby_conf(
     cb: &[u8],
@@ -526,12 +535,272 @@ fn max_nearby_conf(
     best
 }
 
+/// Connected-component flood fill inside a chunk (`16×16×16`) that marks isolated floating mid-air
+/// specks (`< 7` connected voxels not touching any chunk border) as `false` so floating confetti NEVER renders!
+fn compute_non_floater_mask(chunk: &VoxelChunk) -> [bool; CHUNK_VOLUME] {
+    let mut keep = [false; CHUNK_VOLUME];
+    let mut visited = [false; CHUNK_VOLUME];
+    let mut queue = Vec::with_capacity(64);
+    let mut cluster = Vec::with_capacity(64);
+
+    for ly in 0..CHUNK_DIM {
+        for lz in 0..CHUNK_DIM {
+            for lx in 0..CHUNK_DIM {
+                let start = VoxelChunk::idx(lx, ly, lz);
+                if visited[start]
+                    || !VoxelChunk::is_near_surface(chunk.tsdf[start], chunk.weight[start])
+                {
+                    continue;
+                }
+                visited[start] = true;
+                queue.clear();
+                cluster.clear();
+                queue.push((lx, ly, lz));
+                let mut touches_border = false;
+
+                while let Some((cx, cy, cz)) = queue.pop() {
+                    let ci = VoxelChunk::idx(cx, cy, cz);
+                    cluster.push(ci);
+                    if cx == 0
+                        || cy == 0
+                        || cz == 0
+                        || cx == CHUNK_DIM - 1
+                        || cy == CHUNK_DIM - 1
+                        || cz == CHUNK_DIM - 1
+                    {
+                        touches_border = true;
+                    }
+                    let nbs = [
+                        (cx.wrapping_sub(1), cy, cz),
+                        (cx + 1, cy, cz),
+                        (cx, cy.wrapping_sub(1), cz),
+                        (cx, cy + 1, cz),
+                        (cx, cy, cz.wrapping_sub(1)),
+                        (cx, cy, cz + 1),
+                    ];
+                    for (nx, ny, nz) in nbs {
+                        if nx < CHUNK_DIM && ny < CHUNK_DIM && nz < CHUNK_DIM {
+                            let ni = VoxelChunk::idx(nx, ny, nz);
+                            if !visited[ni]
+                                && VoxelChunk::is_near_surface(chunk.tsdf[ni], chunk.weight[ni])
+                            {
+                                visited[ni] = true;
+                                queue.push((nx, ny, nz));
+                            }
+                        }
+                    }
+                }
+
+                // Keep real surfaces (cluster >= 7 voxels OR spanning across chunk border)
+                if touches_border || cluster.len() >= 7 {
+                    for &ci in &cluster {
+                        keep[ci] = true;
+                    }
+                }
+            }
+        }
+    }
+    keep
+}
+
+#[derive(Copy, Clone)]
+struct CandidateQuad {
+    p0: Vec3,
+    p1: Vec3,
+    p2: Vec3,
+    p3: Vec3,
+    normal: Vec3,
+    curv: f32,
+    min_dist_cm: u8,
+    is_flat: bool,
+    plane_bin: i16,
+}
+
+/// Projects merged flat rectangle corners onto the fitted average axis coordinate so coplanar surfaces
+/// form a single razor-flat sheet (1 unified quad = 2 triangles instead of dozens of bumpy micro-tris!).
+#[allow(clippy::too_many_arguments)]
+fn emit_merged_flat_rect(
+    out: &mut Vec<TriMeshVertex>,
+    grid: &[[Option<CandidateQuad>; CHUNK_DIM]; CHUNK_DIM],
+    u0: usize,
+    v0: usize,
+    w: usize,
+    h: usize,
+    axis: usize,
+    positive: bool,
+) {
+    let Some(q00) = grid[v0][u0] else { return };
+    let Some(q10) = grid[v0][u0 + w - 1] else { return };
+    let Some(q11) = grid[v0 + h - 1][u0 + w - 1] else { return };
+    let Some(q01) = grid[v0 + h - 1][u0] else { return };
+
+    let mut n_sum = Vec3::ZERO;
+    let mut pt_sum = Vec3::ZERO;
+    let mut cnt = 0.0f32;
+    for dv in 0..h {
+        for du in 0..w {
+            if let Some(q) = grid[v0 + dv][u0 + du] {
+                n_sum += q.normal;
+                pt_sum += (q.p0 + q.p1 + q.p2 + q.p3) * 0.25;
+                cnt += 1.0;
+            }
+        }
+    }
+    let avg_pt = if cnt > 0.0 { pt_sum / cnt } else { (q00.p0 + q11.p2) * 0.5 };
+    let fallback_n = match (axis, positive) {
+        (0, true) => Vec3::X,
+        (0, false) => Vec3::NEG_X,
+        (1, true) => Vec3::Y,
+        (1, false) => Vec3::NEG_Y,
+        (_, true) => Vec3::Z,
+        (_, false) => Vec3::NEG_Z,
+    };
+    let n = {
+        let cand = n_sum.normalize_or_zero();
+        if cand.length_squared() > 1e-4 { cand } else { fallback_n }
+    };
+
+    // Project the 4 outer corners cleanly onto the true fitted 3D plane (works for both straight & angled walls!)
+    let snap = |p: Vec3| -> Vec3 { p - n * (p - avg_pt).dot(n) };
+    // Match exact outward CCW winding from our verified (+X, +Y, +Z) quad corner layout:
+    // +X (u=y, v=z): p0=(u0,v0).p0, p1=(u1,v0).p1, p2=(u1,v1).p2, p3=(u0,v1).p3
+    // +Y (u=z, v=x): p0=(u0,v0).p0, p1=(u1,v0).p1, p2=(u1,v1).p2, p3=(u0,v1).p3
+    // +Z (u=x, v=y): p0=(u0,v0).p0, p1=(u1,v0).p1, p2=(u1,v1).p2, p3=(u0,v1).p3
+    let c0 = snap(q00.p0);
+    let c1 = snap(q10.p1);
+    let c2 = snap(q11.p2);
+    let c3 = snap(q01.p3);
+
+    let col = adaptive_region_color(true, false, 0.0, n);
+    if positive {
+        push_mesh_quad(out, c0, c1, c2, c3, n, col);
+    } else {
+        push_mesh_quad(out, c0, c3, c2, c1, n, col);
+    }
+}
+
+/// Processes one `16×16` slice of candidate quads for `(axis, positive)`:
+/// 1. **Flat / simple cells:** merged via 2D Greedy Maximal Rectangle Merging into minimal unified flat sheets (`flat_tris`).
+/// 2. **Close-up bumpy cells (`min_dist_cm <= 95cm`):** emitted at full ultra-fine `2.5cm` resolution (`detail_tris`).
+/// 3. **Farther bumpy cells (`min_dist_cm > 95cm`):** coalesced `2×2` into clean `5.0cm` quads (`detail_tris`).
+fn emit_adaptive_slice(
+    grid: &[[Option<CandidateQuad>; CHUNK_DIM]; CHUNK_DIM],
+    axis: usize,
+    positive: bool,
+    flat_out: &mut Vec<TriMeshVertex>,
+    detail_out: &mut Vec<TriMeshVertex>,
+) {
+    // Pass 1: Greedy coplanar rectangle merge for flat / simple regions
+    let mut used = [[false; CHUNK_DIM]; CHUNK_DIM];
+    for v in 0..CHUNK_DIM {
+        let mut u = 0;
+        while u < CHUNK_DIM {
+            if used[v][u] {
+                u += 1;
+                continue;
+            }
+            let Some(q0) = grid[v][u] else {
+                u += 1;
+                continue;
+            };
+            if !q0.is_flat {
+                u += 1;
+                continue;
+            }
+            let bin = q0.plane_bin;
+            let mut w = 1;
+            while u + w < CHUNK_DIM && !used[v][u + w] {
+                if let Some(q) = grid[v][u + w] {
+                    if q.is_flat && (q.plane_bin - bin).abs() <= 1 && q.normal.dot(q0.normal) >= 0.94 {
+                        w += 1;
+                        continue;
+                    }
+                }
+                break;
+            }
+            let mut h = 1;
+            'grow_v: while v + h < CHUNK_DIM {
+                for k in 0..w {
+                    if used[v + h][u + k] {
+                        break 'grow_v;
+                    }
+                    match grid[v + h][u + k] {
+                        Some(q) if q.is_flat && (q.plane_bin - bin).abs() <= 1 && q.normal.dot(q0.normal) >= 0.94 => {}
+                        _ => break 'grow_v,
+                    }
+                }
+                h += 1;
+            }
+            for dv in 0..h {
+                for du in 0..w {
+                    used[v + dv][u + du] = true;
+                }
+            }
+            emit_merged_flat_rect(flat_out, grid, u, v, w, h, axis, positive);
+            u += w;
+        }
+    }
+
+    // Pass 2: Distance-adaptive bumpy / curved cells:
+    // - Farther (> 95cm) 2x2 blocks coalesce into 5cm quads
+    // - Close-up (<= 95cm) cells emit full ultra-fine 2.5cm triangles!
+    let mut detail_used = [[false; CHUNK_DIM]; CHUNK_DIM];
+    for v0 in (0..CHUNK_DIM).step_by(2) {
+        for u0 in (0..CHUNK_DIM).step_by(2) {
+            if u0 + 1 < CHUNK_DIM && v0 + 1 < CHUNK_DIM {
+                if let (Some(q00), Some(q10), Some(q11), Some(q01)) = (
+                    grid[v0][u0],
+                    grid[v0][u0 + 1],
+                    grid[v0 + 1][u0 + 1],
+                    grid[v0 + 1][u0],
+                ) {
+                    let any_flat = used[v0][u0] || used[v0][u0 + 1] || used[v0 + 1][u0 + 1] || used[v0 + 1][u0];
+                    let min_d = q00.min_dist_cm.min(q10.min_dist_cm).min(q11.min_dist_cm).min(q01.min_dist_cm);
+                    // Only coalesce 2x2 when ALL 4 cells are mid/far range (> 95cm) -> shrinks to 2.5cm as you move closer!
+                    if !any_flat && min_d > CLOSE_DETAIL_DIST_CM {
+                        detail_used[v0][u0] = true;
+                        detail_used[v0][u0 + 1] = true;
+                        detail_used[v0 + 1][u0 + 1] = true;
+                        detail_used[v0 + 1][u0] = true;
+                        let n = (q00.normal + q10.normal + q11.normal + q01.normal).normalize_or_zero();
+                        let n = if n.length_squared() > 1e-4 { n } else { q00.normal };
+                        let curv = (q00.curv + q10.curv + q11.curv + q01.curv) * 0.25;
+                        let col = adaptive_region_color(false, false, curv, n);
+                        if positive {
+                            push_mesh_quad(detail_out, q00.p0, q10.p1, q11.p2, q01.p3, n, col);
+                        } else {
+                            push_mesh_quad(detail_out, q00.p0, q01.p3, q11.p2, q10.p1, n, col);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for v in 0..CHUNK_DIM {
+        for u in 0..CHUNK_DIM {
+            if used[v][u] || detail_used[v][u] {
+                continue;
+            }
+            if let Some(q) = grid[v][u] {
+                let is_close = q.min_dist_cm <= CLOSE_DETAIL_DIST_CM;
+                let col = adaptive_region_color(false, is_close, q.curv, q.normal);
+                if positive {
+                    push_mesh_quad(detail_out, q.p0, q.p1, q.p2, q.p3, q.normal, col);
+                } else {
+                    push_mesh_quad(detail_out, q.p0, q.p3, q.p2, q.p1, q.normal, col);
+                }
+            }
+        }
+    }
+}
+
 impl SpatialMeshMap {
     pub fn clear(&mut self) {
         self.planes.clear();
         self.chunks.clear();
         self.has_dense_depth = false;
-        self.has_seen_conf = false;
+        self.last_floor_y = None;
         self.mesh_gen = self.mesh_gen.wrapping_add(1);
     }
 
@@ -544,7 +813,7 @@ impl SpatialMeshMap {
     pub fn active_chunk_count(&self) -> usize {
         self.chunks
             .values()
-            .filter(|c| c.surface_count > 0 || !c.tris.is_empty())
+            .filter(|c| c.surface_count > 0 || c.total_tris_len() > 0)
             .count()
     }
 
@@ -554,10 +823,6 @@ impl SpatialMeshMap {
 
     pub fn canonical_plane_count(&self) -> usize {
         self.planes.len()
-    }
-
-    pub fn has_tsdf_mesh(&self) -> bool {
-        self.chunks.values().any(|c| !c.tris.is_empty())
     }
 
     pub fn inferred_floor_y(&self) -> Option<f32> {
@@ -598,7 +863,6 @@ impl SpatialMeshMap {
         classify_ar_plane(raw_type, pos.y, ext, ext, cam_y, self.inferred_floor_y())
     }
 
-    /// Synthesizes a 36cm x 36cm support patch ONLY on explicit user drop onto a real `Point` normal.
     pub fn ensure_explicit_drop_patch(&mut self, pos: Vec3, normal: Vec3, cam_y: f32) -> SurfaceKind {
         let n = normal.normalize_or_zero();
         if !pos.is_finite() || n.length_squared() < 1e-4 {
@@ -649,7 +913,6 @@ impl SpatialMeshMap {
                 detail_hits: 0,
                 demoted_to_object: false,
             });
-            self.mesh_gen = self.mesh_gen.wrapping_add(1);
         }
         kind
     }
@@ -673,8 +936,8 @@ impl SpatialMeshMap {
         self.planes.push(plane);
     }
 
-    /// Rule 1: Coplanar Plane Merging — fuses incoming ARCore polygons for crisp physics colliders,
-    /// reticle classification, and non-Depth device fallback (NEVER stacked visually over TSDF mesh!).
+    /// Ingests ARCore plane polygons strictly for invisible floor height (`physics_3d`) and reticle snapping.
+    /// When a new floor elevation is learned, marks floor-level chunks dirty so floor quads disappear immediately!
     pub fn ingest_ar_plane_polygons(&mut self, incoming: &[RawArPlane], cam_y: f32) {
         self.tick_gen = self.tick_gen.wrapping_add(1);
         if incoming.is_empty() {
@@ -709,7 +972,6 @@ impl SpatialMeshMap {
             if normal.length_squared() < 1e-4 {
                 continue;
             }
-
             let raw_poly = if raw.polygon_xz.len() >= 3 {
                 convex_hull_2d(&raw.polygon_xz)
             } else {
@@ -724,24 +986,13 @@ impl SpatialMeshMap {
                 continue;
             }
             let new_rad = 0.5 * (ex * ex + ez * ez).sqrt();
-
             let match_idx = self.planes.iter().position(|old| {
-                let ndot = old.normal.dot(normal);
-                if ndot < 0.90 {
-                    return false;
-                }
-                let perp = (raw.pos - old.pos).dot(old.normal).abs();
-                if perp > 0.075 {
-                    return false;
-                }
-                let dist = (raw.pos - old.pos).length();
-                dist <= old.bounding_radius() + new_rad + 0.30
+                old.normal.dot(normal) >= 0.90
+                    && (raw.pos - old.pos).dot(old.normal).abs() <= 0.075
+                    && (raw.pos - old.pos).length() <= old.bounding_radius() + new_rad + 0.30
             });
-
             if let Some(idx) = match_idx {
-                self.merge_into_plane(
-                    idx, raw.raw_type, raw.pos, rot, &raw_poly, area, cam_y, floor_y,
-                );
+                self.merge_into_plane(idx, raw.raw_type, raw.pos, rot, &raw_poly, area, cam_y, floor_y);
                 changed = true;
             } else {
                 self.push_or_evict_plane(CanonicalPlane {
@@ -767,26 +1018,25 @@ impl SpatialMeshMap {
 
         if changed {
             self.coalesce_overlapping_planes(cam_y, floor_y);
-            // Mark chunks touching structural Floor/Wall/Ceiling planes dirty so flat micro-tris yield cleanly to Tier-1 planes
-            for (&ckey, chunk) in &mut self.chunks {
-                if chunk.tris.is_empty() {
-                    continue;
-                }
-                let span = CHUNK_DIM as f32 * CELL_SIZE;
-                let cc = Vec3::new(
-                    (ckey.0 as f32 + 0.5) * span,
-                    (ckey.1 as f32 + 0.5) * span,
-                    (ckey.2 as f32 + 0.5) * span,
-                );
-                let touches_struct = self.planes.iter().any(|p| {
-                    p.is_true_structural_tier1()
-                        && (cc - p.pos).dot(p.normal).abs() <= span * 0.70
-                });
-                if touches_struct {
-                    chunk.dirty = true;
+            let next_fy = self.inferred_floor_y();
+            let floor_updated = match (self.last_floor_y, next_fy) {
+                (None, Some(_)) => true,
+                (Some(a), Some(b)) => (a - b).abs() > 0.03,
+                _ => false,
+            };
+            if floor_updated {
+                self.last_floor_y = next_fy;
+                if let Some(fy) = next_fy {
+                    let span = CHUNK_DIM as f32 * CELL_SIZE;
+                    for (&ckey, chunk) in &mut self.chunks {
+                        let y_min = ckey.1 as f32 * span;
+                        let y_max = y_min + span;
+                        if fy >= y_min - 0.08 && fy <= y_max + 0.08 {
+                            chunk.dirty = true;
+                        }
+                    }
                 }
             }
-            self.mesh_gen = self.mesh_gen.wrapping_add(1);
         }
     }
 
@@ -812,8 +1062,7 @@ impl SpatialMeshMap {
         let alpha = (w_new / (old.weight + w_new)).clamp(0.12, 0.45);
         let plane_anchor = old.pos + old.normal * ((new_pos - old.pos).dot(old.normal) * alpha);
 
-        let mut combined_xz: Vec<[f32; 2]> =
-            Vec::with_capacity(old.polygon_xz.len() + new_poly.len());
+        let mut combined_xz: Vec<[f32; 2]> = Vec::with_capacity(old.polygon_xz.len() + new_poly.len());
         for &[lx, lz] in &old.polygon_xz {
             let wp = old.pos + old_ax_x * lx + old_ax_z * lz;
             let rel = wp - plane_anchor;
@@ -841,11 +1090,7 @@ impl SpatialMeshMap {
             old.weight = (old.weight + w_new * 0.25).min(20.0);
             old.is_explicit_patch = false;
             old.last_seen_gen = self.tick_gen;
-            old.kind = if old.demoted_to_object {
-                SurfaceKind::VerticalObject
-            } else {
-                classify_ar_plane(raw_type, old.pos.y, old.extent_x, old.extent_z, cam_y, floor_y)
-            };
+            old.kind = classify_ar_plane(raw_type, old.pos.y, old.extent_x, old.extent_z, cam_y, floor_y);
         }
     }
 
@@ -928,36 +1173,16 @@ impl SpatialMeshMap {
     fn mark_border_neighbors_dirty(&mut self, border_flips: &[((i32, i32, i32), usize, usize, usize)]) {
         const LAST: usize = CHUNK_DIM - 1;
         for &(ckey, lx, ly, lz) in border_flips {
-            let dx_range = if lx == 0 {
-                -1..=0
-            } else if lx == LAST {
-                0..=1
-            } else {
-                0..=0
-            };
-            let dy_range = if ly == 0 {
-                -1..=0
-            } else if ly == LAST {
-                0..=1
-            } else {
-                0..=0
-            };
-            let dz_range = if lz == 0 {
-                -1..=0
-            } else if lz == LAST {
-                0..=1
-            } else {
-                0..=0
-            };
-            for dx in dx_range {
-                for dy in dy_range.clone() {
-                    for dz in dz_range.clone() {
+            let dx_r = if lx == 0 { -1..=0 } else if lx == LAST { 0..=1 } else { 0..=0 };
+            let dy_r = if ly == 0 { -1..=0 } else if ly == LAST { 0..=1 } else { 0..=0 };
+            let dz_r = if lz == 0 { -1..=0 } else if lz == LAST { 0..=1 } else { 0..=0 };
+            for dx in dx_r {
+                for dy in dy_r.clone() {
+                    for dz in dz_r.clone() {
                         if dx == 0 && dy == 0 && dz == 0 {
                             continue;
                         }
-                        if let Some(nb) =
-                            self.chunks.get_mut(&(ckey.0 + dx, ckey.1 + dy, ckey.2 + dz))
-                        {
+                        if let Some(nb) = self.chunks.get_mut(&(ckey.0 + dx, ckey.1 + dy, ckey.2 + dz)) {
                             nb.dirty = true;
                         }
                     }
@@ -966,8 +1191,6 @@ impl SpatialMeshMap {
         }
     }
 
-    /// Integrates a single surface ray `(cam_pos, dir, d_obs)` across the TSDF truncation band
-    /// `[d_obs - TSDF_TRUNC, d_obs + 0.72 * TSDF_TRUNC]`.
     #[allow(clippy::too_many_arguments)]
     fn integrate_surface_band(
         &mut self,
@@ -978,16 +1201,16 @@ impl SpatialMeshMap {
         gen: u64,
         border_flips: &mut Vec<((i32, i32, i32), usize, usize, usize)>,
     ) -> u32 {
-        let t_start = (d_obs - TSDF_TRUNC * 0.92).max(0.18);
-        let t_end = d_obs + TSDF_TRUNC * 0.72;
-        let step = CELL_SIZE * 0.80; // 2.8cm step (< 3.5cm cell) guarantees continuous zero-crossing band
+        let obs_dist_cm = (d_obs * 100.0).round().clamp(15.0, 254.0) as u8;
+        let t_start = (d_obs - TSDF_TRUNC * 0.96).max(0.16);
+        let t_end = d_obs + TSDF_TRUNC * 0.78;
+        let step = CELL_SIZE * 0.80; // 2.0cm step (< 2.5cm cell)
 
         let mut prev_cell = (i32::MAX, i32::MAX, i32::MAX);
         let mut updated = 0u32;
         let mut t = t_start;
         while t <= t_end {
-            let p = cam_pos + dir * t;
-            let cell = Self::world_to_cell(p);
+            let cell = Self::world_to_cell(cam_pos + dir * t);
             if cell != prev_cell {
                 prev_cell = cell;
                 let center = Self::cell_center(cell.0, cell.1, cell.2);
@@ -996,7 +1219,7 @@ impl SpatialMeshMap {
                 let (ckey, lx, ly, lz) = Self::split_cell(cell.0, cell.1, cell.2);
                 if let Some(chunk) = self.get_or_alloc_chunk(ckey, gen) {
                     let idx = VoxelChunk::idx(lx, ly, lz);
-                    if chunk.fuse_voxel(idx, sdf, w, gen) {
+                    if chunk.fuse_voxel(idx, sdf, w, obs_dist_cm, false, gen) {
                         updated += 1;
                         if lx == 0
                             || ly == 0
@@ -1015,11 +1238,89 @@ impl SpatialMeshMap {
         updated
     }
 
-    /// Checks if the observed depth `d_obs` already matches an existing locked surface within `±11cm`.
-    /// Resets `change_hits` on the matched surface so sporadic single-frame noise can never accumulate.
+    /// Zero-dead-zone free-space ray carving:
+    /// - Turbo (`diff_only = false`): carves right up to `d_obs - 5.5cm` (overlapping seamlessly with
+    ///   `integrate_surface_band`'s `+sdf` front band!) and hard-erodes floating errors in 1-2 frames!
+    /// - Locked (`diff_only = true`): requires 3 consecutive ticks (`LOCK_CHANGE_CONFIRM`) before carving.
+    #[allow(clippy::too_many_arguments)]
+    fn carve_free_space_ray(
+        &mut self,
+        cam_pos: Vec3,
+        dir: Vec3,
+        d_obs: f32,
+        carve_w: f32,
+        diff_only: bool,
+        gen: u64,
+        border_flips: &mut Vec<((i32, i32, i32), usize, usize, usize)>,
+    ) -> u32 {
+        let margin = if diff_only { 0.12 } else { 0.055 };
+        let max_t = (d_obs - margin).min(2.65);
+        if max_t <= 0.18 {
+            return 0;
+        }
+        let step = CELL_SIZE * 0.85; // 2.1cm step (< 2.5cm cell -> zero Swiss cheese!)
+        let mut t = 0.18f32;
+        let mut carved = 0u32;
+        let mut steps = 0usize;
+        let mut prev_cell = (i32::MAX, i32::MAX, i32::MAX);
+        let mut miss_ckey = (i32::MAX, i32::MAX, i32::MAX);
+
+        while t < max_t && steps < 118 {
+            let cell = Self::world_to_cell(cam_pos + dir * t);
+            if cell != prev_cell {
+                prev_cell = cell;
+                let (ckey, lx, ly, lz) = Self::split_cell(cell.0, cell.1, cell.2);
+                if ckey != miss_ckey {
+                    if let Some(chunk) = self.chunks.get_mut(&ckey) {
+                        let idx = VoxelChunk::idx(lx, ly, lz);
+                        let old_w = chunk.weight[idx];
+                        let old_t = chunk.tsdf[idx];
+                        if diff_only {
+                            if old_w >= MESH_MIN_WEIGHT && old_t <= 18 {
+                                let votes = chunk.vote_change(idx, gen);
+                                if votes >= LOCK_CHANGE_CONFIRM {
+                                    if chunk.fuse_voxel(idx, 1.0, carve_w.max(36.0), 255, true, gen) {
+                                        carved += 1;
+                                        if lx == 0
+                                            || ly == 0
+                                            || lz == 0
+                                            || lx == CHUNK_DIM - 1
+                                            || ly == CHUNK_DIM - 1
+                                            || lz == CHUNK_DIM - 1
+                                        {
+                                            border_flips.push((ckey, lx, ly, lz));
+                                        }
+                                    }
+                                }
+                            }
+                        } else if old_w > 0 && old_t < 96 {
+                            if chunk.fuse_voxel(idx, 1.0, carve_w.max(40.0), 255, true, gen) {
+                                carved += 1;
+                                if lx == 0
+                                    || ly == 0
+                                    || lz == 0
+                                    || lx == CHUNK_DIM - 1
+                                    || ly == CHUNK_DIM - 1
+                                    || lz == CHUNK_DIM - 1
+                                {
+                                    border_flips.push((ckey, lx, ly, lz));
+                                }
+                            }
+                        }
+                    } else {
+                        miss_ckey = ckey;
+                    }
+                }
+            }
+            t += step;
+            steps += 1;
+        }
+        carved
+    }
+
     fn match_locked_surface_along_ray(&mut self, cam_pos: Vec3, dir: Vec3, d_obs: f32) -> bool {
-        let t_min = (d_obs - 0.11).max(0.20);
-        let t_max = d_obs + 0.11;
+        let t_min = (d_obs - 0.10).max(0.18);
+        let t_max = d_obs + 0.10;
         let step = CELL_SIZE * 0.90;
         let mut t = t_min;
         let mut prev_cell = (i32::MAX, i32::MAX, i32::MAX);
@@ -1033,9 +1334,7 @@ impl SpatialMeshMap {
                 if ckey != miss_ckey {
                     if let Some(chunk) = self.chunks.get_mut(&ckey) {
                         let idx = VoxelChunk::idx(lx, ly, lz);
-                        if chunk.weight[idx] >= MESH_MIN_WEIGHT
-                            && (-105..=40).contains(&chunk.tsdf[idx])
-                        {
+                        if chunk.weight[idx] >= MESH_MIN_WEIGHT && (-105..=40).contains(&chunk.tsdf[idx]) {
                             chunk.change_hits[idx] = 0;
                             return true;
                         }
@@ -1049,12 +1348,10 @@ impl SpatialMeshMap {
         false
     }
 
-    /// Checks if a genuine locked surface exists BEHIND `d_obs` (`d_obs + 0.14m .. d_obs + 1.8m`),
-    /// proving a newly detected surface in Locked/Maintain mode is inside our mapped room rather than unscanned space.
     fn has_locked_surface_behind(&self, cam_pos: Vec3, dir: Vec3, d_obs: f32) -> bool {
-        let t_start = d_obs + 0.14;
-        let t_end = (d_obs + 1.80).min(3.15);
-        let step = CELL_SIZE * 1.35;
+        let t_start = d_obs + 0.12;
+        let t_end = (d_obs + 1.80).min(3.10);
+        let step = CELL_SIZE * 1.6;
         let mut t = t_start;
         let mut miss_ckey = (i32::MAX, i32::MAX, i32::MAX);
 
@@ -1076,210 +1373,10 @@ impl SpatialMeshMap {
         false
     }
 
-    /// Free-space ray carving strictly IN FRONT of the observed surface.
-    /// - Turbo (`diff_only = false`): carves immediately (`< CELL_SIZE` step, chunk-miss cached).
-    /// - Locked/Maintain (`diff_only = true`): increments `change_hits` and ONLY carves once a voxel
-    ///   has been persistently seen-through for `LOCK_CHANGE_CONFIRM` (3+) consecutive ticks (~1.5s)!
-    #[allow(clippy::too_many_arguments)]
-    fn carve_free_space_ray(
-        &mut self,
-        cam_pos: Vec3,
-        dir: Vec3,
-        d_obs: f32,
-        carve_w: f32,
-        diff_only: bool,
-        gen: u64,
-        border_flips: &mut Vec<((i32, i32, i32), usize, usize, usize)>,
-    ) -> u32 {
-        let margin = if diff_only { 0.15 } else { TSDF_TRUNC * 1.30 };
-        let max_t = (d_obs - margin).min(2.6);
-        if max_t <= 0.24 {
-            return 0;
-        }
-        let step = CELL_SIZE * 0.85; // < CELL_SIZE so carving never skips a voxel along the ray
-        let mut t = 0.24f32;
-        let mut carved = 0u32;
-        let mut steps = 0usize;
-        let mut prev_cell = (i32::MAX, i32::MAX, i32::MAX);
-        let mut cached_miss_ckey = (i32::MAX, i32::MAX, i32::MAX);
-
-        while t < max_t && steps < 84 {
-            let p = cam_pos + dir * t;
-            let cell = Self::world_to_cell(p);
-            if cell != prev_cell {
-                prev_cell = cell;
-                let (ckey, lx, ly, lz) = Self::split_cell(cell.0, cell.1, cell.2);
-                if ckey != cached_miss_ckey {
-                    if let Some(chunk) = self.chunks.get_mut(&ckey) {
-                        let idx = VoxelChunk::idx(lx, ly, lz);
-                        let old_w = chunk.weight[idx];
-                        let old_t = chunk.tsdf[idx];
-                        if diff_only {
-                            if old_w >= MESH_MIN_WEIGHT && old_t <= 16 {
-                                let votes = chunk.vote_change(idx, gen);
-                                if votes >= LOCK_CHANGE_CONFIRM {
-                                    if chunk.weight[idx] > 32 {
-                                        chunk.weight[idx] = 32;
-                                    }
-                                    if chunk.fuse_voxel(idx, 1.0, carve_w.max(32.0), gen) {
-                                        carved += 1;
-                                        if lx == 0
-                                            || ly == 0
-                                            || lz == 0
-                                            || lx == CHUNK_DIM - 1
-                                            || ly == CHUNK_DIM - 1
-                                            || lz == CHUNK_DIM - 1
-                                        {
-                                            border_flips.push((ckey, lx, ly, lz));
-                                        }
-                                    }
-                                }
-                            }
-                        } else if old_w > 0 && old_t < 96 {
-                            if chunk.weight[idx] > 34 {
-                                chunk.weight[idx] = 34;
-                            }
-                            if chunk.fuse_voxel(idx, 1.0, carve_w.max(28.0), gen) {
-                                carved += 1;
-                                if lx == 0
-                                    || ly == 0
-                                    || lz == 0
-                                    || lx == CHUNK_DIM - 1
-                                    || ly == CHUNK_DIM - 1
-                                    || lz == CHUNK_DIM - 1
-                                {
-                                    border_flips.push((ckey, lx, ly, lz));
-                                }
-                            }
-                        }
-                    } else {
-                        cached_miss_ckey = ckey;
-                    }
-                }
-            }
-            t += step;
-            steps += 1;
-        }
-        carved
-    }
-
-    /// Returns `true` if `pos` sits flush (`±4.2cm`) on a genuine Tier-1 architectural Floor, Wall, or Ceiling
-    /// (`is_true_structural_tier1() == true`, NEVER small vertical furniture/monitors/boxes or demoted objects!).
-    fn is_flush_structural_plane(&self, pos: Vec3, opt_normal: Option<Vec3>) -> bool {
-        self.planes.iter().any(|p| {
-            if !p.is_true_structural_tier1() {
-                return false;
-            }
-            if let Some(n) = opt_normal {
-                if n.dot(p.normal) < 0.85 {
-                    return false;
-                }
-            }
-            let rel = pos - p.pos;
-            if rel.dot(p.normal).abs() > 0.042 {
-                return false;
-            }
-            let lx = rel.dot(p.rot * Vec3::X).abs();
-            let lz = rel.dot(p.rot * Vec3::Z).abs();
-            lx <= p.extent_x * 0.52 + 0.04 && lz <= p.extent_z * 0.52 + 0.04
-        })
-    }
-
-    /// Dynamically validates vertical `Wall` planes against live dense depth rays:
-    /// - If depth rays pass >16cm BEHIND a supposed Wall -> increments `carve_hits` (opened door / moved object / fake wall).
-    /// - If high-curvature 3D detail hits ON a supposed Wall -> increments `detail_hits` (monitor / shelf / furniture, not a flat wall).
-    /// - Confirmed smooth flat wall rays decay both counters back to 0.
-    fn validate_vertical_planes_with_ray(
-        &mut self,
-        cam_pos: Vec3,
-        dir: Vec3,
-        dist: f32,
-        curv_mm: i32,
-    ) {
-        for p in &mut self.planes {
-            if p.kind != SurfaceKind::Wall || p.demoted_to_object {
-                continue;
-            }
-            let denom = dir.dot(p.normal);
-            if denom.abs() < 0.25 {
-                continue;
-            }
-            let t = (p.pos - cam_pos).dot(p.normal) / denom;
-            if !(0.25..=3.2).contains(&t) {
-                continue;
-            }
-            let hit = cam_pos + dir * t;
-            let rel = hit - p.pos;
-            let lx = rel.dot(p.rot * Vec3::X).abs();
-            let lz = rel.dot(p.rot * Vec3::Z).abs();
-            if lx > p.extent_x * 0.50 || lz > p.extent_z * 0.50 {
-                continue;
-            }
-            if t < dist - 0.16 {
-                p.carve_hits = p.carve_hits.saturating_add(1);
-            } else if (t - dist).abs() <= 0.06 {
-                if curv_mm >= 18 {
-                    p.detail_hits = p.detail_hits.saturating_add(1);
-                } else {
-                    p.carve_hits = p.carve_hits.saturating_sub(1);
-                    p.detail_hits = p.detail_hits.saturating_sub(1);
-                }
-            }
-        }
-    }
-
-    /// Removes vertical walls contradicted by ray-through depth (`carve_hits >= 36`) and demotes
-    /// bumpy furniture misclassified as a wall (`detail_hits >= 48`) back to `VerticalObject` so
-    /// high-detail `3.5cm` TSDF immediately wraps the real object!
-    fn prune_or_demote_invalid_walls(&mut self) {
-        let mut invalidated_planes: Vec<(Vec3, Vec3)> = Vec::new();
-        let mut i = 0;
-        while i < self.planes.len() {
-            if self.planes[i].kind == SurfaceKind::Wall && !self.planes[i].demoted_to_object {
-                if self.planes[i].carve_hits >= 36 {
-                    let removed = self.planes.swap_remove(i);
-                    invalidated_planes.push((removed.pos, removed.normal));
-                    continue;
-                } else if self.planes[i].detail_hits >= 48 {
-                    let p = &mut self.planes[i];
-                    p.demoted_to_object = true;
-                    p.kind = SurfaceKind::VerticalObject;
-                    p.carve_hits = 0;
-                    p.detail_hits = 0;
-                    invalidated_planes.push((p.pos, p.normal));
-                }
-            }
-            i += 1;
-        }
-        if !invalidated_planes.is_empty() {
-            let span = CHUNK_DIM as f32 * CELL_SIZE;
-            for (&ckey, chunk) in &mut self.chunks {
-                let cc = Vec3::new(
-                    (ckey.0 as f32 + 0.5) * span,
-                    (ckey.1 as f32 + 0.5) * span,
-                    (ckey.2 as f32 + 0.5) * span,
-                );
-                if invalidated_planes
-                    .iter()
-                    .any(|&(pos, norm)| (cc - pos).dot(norm).abs() <= span * 0.85)
-                {
-                    chunk.dirty = true;
-                }
-            }
-            self.mesh_gen = self.mesh_gen.wrapping_add(1);
-        }
-    }
-
-    /// Primary Two-Tier Conformal 3D Object Scanner: ingests ARCore 16-bit Dense Depth (`AUTOMATIC` or `RAW_DEPTH_ONLY`)
-    /// directly using official `cam.imageIntrinsics` + `cam.pose` sensor-space unprojection.
-    ///
-    /// - **Two-Tier Region Split:** Flat low-curvature pixels flush on canonical Floors/Walls/Ceilings yield to sleek
-    ///   Tier-1 architectural planes (while still carving empty air in front); protruding / high-curvature object regions
-    ///   (cups, laptops, chairs, tables, corners) fuse into crisp `3.5cm` Tier-2 TSDF Surface Nets!
-    /// - **Neighborhood-Anchored Soft Confidence:** accepts smooth object interiors anchored within `±4px` to confident
-    ///   stereo edges (`>=35`) while rejecting unanchored `conf=0` mid-air voids!
-    /// - **`turbo == false` (`🔒 Khóa`)**: TRUE LOCK — ignores `±11cm` depth wobble, never scans unscanned directions,
-    ///   and requires 3 consecutive confirmed change ticks before mutating TSDF.
+    /// Primary Adaptive Multi-Resolution TSDF Scanner (`2.5cm` close-up <-> `5cm` mid-range <-> merged flat sheets, NO floor mesh!):
+    /// - Moving closer overrides stale distant errors and unlocks ultra-fine `2.5cm` triangles!
+    /// - Zero carving dead-zone (`d_obs - 5.5cm`) erases floating mistakes immediately when panning back!
+    /// - Skips bare flat floor pixels (`hit_world.y <= floor_y + 4.5cm`) while still carving above the floor!
     #[allow(clippy::too_many_arguments)]
     pub fn ingest_depth_map(
         &mut self,
@@ -1317,13 +1414,10 @@ impl SpatialMeshMap {
             return DepthIngestStats::default();
         }
 
-        if conf_bytes.is_some() {
-            self.has_seen_conf = true;
-        }
-
         self.tick_gen = self.tick_gen.wrapping_add(1);
         let gen = self.tick_gen;
         let rot = cam_rot.normalize();
+        let floor_y = self.inferred_floor_y();
 
         let sx = dw as f32 / img_w as f32;
         let sy = dh as f32 / img_h as f32;
@@ -1335,7 +1429,7 @@ impl SpatialMeshMap {
         let step_px = stride.clamp(1, 4);
         let pad_x = (dw / 24).max(2);
         let pad_y = (dh / 24).max(2);
-        let max_depth_m = if turbo { 2.95f32 } else { 2.75f32 };
+        let max_depth_m = if turbo { 2.85f32 } else { 2.65f32 };
 
         let mut stats = DepthIngestStats::default();
         let mut border_flips: Vec<((i32, i32, i32), usize, usize, usize)> = Vec::with_capacity(256);
@@ -1345,10 +1439,9 @@ impl SpatialMeshMap {
             let mut x = pad_x;
             while x + pad_x < dw {
                 let d_mm = read_depth_mm(depth_bytes, x, y, d_row_stride, d_pix_stride);
-                if (260..=2950).contains(&d_mm) {
+                if (220..=2900).contains(&d_mm) {
                     let dm = d_mm as f32 * 0.001;
                     if dm <= max_depth_m {
-                        // Neighborhood-anchored soft confidence: wraps real smooth objects cleanly while blocking mid-air voids!
                         let (conf_ok, base_w, allow_carve) = if let Some(cb) = conf_bytes {
                             let c0 = read_conf_u8(cb, x, y, dw, dh, cw, ch, c_row_stride, c_pix_stride);
                             if !turbo {
@@ -1363,28 +1456,24 @@ impl SpatialMeshMap {
                                 }
                             } else if is_raw_only {
                                 if c0 >= 65 {
-                                    (true, if c0 >= 130 { 18.0 } else { 13.0 }, c0 >= 85)
+                                    (true, if c0 >= 130 { 18.0 } else { 13.0 }, true)
                                 } else {
                                     (false, 0.0f32, false)
                                 }
-                            } else if c0 >= 95 {
+                            } else if c0 >= 90 {
                                 (true, 18.0f32, true)
                             } else if c0 >= 35 {
-                                (true, 12.0f32, true)
+                                (true, 13.0f32, true)
                             } else {
                                 let nb_c = max_nearby_conf(cb, x, y, dw, dh, cw, ch, c_row_stride, c_pix_stride);
                                 if nb_c >= 35 {
-                                    // Smooth object interior anchored to nearby confident stereo edge
-                                    (true, 9.5f32, nb_c >= 80)
+                                    (true, 10.0f32, nb_c >= 60)
                                 } else {
-                                    // Unanchored conf=0 void (blank mid-air hallucination) -> REJECT!
                                     (false, 0.0f32, false)
                                 }
                             }
                         } else {
-                            // Alternate ARCore frames when RawDepthConfidence throws NotYetAvailableException:
-                            // still fuse smooth depth gently (needs 3 independent frames to reach MESH_MIN_WEIGHT=28)
-                            (true, 10.5f32, true)
+                            (true, 11.0f32, true)
                         };
 
                         if !conf_ok {
@@ -1392,7 +1481,7 @@ impl SpatialMeshMap {
                             continue;
                         }
 
-                        // Smart ±1px silhouette jump guard: removes spiderwebs while preserving mugs/bottles/chair legs!
+                        // ±1px silhouette jump guard: eliminates spiderwebs without clipping small objects!
                         let dl1 = read_depth_mm(depth_bytes, x - 1, y, d_row_stride, d_pix_stride);
                         let dr1 = read_depth_mm(depth_bytes, x + 1, y, d_row_stride, d_pix_stride);
                         let du1 = read_depth_mm(depth_bytes, x, y - 1, d_row_stride, d_pix_stride);
@@ -1401,14 +1490,13 @@ impl SpatialMeshMap {
                             x += step_px;
                             continue;
                         }
-                        let max_jump = ((d_mm as f32) * 0.085).clamp(55.0, 160.0) as i32;
+                        let max_jump = ((d_mm as f32) * 0.085).clamp(50.0, 155.0) as i32;
                         let edge_jump = (dl1 as i32 - d_mm as i32).abs() > max_jump
                             || (dr1 as i32 - d_mm as i32).abs() > max_jump
                             || (du1 as i32 - d_mm as i32).abs() > max_jump
                             || (dd1 as i32 - d_mm as i32).abs() > max_jump;
 
                         if !edge_jump {
-                            // Exact ARCore pinhole unprojection in `cam.pose` sensor frame (+X right, +Y up, -Z forward)
                             let p_cam = Vec3::new(
                                 (x as f32 - cx_d) / fx_d * dm,
                                 (cy_d - y as f32) / fy_d * dm,
@@ -1416,55 +1504,53 @@ impl SpatialMeshMap {
                             );
                             let world_vec = rot * p_cam;
                             let dist = world_vec.length();
-                            if dist >= 0.26 && dist.is_finite() {
+                            if dist >= 0.22 && dist.is_finite() {
                                 let dir = world_vec / dist;
                                 let hit_world = cam_pos + world_vec;
                                 stats.valid_rays += 1;
 
-                                // Local depth 2nd-derivative curvature (mm): separates flat wall/floor patches from detailed objects
-                                let curv_mm = (dl1 as i32 + dr1 as i32 - 2 * d_mm as i32).abs()
-                                    + (du1 as i32 + dd1 as i32 - 2 * d_mm as i32).abs();
-                                if allow_carve && (stats.valid_rays % 3 == 0) {
-                                    self.validate_vertical_planes_with_ray(cam_pos, dir, dist, curv_mm);
-                                }
-                                let flat_structural = curv_mm < 16
-                                    && self.is_flush_structural_plane(hit_world, None);
+                                // NO FLOOR MESH: skip integrating flat bare floor pixels (<= floor_y + 4.5cm),
+                                // while still letting this ray carve any floating errors hovering above the floor!
+                                let on_bare_floor = floor_y
+                                    .map(|fy| hit_world.y <= fy + 0.045)
+                                    .unwrap_or(false);
+
+                                // Distance-proportional quality boost: close-up rays (<1.0m) carry much higher accuracy!
+                                let dist_boost = if dist <= 0.95 { 1.25 } else { 1.0 };
 
                                 if turbo {
-                                    // TURBO CONTINUOUS SCAN: carve empty air along sightline, then fuse HIGH-DETAIL regions into TSDF
                                     stats.changed_rays += 1;
                                     if allow_carve {
                                         stats.updated_voxels += self.carve_free_space_ray(
                                             cam_pos,
                                             dir,
                                             dist,
-                                            28.0,
+                                            40.0,
                                             false,
                                             gen,
                                             &mut border_flips,
                                         );
                                     }
-                                    if !flat_structural {
+                                    if !on_bare_floor {
                                         stats.updated_voxels += self.integrate_surface_band(
                                             cam_pos,
                                             dir,
                                             dist,
-                                            base_w,
+                                            base_w * dist_boost,
                                             gen,
                                             &mut border_flips,
                                         );
                                     }
                                 } else {
                                     // TRUE LOCK MODE:
-                                    // 1. If depth matches an existing locked TSDF surface (or flat structural plane) -> DO NOTHING!
-                                    if flat_structural || self.match_locked_surface_along_ray(cam_pos, dir, dist) {
-                                        // Even if hitting a flat wall behind a removed object, still allow 3-tick carving in front!
-                                        if flat_structural && allow_carve {
+                                    // 1. Unchanged locked surface (±10cm) or bare floor -> 0 writes!
+                                    if on_bare_floor || self.match_locked_surface_along_ray(cam_pos, dir, dist) {
+                                        if on_bare_floor && allow_carve {
                                             let carved = self.carve_free_space_ray(
                                                 cam_pos,
                                                 dir,
                                                 dist,
-                                                34.0,
+                                                36.0,
                                                 true,
                                                 gen,
                                                 &mut border_flips,
@@ -1477,13 +1563,13 @@ impl SpatialMeshMap {
                                         x += step_px;
                                         continue;
                                     }
-                                    // 2. Check if an old locked object in front of `dist` was removed (needs 3+ consecutive ticks!)
+                                    // 2. Confirmed 3-tick removal of old object in front of `dist`
                                     if allow_carve {
                                         let carved = self.carve_free_space_ray(
                                             cam_pos,
                                             dir,
                                             dist,
-                                            34.0,
+                                            36.0,
                                             true,
                                             gen,
                                             &mut border_flips,
@@ -1493,8 +1579,7 @@ impl SpatialMeshMap {
                                             stats.updated_voxels += carved;
                                         }
                                     }
-                                    // 3. ONLY add a new object if a locked surface (TSDF or Floor/Wall) exists BEHIND it
-                                    //    AND it stays stationary for 3+ consecutive ticks!
+                                    // 3. Confirmed 3-tick placement of new object in front of existing locked surface
                                     if self.has_locked_surface_behind(cam_pos, dir, dist) {
                                         let (gx, gy, gz) = Self::world_to_cell(hit_world);
                                         let (ckey, lx, ly, lz) = Self::split_cell(gx, gy, gz);
@@ -1532,28 +1617,27 @@ impl SpatialMeshMap {
             self.has_dense_depth = true;
         }
 
-        self.prune_or_demote_invalid_walls();
-
         if !border_flips.is_empty() {
             self.mark_border_neighbors_dirty(&border_flips);
         }
 
         self.chunks.retain(|_, c| {
             c.surface_count > 0
-                || !c.tris.is_empty()
+                || c.total_tris_len() > 0
                 || gen.saturating_sub(c.last_touched_gen) <= 45
         });
 
         stats
     }
 
-    /// Fallback sparse ARCore SLAM PointCloud TSDF ingestion (active only when dense Depth API has not produced data).
+    /// Fallback sparse SLAM PointCloud TSDF ingestion (only before Dense Depth warms up or on non-Depth devices).
     pub fn ingest_point_cloud(&mut self, point_count: usize, packed_xyzc: &[f32], cam_pos: Vec3) {
         if self.has_dense_depth {
             return;
         }
         self.tick_gen = self.tick_gen.wrapping_add(1);
         let gen = self.tick_gen;
+        let floor_y = self.inferred_floor_y();
         let n = point_count.min(packed_xyzc.len() / 4);
         let mut border_flips: Vec<((i32, i32, i32), usize, usize, usize)> = Vec::new();
 
@@ -1567,16 +1651,20 @@ impl SpatialMeshMap {
             if !pt.is_finite() {
                 continue;
             }
+            if let Some(fy) = floor_y {
+                if pt.y <= fy + 0.045 {
+                    continue;
+                }
+            }
             let delta = pt - cam_pos;
             let dist_sq = delta.length_squared();
-            if !(0.22 * 0.22..=3.5 * 3.5).contains(&dist_sq) {
+            if !(0.22 * 0.22..=3.2 * 3.2).contains(&dist_sq) {
                 continue;
             }
             let dist = dist_sq.sqrt();
             let dir = delta / dist;
-
             if i % 3 == 0 {
-                self.carve_free_space_ray(cam_pos, dir, dist, 12.0, false, gen, &mut border_flips);
+                self.carve_free_space_ray(cam_pos, dir, dist, 18.0, false, gen, &mut border_flips);
             }
             let w = if conf >= 0.72 { 16.0 } else { 12.0 };
             self.integrate_surface_band(cam_pos, dir, dist, w, gen, &mut border_flips);
@@ -1585,15 +1673,11 @@ impl SpatialMeshMap {
         if !border_flips.is_empty() {
             self.mark_border_neighbors_dirty(&border_flips);
         }
-
         self.chunks.retain(|_, c| {
-            c.surface_count > 0
-                || !c.tris.is_empty()
-                || gen.saturating_sub(c.last_touched_gen) <= 60
+            c.surface_count > 0 || c.total_tris_len() > 0 || gen.saturating_sub(c.last_touched_gen) <= 60
         });
     }
 
-    /// Budgeted Incremental TSDF Zero-Crossing Surface Nets Meshing — rebuilds at most `max_dirty_chunks` per frame.
     pub fn step_greedy_meshing(&mut self, max_dirty_chunks: usize) -> usize {
         let dirty_keys: Vec<(i32, i32, i32)> = self
             .chunks
@@ -1609,9 +1693,10 @@ impl SpatialMeshMap {
 
         let floor_y = self.inferred_floor_y();
         for ckey in &dirty_keys {
-            let (tris, aabbs) = self.build_chunk_tsdf_surface_nets(*ckey, floor_y);
+            let (detail_tris, flat_tris, aabbs) = self.build_chunk_adaptive_mesh(*ckey, floor_y);
             if let Some(chunk) = self.chunks.get_mut(ckey) {
-                chunk.tris = tris;
+                chunk.detail_tris = detail_tris;
+                chunk.flat_tris = flat_tris;
                 chunk.aabbs = aabbs;
                 chunk.dirty = false;
             }
@@ -1621,48 +1706,58 @@ impl SpatialMeshMap {
         dirty_keys.len()
     }
 
-    /// Fast L1-Cache Halo TSDF Zero-Crossing Surface Nets Mesher:
-    /// Copies chunk + 1-voxel neighbor border into an `18×18×18` flat array (at most 27 HashMap lookups),
-    /// interpolates exact `tsdf = 0` crossings on all 12 dual-cell edges, computes outward TSDF-gradient normals,
-    /// applies gentle 20% Laplacian polish (preserving sharp edges on laptops/mugs/tables), and emits
-    /// guaranteed outward-CCW single-sided conformal triangles with ZERO back-face bubbles.
-    fn build_chunk_tsdf_surface_nets(
+    /// Adaptive Multi-Resolution TSDF Surface Nets + Coplanar Flat Greedy Merger + Floating Island Pruner:
+    /// 1. Prunes isolated floating mid-air islands (`< 7` voxels inside chunk).
+    /// 2. Suppresses bare floor quads (`n.y >= 0.80 && y <= floor_y + 5cm`).
+    /// 3. Merges flat / simple faces via 2D Greedy Rectangle Merging into 1 crisp unified sheet (`flat_tris`).
+    /// 4. Keeps bumpy/curved regions at `2.5cm` micro-triangles when scanned up close (`<= 0.95m`), or `5.0cm`
+    ///    coalesced quads when scanned only from afar (`detail_tris`)!
+    fn build_chunk_adaptive_mesh(
         &self,
         ckey: (i32, i32, i32),
         floor_y: Option<f32>,
-    ) -> (Vec<TriMeshVertex>, Vec<AabbCollider>) {
+    ) -> (Vec<TriMeshVertex>, Vec<TriMeshVertex>, Vec<AabbCollider>) {
         let Some(chunk) = self.chunks.get(&ckey) else {
-            return (Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), Vec::new());
         };
         if chunk.surface_count == 0 {
-            return (Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), Vec::new());
         }
+
+        let keep_mask = compute_non_floater_mask(chunk);
 
         let base_gx = ckey.0 * (CHUNK_DIM as i32);
         let base_gy = ckey.1 * (CHUNK_DIM as i32);
         let base_gz = ckey.2 * (CHUNK_DIM as i32);
 
-        // Step 0: Populate 18x18x18 padded primal halo (indices 0..18 map to local -1..=16)
         const H: usize = CHUNK_DIM + 2; // 18
-        const H_VOL: usize = H * H * H; // 5832
+        const H_VOL: usize = H * H * H;
         let h_idx = |x: usize, y: usize, z: usize| -> usize { (y * H + z) * H + x };
 
         let mut h_tsdf = [127i8; H_VOL];
         let mut h_weight = [0u8; H_VOL];
+        let mut h_dist = [255u8; H_VOL];
 
-        // Copy center chunk interior (local 0..16 -> halo 1..17)
         for ly in 0..CHUNK_DIM {
             for lz in 0..CHUNK_DIM {
                 let src_row = (ly * CHUNK_DIM + lz) * CHUNK_DIM;
                 let dst_row = ((ly + 1) * H + (lz + 1)) * H + 1;
-                h_tsdf[dst_row..dst_row + CHUNK_DIM]
-                    .copy_from_slice(&chunk.tsdf[src_row..src_row + CHUNK_DIM]);
-                h_weight[dst_row..dst_row + CHUNK_DIM]
-                    .copy_from_slice(&chunk.weight[src_row..src_row + CHUNK_DIM]);
+                for lx in 0..CHUNK_DIM {
+                    let si = src_row + lx;
+                    // Pruned floating island specks are treated as empty air during meshing!
+                    if VoxelChunk::is_near_surface(chunk.tsdf[si], chunk.weight[si]) && !keep_mask[si] {
+                        h_tsdf[dst_row + lx] = 127;
+                        h_weight[dst_row + lx] = 0;
+                        h_dist[dst_row + lx] = 255;
+                    } else {
+                        h_tsdf[dst_row + lx] = chunk.tsdf[si];
+                        h_weight[dst_row + lx] = chunk.weight[si];
+                        h_dist[dst_row + lx] = chunk.min_dist_cm[si];
+                    }
+                }
             }
         }
 
-        // Copy 1-voxel boundary faces/edges/corners from up to 26 neighbors
         for dy in -1i32..=1 {
             for dz in -1i32..=1 {
                 for dx in -1i32..=1 {
@@ -1692,45 +1787,31 @@ impl SpatialMeshMap {
                             let src = ((ny0 + oy) * CHUNK_DIM + (nz0 + oz)) * CHUNK_DIM + nx0;
                             let dst = ((hy0 + oy) * H + (hz0 + oz)) * H + hx0;
                             h_tsdf[dst..dst + sx_len].copy_from_slice(&nb.tsdf[src..src + sx_len]);
-                            h_weight[dst..dst + sx_len]
-                                .copy_from_slice(&nb.weight[src..src + sx_len]);
+                            h_weight[dst..dst + sx_len].copy_from_slice(&nb.weight[src..src + sx_len]);
+                            h_dist[dst..dst + sx_len].copy_from_slice(&nb.min_dist_cm[src..src + sx_len]);
                         }
                     }
                 }
             }
         }
 
-        // Step A: Place dual vertices on 17x17x17 grid at exact linear zero-crossings of the 12 cube edges
-        const D: usize = CHUNK_DIM + 1; // 17
+        // Step A: Dual vertices on 17x17x17 grid at exact linear tsdf = 0 zero-crossings
+        const D: usize = CHUNK_DIM + 1;
         const D_VOL: usize = D * D * D;
         let d_idx = |x: usize, y: usize, z: usize| -> usize { (y * D + z) * D + x };
 
         let mut dual_pos: Vec<Option<Vec3>> = vec![None; D_VOL];
         let mut dual_norm: Vec<Vec3> = vec![Vec3::Y; D_VOL];
+        let mut dual_dist: Vec<u8> = vec![255u8; D_VOL];
 
         const CUBE_EDGES: [(usize, usize); 12] = [
-            (0, 1),
-            (2, 3),
-            (4, 5),
-            (6, 7),
-            (0, 2),
-            (1, 3),
-            (4, 6),
-            (5, 7),
-            (0, 4),
-            (1, 5),
-            (2, 6),
-            (3, 7),
+            (0, 1), (2, 3), (4, 5), (6, 7),
+            (0, 2), (1, 3), (4, 6), (5, 7),
+            (0, 4), (1, 5), (2, 6), (3, 7),
         ];
         const CORNER_OFF: [(usize, usize, usize); 8] = [
-            (0, 0, 0),
-            (1, 0, 0),
-            (0, 0, 1),
-            (1, 0, 1),
-            (0, 1, 0),
-            (1, 1, 0),
-            (0, 1, 1),
-            (1, 1, 1),
+            (0, 0, 0), (1, 0, 0), (0, 0, 1), (1, 0, 1),
+            (0, 1, 0), (1, 1, 0), (0, 1, 1), (1, 1, 1),
         ];
 
         for ly in 0..D {
@@ -1739,6 +1820,7 @@ impl SpatialMeshMap {
                     let mut c_tsdf = [0i8; 8];
                     let mut c_w = [0u8; 8];
                     let mut c_pos = [Vec3::ZERO; 8];
+                    let mut min_d = 255u8;
                     let mut any_pos = false;
                     let mut any_neg = false;
 
@@ -1750,19 +1832,14 @@ impl SpatialMeshMap {
                         c_tsdf[k] = t;
                         c_w[k] = w;
                         if w >= MESH_MIN_WEIGHT {
-                            if t > 0 {
-                                any_pos = true;
-                            } else {
-                                any_neg = true;
-                            }
+                            min_d = min_d.min(h_dist[hi]);
+                            if t > 0 { any_pos = true; } else { any_neg = true; }
                         }
-                        // Halo index (lx + ox) corresponds to global cell (base_gx + lx + ox - 1)
                         let gx = base_gx + (lx + ox) as i32 - 1;
                         let gy = base_gy + (ly + oy) as i32 - 1;
                         let gz = base_gz + (lz + oz) as i32 - 1;
                         c_pos[k] = Self::cell_center(gx, gy, gz);
                     }
-
                     if !(any_pos && any_neg) {
                         continue;
                     }
@@ -1788,8 +1865,8 @@ impl SpatialMeshMap {
                     if cross_n > 0 {
                         let di = d_idx(lx, ly, lz);
                         dual_pos[di] = Some(cross_sum / (cross_n as f32));
+                        dual_dist[di] = min_d;
 
-                        // TSDF gradient points from inside (-tsdf) toward empty air (+tsdf) = exact outward normal!
                         let mut grad = Vec3::ZERO;
                         for k in 0..8 {
                             if c_w[k] >= MESH_MIN_WEIGHT {
@@ -1807,7 +1884,7 @@ impl SpatialMeshMap {
             }
         }
 
-        // Step B: Gentle 20% Laplacian polish + local 3D curvature estimation (separates high-detail edges from flat patches)
+        // Step B: Gentle 18% Laplacian polish + 3D normal curvature estimation
         let mut smooth_pos = dual_pos.clone();
         let mut dual_curv = vec![0.0f32; D_VOL];
         for ly in 1..(D - 1) {
@@ -1820,12 +1897,9 @@ impl SpatialMeshMap {
                     let mut curv_sum = 0.0f32;
                     let mut nb_cnt = 0u32;
                     for (ox, oy, oz) in [
-                        (-1isize, 0, 0),
-                        (1, 0, 0),
-                        (0, -1, 0),
-                        (0, 1, 0),
-                        (0, 0, -1),
-                        (0, 0, 1),
+                        (-1isize, 0, 0), (1, 0, 0),
+                        (0, -1, 0), (0, 1, 0),
+                        (0, 0, -1), (0, 0, 1),
                     ] {
                         let ni = d_idx(
                             (lx as isize + ox) as usize,
@@ -1839,146 +1913,183 @@ impl SpatialMeshMap {
                         }
                     }
                     if nb_cnt >= 2 {
-                        smooth_pos[di] = Some(cur * 0.80 + (nb_sum / nb_cnt as f32) * 0.20);
+                        smooth_pos[di] = Some(cur * 0.82 + (nb_sum / nb_cnt as f32) * 0.18);
                         dual_curv[di] = curv_sum / (nb_cnt as f32);
                     }
                 }
             }
         }
 
-        // Step C: Stitch single-sided outward-CCW quads across locked primal sign-changing edges (+X, +Y, +Z)
-        let mut tris = Vec::with_capacity((chunk.surface_count as usize) * 6);
-        let _ = floor_y;
+        // Step C: Collect axis-aligned slices (+X/-X, +Y/-Y, +Z/-Z), drop floor quads, and run
+        // Coplanar Greedy Merge (flat faces -> 1 unified quad) + Distance LOD (<=95cm: 2.5cm, >95cm: 5cm)!
+        let mut detail_tris = Vec::with_capacity((chunk.surface_count as usize) * 3);
+        let mut flat_tris = Vec::with_capacity(128);
 
-        for ly in 0..CHUNK_DIM {
+        let is_floor_quad = |mid: Vec3, n: Vec3| -> bool {
+            if let Some(fy) = floor_y {
+                n.y >= 0.78 && mid.y <= fy + 0.052
+            } else {
+                false
+            }
+        };
+
+        // Axis 0 (+X / -X slices indexed by lx, grid[lz][ly])
+        for lx in 0..CHUNK_DIM {
+            let mut pos_grid = [[None; CHUNK_DIM]; CHUNK_DIM];
+            let mut neg_grid = [[None; CHUNK_DIM]; CHUNK_DIM];
+            let mut any_pos = false;
+            let mut any_neg = false;
             for lz in 0..CHUNK_DIM {
-                for lx in 0..CHUNK_DIM {
+                for ly in 0..CHUNK_DIM {
                     let hi0 = h_idx(lx + 1, ly + 1, lz + 1);
-                    let w0 = h_weight[hi0];
-                    if w0 < MESH_MIN_WEIGHT {
-                        continue;
-                    }
-                    // Anti-floater dust filter: strip isolated 1-voxel specks (0 locked surface neighbors)
-                    let mut nb_surf = 0u8;
-                    for (ox, oy, oz) in [
-                        (0usize, 1usize, 1usize),
-                        (2, 1, 1),
-                        (1, 0, 1),
-                        (1, 2, 1),
-                        (1, 1, 0),
-                        (1, 1, 2),
-                    ] {
-                        let ni = h_idx(lx + ox, ly + oy, lz + oz);
-                        if h_weight[ni] >= MESH_MIN_WEIGHT && (-105..=32).contains(&h_tsdf[ni]) {
-                            nb_surf += 1;
-                        }
-                    }
-                    if nb_surf < 1 {
-                        continue;
-                    }
-                    let t0 = h_tsdf[hi0];
-                    let s0_solid = t0 <= 0;
-
-                    // Edge along +X: voxel (lx, ly, lz) -> (lx+1, ly, lz)
                     let hix = h_idx(lx + 2, ly + 1, lz + 1);
-                    if h_weight[hix] >= MESH_MIN_WEIGHT && (h_tsdf[hix] <= 0) != s0_solid {
-                        let i0 = d_idx(lx + 1, ly, lz);
-                        let i1 = d_idx(lx + 1, ly + 1, lz);
-                        let i2 = d_idx(lx + 1, ly + 1, lz + 1);
-                        let i3 = d_idx(lx + 1, ly, lz + 1);
-                        if let (Some(p0), Some(p1), Some(p2), Some(p3)) =
-                            (smooth_pos[i0], smooth_pos[i1], smooth_pos[i2], smooth_pos[i3])
-                        {
-                            let n = (dual_norm[i0] + dual_norm[i1] + dual_norm[i2] + dual_norm[i3])
-                                .normalize_or_zero();
-                            let n = if n.length_squared() > 1e-4 {
-                                n
-                            } else if s0_solid {
-                                Vec3::X
-                            } else {
-                                Vec3::NEG_X
-                            };
-                            let mid = (p0 + p2) * 0.5;
-                            let curv = (dual_curv[i0] + dual_curv[i1] + dual_curv[i2] + dual_curv[i3]) * 0.25;
-                            if curv >= 0.085 || !self.is_flush_structural_plane(mid, Some(n)) {
-                                let col = tsdf_detail_color(curv, n);
-                                if s0_solid {
-                                    push_mesh_quad(&mut tris, p0, p1, p2, p3, n, col);
-                                } else {
-                                    push_mesh_quad(&mut tris, p0, p3, p2, p1, n, col);
-                                }
-                            }
-                        }
+                    if h_weight[hi0] < MESH_MIN_WEIGHT || h_weight[hix] < MESH_MIN_WEIGHT {
+                        continue;
                     }
-
-                    // Edge along +Y: voxel (lx, ly, lz) -> (lx, ly+1, lz)
-                    let hiy = h_idx(lx + 1, ly + 2, lz + 1);
-                    if h_weight[hiy] >= MESH_MIN_WEIGHT && (h_tsdf[hiy] <= 0) != s0_solid {
-                        let i0 = d_idx(lx, ly + 1, lz);
-                        let i1 = d_idx(lx, ly + 1, lz + 1);
-                        let i2 = d_idx(lx + 1, ly + 1, lz + 1);
-                        let i3 = d_idx(lx + 1, ly + 1, lz);
-                        if let (Some(p0), Some(p1), Some(p2), Some(p3)) =
-                            (smooth_pos[i0], smooth_pos[i1], smooth_pos[i2], smooth_pos[i3])
-                        {
-                            let n = (dual_norm[i0] + dual_norm[i1] + dual_norm[i2] + dual_norm[i3])
-                                .normalize_or_zero();
-                            let n = if n.length_squared() > 1e-4 {
-                                n
-                            } else if s0_solid {
-                                Vec3::Y
-                            } else {
-                                Vec3::NEG_Y
-                            };
-                            let mid = (p0 + p2) * 0.5;
-                            let curv = (dual_curv[i0] + dual_curv[i1] + dual_curv[i2] + dual_curv[i3]) * 0.25;
-                            if curv >= 0.085 || !self.is_flush_structural_plane(mid, Some(n)) {
-                                let col = tsdf_detail_color(curv, n);
-                                if s0_solid {
-                                    push_mesh_quad(&mut tris, p0, p1, p2, p3, n, col);
-                                } else {
-                                    push_mesh_quad(&mut tris, p0, p3, p2, p1, n, col);
-                                }
-                            }
-                        }
+                    let s0 = h_tsdf[hi0] <= 0;
+                    if s0 == (h_tsdf[hix] <= 0) {
+                        continue;
                     }
-
-                    // Edge along +Z: voxel (lx, ly, lz) -> (lx, ly, lz+1)
-                    let hiz = h_idx(lx + 1, ly + 1, lz + 2);
-                    if h_weight[hiz] >= MESH_MIN_WEIGHT && (h_tsdf[hiz] <= 0) != s0_solid {
-                        let i0 = d_idx(lx, ly, lz + 1);
-                        let i1 = d_idx(lx + 1, ly, lz + 1);
-                        let i2 = d_idx(lx + 1, ly + 1, lz + 1);
-                        let i3 = d_idx(lx, ly + 1, lz + 1);
-                        if let (Some(p0), Some(p1), Some(p2), Some(p3)) =
-                            (smooth_pos[i0], smooth_pos[i1], smooth_pos[i2], smooth_pos[i3])
-                        {
-                            let n = (dual_norm[i0] + dual_norm[i1] + dual_norm[i2] + dual_norm[i3])
-                                .normalize_or_zero();
-                            let n = if n.length_squared() > 1e-4 {
-                                n
-                            } else if s0_solid {
-                                Vec3::Z
-                            } else {
-                                Vec3::NEG_Z
-                            };
-                            let mid = (p0 + p2) * 0.5;
-                            let curv = (dual_curv[i0] + dual_curv[i1] + dual_curv[i2] + dual_curv[i3]) * 0.25;
-                            if curv >= 0.085 || !self.is_flush_structural_plane(mid, Some(n)) {
-                                let col = tsdf_detail_color(curv, n);
-                                if s0_solid {
-                                    push_mesh_quad(&mut tris, p0, p1, p2, p3, n, col);
-                                } else {
-                                    push_mesh_quad(&mut tris, p0, p3, p2, p1, n, col);
-                                }
-                            }
+                    let i0 = d_idx(lx + 1, ly, lz);
+                    let i1 = d_idx(lx + 1, ly + 1, lz);
+                    let i2 = d_idx(lx + 1, ly + 1, lz + 1);
+                    let i3 = d_idx(lx + 1, ly, lz + 1);
+                    if let (Some(p0), Some(p1), Some(p2), Some(p3)) =
+                        (smooth_pos[i0], smooth_pos[i1], smooth_pos[i2], smooth_pos[i3])
+                    {
+                        let n = (dual_norm[i0] + dual_norm[i1] + dual_norm[i2] + dual_norm[i3]).normalize_or_zero();
+                        let n = if n.length_squared() > 1e-4 { n } else if s0 { Vec3::X } else { Vec3::NEG_X };
+                        let mid = (p0 + p2) * 0.5;
+                        if is_floor_quad(mid, n) {
+                            continue;
+                        }
+                        let curv = (dual_curv[i0] + dual_curv[i1] + dual_curv[i2] + dual_curv[i3]) * 0.25;
+                        let min_d = dual_dist[i0].min(dual_dist[i1]).min(dual_dist[i2]).min(dual_dist[i3]);
+                        let axis_dir = if s0 { Vec3::X } else { Vec3::NEG_X };
+                        let is_flat = curv < 0.085 && n.dot(axis_dir) >= 0.74;
+                        let q = CandidateQuad {
+                            p0, p1, p2, p3, normal: n, curv, min_dist_cm: min_d, is_flat,
+                            plane_bin: (mid.x / 0.015).round() as i16,
+                        };
+                        if s0 {
+                            pos_grid[lz][ly] = Some(q);
+                            any_pos = true;
+                        } else {
+                            neg_grid[lz][ly] = Some(q);
+                            any_neg = true;
                         }
                     }
                 }
             }
+            if any_pos { emit_adaptive_slice(&pos_grid, 0, true, &mut flat_tris, &mut detail_tris); }
+            if any_neg { emit_adaptive_slice(&neg_grid, 0, false, &mut flat_tris, &mut detail_tris); }
         }
 
-        // Step D: Merged per-layer XZ physics AABBs directly on the zero-crossing shell for 120Hz collisions
+        // Axis 1 (+Y / -Y slices indexed by ly, grid[lx][lz])
+        for ly in 0..CHUNK_DIM {
+            let mut pos_grid = [[None; CHUNK_DIM]; CHUNK_DIM];
+            let mut neg_grid = [[None; CHUNK_DIM]; CHUNK_DIM];
+            let mut any_pos = false;
+            let mut any_neg = false;
+            for lx in 0..CHUNK_DIM {
+                for lz in 0..CHUNK_DIM {
+                    let hi0 = h_idx(lx + 1, ly + 1, lz + 1);
+                    let hiy = h_idx(lx + 1, ly + 2, lz + 1);
+                    if h_weight[hi0] < MESH_MIN_WEIGHT || h_weight[hiy] < MESH_MIN_WEIGHT {
+                        continue;
+                    }
+                    let s0 = h_tsdf[hi0] <= 0;
+                    if s0 == (h_tsdf[hiy] <= 0) {
+                        continue;
+                    }
+                    let i0 = d_idx(lx, ly + 1, lz);
+                    let i1 = d_idx(lx, ly + 1, lz + 1);
+                    let i2 = d_idx(lx + 1, ly + 1, lz + 1);
+                    let i3 = d_idx(lx + 1, ly + 1, lz);
+                    if let (Some(p0), Some(p1), Some(p2), Some(p3)) =
+                        (smooth_pos[i0], smooth_pos[i1], smooth_pos[i2], smooth_pos[i3])
+                    {
+                        let n = (dual_norm[i0] + dual_norm[i1] + dual_norm[i2] + dual_norm[i3]).normalize_or_zero();
+                        let n = if n.length_squared() > 1e-4 { n } else if s0 { Vec3::Y } else { Vec3::NEG_Y };
+                        let mid = (p0 + p2) * 0.5;
+                        if is_floor_quad(mid, n) {
+                            continue;
+                        }
+                        let curv = (dual_curv[i0] + dual_curv[i1] + dual_curv[i2] + dual_curv[i3]) * 0.25;
+                        let min_d = dual_dist[i0].min(dual_dist[i1]).min(dual_dist[i2]).min(dual_dist[i3]);
+                        let axis_dir = if s0 { Vec3::Y } else { Vec3::NEG_Y };
+                        let is_flat = curv < 0.085 && n.dot(axis_dir) >= 0.74;
+                        let q = CandidateQuad {
+                            p0, p1, p2, p3, normal: n, curv, min_dist_cm: min_d, is_flat,
+                            plane_bin: (mid.y / 0.015).round() as i16,
+                        };
+                        if s0 {
+                            pos_grid[lx][lz] = Some(q);
+                            any_pos = true;
+                        } else {
+                            neg_grid[lx][lz] = Some(q);
+                            any_neg = true;
+                        }
+                    }
+                }
+            }
+            if any_pos { emit_adaptive_slice(&pos_grid, 1, true, &mut flat_tris, &mut detail_tris); }
+            if any_neg { emit_adaptive_slice(&neg_grid, 1, false, &mut flat_tris, &mut detail_tris); }
+        }
+
+        // Axis 2 (+Z / -Z slices indexed by lz, grid[ly][lx])
+        for lz in 0..CHUNK_DIM {
+            let mut pos_grid = [[None; CHUNK_DIM]; CHUNK_DIM];
+            let mut neg_grid = [[None; CHUNK_DIM]; CHUNK_DIM];
+            let mut any_pos = false;
+            let mut any_neg = false;
+            for ly in 0..CHUNK_DIM {
+                for lx in 0..CHUNK_DIM {
+                    let hi0 = h_idx(lx + 1, ly + 1, lz + 1);
+                    let hiz = h_idx(lx + 1, ly + 1, lz + 2);
+                    if h_weight[hi0] < MESH_MIN_WEIGHT || h_weight[hiz] < MESH_MIN_WEIGHT {
+                        continue;
+                    }
+                    let s0 = h_tsdf[hi0] <= 0;
+                    if s0 == (h_tsdf[hiz] <= 0) {
+                        continue;
+                    }
+                    let i0 = d_idx(lx, ly, lz + 1);
+                    let i1 = d_idx(lx + 1, ly, lz + 1);
+                    let i2 = d_idx(lx + 1, ly + 1, lz + 1);
+                    let i3 = d_idx(lx, ly + 1, lz + 1);
+                    if let (Some(p0), Some(p1), Some(p2), Some(p3)) =
+                        (smooth_pos[i0], smooth_pos[i1], smooth_pos[i2], smooth_pos[i3])
+                    {
+                        let n = (dual_norm[i0] + dual_norm[i1] + dual_norm[i2] + dual_norm[i3]).normalize_or_zero();
+                        let n = if n.length_squared() > 1e-4 { n } else if s0 { Vec3::Z } else { Vec3::NEG_Z };
+                        let mid = (p0 + p2) * 0.5;
+                        if is_floor_quad(mid, n) {
+                            continue;
+                        }
+                        let curv = (dual_curv[i0] + dual_curv[i1] + dual_curv[i2] + dual_curv[i3]) * 0.25;
+                        let min_d = dual_dist[i0].min(dual_dist[i1]).min(dual_dist[i2]).min(dual_dist[i3]);
+                        let axis_dir = if s0 { Vec3::Z } else { Vec3::NEG_Z };
+                        let is_flat = curv < 0.085 && n.dot(axis_dir) >= 0.74;
+                        let q = CandidateQuad {
+                            p0, p1, p2, p3, normal: n, curv, min_dist_cm: min_d, is_flat,
+                            plane_bin: (mid.z / 0.015).round() as i16,
+                        };
+                        if s0 {
+                            pos_grid[ly][lx] = Some(q);
+                            any_pos = true;
+                        } else {
+                            neg_grid[ly][lx] = Some(q);
+                            any_neg = true;
+                        }
+                    }
+                }
+            }
+            if any_pos { emit_adaptive_slice(&pos_grid, 2, true, &mut flat_tris, &mut detail_tris); }
+            if any_neg { emit_adaptive_slice(&neg_grid, 2, false, &mut flat_tris, &mut detail_tris); }
+        }
+
+        // Step D: Merged per-layer XZ physics AABBs (only from non-floater surface voxels!)
         let mut aabbs = Vec::with_capacity(16);
         for ly in 0..CHUNK_DIM {
             let mut mask = [[false; CHUNK_DIM]; CHUNK_DIM];
@@ -1986,7 +2097,8 @@ impl SpatialMeshMap {
             for lz in 0..CHUNK_DIM {
                 for lx in 0..CHUNK_DIM {
                     let idx = VoxelChunk::idx(lx, ly, lz);
-                    if chunk.weight[idx] >= MESH_MIN_WEIGHT
+                    if keep_mask[idx]
+                        && chunk.weight[idx] >= MESH_MIN_WEIGHT
                         && (-75..=14).contains(&chunk.tsdf[idx])
                     {
                         mask[lz][lx] = true;
@@ -2027,8 +2139,7 @@ impl SpatialMeshMap {
                         (base_gy + ly as i32) as f32 * CELL_SIZE,
                         (base_gz + lz as i32) as f32 * CELL_SIZE,
                     );
-                    let max =
-                        min + Vec3::new(w as f32 * CELL_SIZE, CELL_SIZE, h as f32 * CELL_SIZE);
+                    let max = min + Vec3::new(w as f32 * CELL_SIZE, CELL_SIZE, h as f32 * CELL_SIZE);
                     aabbs.push(AabbCollider {
                         min,
                         max,
@@ -2039,18 +2150,14 @@ impl SpatialMeshMap {
             }
         }
 
-        (tris, aabbs)
+        (detail_tris, flat_tris, aabbs)
     }
 
-    pub fn snapshot_plane_markers(&self, include_all_types: bool) -> Vec<PlaneMarker> {
+    pub fn snapshot_plane_markers(&self, _include_all_types: bool) -> Vec<PlaneMarker> {
         self.planes
             .iter()
             .filter(|p| {
-                include_all_types
-                    || matches!(
-                        p.kind,
-                        SurfaceKind::Floor | SurfaceKind::Wall | SurfaceKind::Table | SurfaceKind::Seat
-                    )
+                matches!(p.kind, SurfaceKind::Floor | SurfaceKind::Table | SurfaceKind::Seat | SurfaceKind::Wall)
                     || p.is_explicit_patch
             })
             .map(CanonicalPlane::to_plane_marker)
@@ -2072,11 +2179,7 @@ impl SpatialMeshMap {
                     (ckey.2 as f32 + 0.5) * chunk_span,
                 );
                 let d2 = (center - cam_pos).length_squared();
-                if d2 <= 3.2 * 3.2 {
-                    Some((d2, chunk))
-                } else {
-                    None
-                }
+                if d2 <= 3.0 * 3.0 { Some((d2, chunk)) } else { None }
             })
             .collect();
         nearby.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -2093,10 +2196,8 @@ impl SpatialMeshMap {
         out
     }
 
-    /// Builds Two-Tier Triangle Mesh VBO returning `(active_chunks, detail_object_tris, structural_plane_tris)`:
-    /// - **Tier 2 (High-Detail Objects):** Nearest-first `3.5cm` TSDF Surface Nets (emerald/gold, up to `82,000` verts).
-    /// - **Tier 1 (Flat Structural Floors / Walls / Ceilings):** Clean coarse architectural triangles (cyan/blue, recessed `-6mm`
-    ///   for zero Z-fighting where objects touch the floor/wall). Never stacks Table planes over TSDF objects!
+    /// Builds nearest-first Adaptive Mesh VBO returning `(active_chunks, detail_tris, flat_merged_tris)`.
+    /// ZERO floor sheets and ZERO stuck ARCore plane rectangles!
     pub fn build_triangle_mesh_buffer(
         &self,
         cam_pos: Vec3,
@@ -2108,7 +2209,7 @@ impl SpatialMeshMap {
         let chunk_span = CHUNK_DIM as f32 * CELL_SIZE;
         let mut visible_chunks: Vec<(f32, &VoxelChunk)> = Vec::with_capacity(self.chunks.len());
         for (&ckey, chunk) in &self.chunks {
-            if chunk.tris.is_empty() {
+            if chunk.total_tris_len() == 0 {
                 continue;
             }
             let center = Vec3::new(
@@ -2127,50 +2228,38 @@ impl SpatialMeshMap {
             visible_chunks.push((dist, chunk));
         }
 
-        // Nearest-first sort ensures objects right in front of the user ALWAYS get full vertex priority!
         visible_chunks.sort_by(|a, b| a.0.total_cmp(&b.0));
 
-        let detail_vert_cap = MAX_MESH_VERTICES.saturating_sub(8_000);
         let mut active_chunks = 0u32;
+        let mut detail_verts = 0usize;
+        let mut flat_verts = 0usize;
+
         for (_, chunk) in visible_chunks {
             active_chunks += 1;
-            let remain = detail_vert_cap.saturating_sub(out.len());
-            let copy_n = (chunk.tris.len().min(remain) / 3) * 3;
-            if copy_n > 0 {
-                out.extend_from_slice(&chunk.tris[..copy_n]);
+            let remain_d = MAX_MESH_VERTICES.saturating_sub(out.len());
+            let copy_d = (chunk.detail_tris.len().min(remain_d) / 3) * 3;
+            if copy_d > 0 {
+                out.extend_from_slice(&chunk.detail_tris[..copy_d]);
+                detail_verts += copy_d;
             }
-            if out.len() + 3 > detail_vert_cap {
+            let remain_f = MAX_MESH_VERTICES.saturating_sub(out.len());
+            let copy_f = (chunk.flat_tris.len().min(remain_f) / 3) * 3;
+            if copy_f > 0 {
+                out.extend_from_slice(&chunk.flat_tris[..copy_f]);
+                flat_verts += copy_f;
+            }
+            if out.len() + 3 > MAX_MESH_VERTICES {
                 break;
             }
         }
-        let detail_verts = out.len();
 
-        // Tier 1: Always draw genuine room-scale Floor / Wall / Ceiling sheets (never small furniture misclassified as walls!)
-        let include_non_structural_fallback = !self.has_dense_depth && detail_verts < 30;
-        for plane in &self.planes {
-            let is_structural = plane.is_true_structural_tier1();
-            if !is_structural && !include_non_structural_fallback {
-                continue;
-            }
-            if out.len() + 600 > MAX_MESH_VERTICES {
-                break;
-            }
-            if (plane.pos - cam_pos).length() > MAX_RENDER_RADIUS_M + plane.bounding_radius() {
-                continue;
-            }
-            triangulate_canonical_plane(plane, out);
-        }
-
-        let detail_tris = (detail_verts / 3) as u32;
-        let plane_tris = ((out.len() - detail_verts) / 3) as u32;
-        (active_chunks, detail_tris, plane_tris)
+        (active_chunks, (detail_verts / 3) as u32, (flat_verts / 3) as u32)
     }
 
-    /// Exports active TSDF narrow-band voxels (`weight >= MESH_MIN_WEIGHT && |tsdf| <= 118`) for `.arroom` v2 persistence.
     pub fn export_tsdf_chunks(&self) -> Vec<((i32, i32, i32), Vec<(u16, i8, u8)>)> {
         let mut out = Vec::new();
         for (&ckey, chunk) in &self.chunks {
-            if chunk.surface_count == 0 && chunk.tris.is_empty() {
+            if chunk.surface_count == 0 && chunk.total_tris_len() == 0 {
                 continue;
             }
             let mut entries = Vec::with_capacity((chunk.surface_count as usize) * 2);
@@ -2221,8 +2310,8 @@ impl SpatialMeshMap {
             if let Some(chunk) = self.get_or_alloc_chunk(ckey, gen) {
                 let idx = VoxelChunk::idx(lx, ly, lz);
                 let sdf_norm = (sv.tsdf as f32 / 127.0).clamp(-1.0, 1.0);
-                let prior_w = (sv.weight as f32).clamp(MESH_MIN_WEIGHT as f32 + 12.0, 120.0);
-                chunk.fuse_voxel(idx, sdf_norm, prior_w, gen);
+                let prior_w = (sv.weight as f32).clamp(MESH_MIN_WEIGHT as f32 + 10.0, 80.0);
+                chunk.fuse_voxel(idx, sdf_norm, prior_w, 90, false, gen);
                 chunk.dirty = true;
                 imported_voxels += 1;
             }
@@ -2230,108 +2319,30 @@ impl SpatialMeshMap {
         if imported_voxels >= 16 {
             self.has_dense_depth = true;
         }
-        self.step_greedy_meshing(64);
+        self.step_greedy_meshing(96);
         self.mesh_gen = self.mesh_gen.wrapping_add(1);
     }
 
     pub fn build_obj_mesh_groups(&mut self) -> Vec<(&'static str, Vec<TriMeshVertex>)> {
         self.step_greedy_meshing(MAX_ACTIVE_CHUNKS);
-        let mut groups: Vec<(&'static str, Vec<TriMeshVertex>)> = vec![
-            ("ConformalSurfaceMesh", Vec::new()),
-            ("Floor", Vec::new()),
-            ("Table", Vec::new()),
-            ("Seat", Vec::new()),
-            ("Wall", Vec::new()),
-            ("Ceiling", Vec::new()),
-        ];
+        let mut detail = Vec::new();
+        let mut flat = Vec::new();
         for chunk in self.chunks.values() {
-            if !chunk.tris.is_empty() {
-                groups[0].1.extend_from_slice(&chunk.tris);
+            if !chunk.detail_tris.is_empty() {
+                detail.extend_from_slice(&chunk.detail_tris);
+            }
+            if !chunk.flat_tris.is_empty() {
+                flat.extend_from_slice(&chunk.flat_tris);
             }
         }
-        if groups[0].1.is_empty() {
-            for plane in &self.planes {
-                let slot = match plane.kind {
-                    SurfaceKind::Floor => 1,
-                    SurfaceKind::Table => 2,
-                    SurfaceKind::Seat => 3,
-                    SurfaceKind::Wall | SurfaceKind::VerticalObject => 4,
-                    SurfaceKind::Ceiling => 5,
-                    SurfaceKind::Unknown => continue,
-                };
-                triangulate_canonical_plane(plane, &mut groups[slot].1);
-            }
+        let mut groups = Vec::new();
+        if !detail.is_empty() {
+            groups.push(("DetailObjects", detail));
         }
-        groups.into_iter().filter(|(_, v)| !v.is_empty()).collect()
-    }
-}
-
-/// Clean coarse architectural triangulation (`~38cm` ring spacing, subtle cool fill, `-6mm` recessed
-/// so Tier-2 high-detail objects sitting on the floor or leaning against walls NEVER Z-fight!).
-pub fn triangulate_canonical_plane(plane: &CanonicalPlane, out: &mut Vec<TriMeshVertex>) {
-    let n = plane.polygon_xz.len();
-    if n < 3 {
-        return;
-    }
-    let ax_x = plane.rot * Vec3::X;
-    let ax_z = plane.rot * Vec3::Z;
-    let normal = plane.normal;
-    let is_structural = matches!(
-        plane.kind,
-        SurfaceKind::Floor | SurfaceKind::Wall | SurfaceKind::Ceiling
-    );
-    // Slight -6mm recess on Floor/Wall/Ceiling keeps Tier-2 detail objects visually crisp in front
-    let origin = if is_structural {
-        plane.pos - normal * 0.006
-    } else {
-        plane.pos + normal * 0.002
-    };
-    let rgb = surface_rgb(plane.kind);
-    let alpha = match plane.kind {
-        SurfaceKind::Floor => 0.085,
-        SurfaceKind::Wall => 0.095,
-        SurfaceKind::Ceiling => 0.065,
-        _ => 0.14,
-    };
-    let col = [rgb[0], rgb[1], rgb[2], alpha];
-
-    let mut cx = 0.0f32;
-    let mut cz = 0.0f32;
-    for &[x, z] in &plane.polygon_xz {
-        cx += x;
-        cz += z;
-    }
-    cx /= n as f32;
-    cz /= n as f32;
-
-    let avg_r: f32 = plane
-        .polygon_xz
-        .iter()
-        .map(|&[x, z]| ((x - cx) * (x - cx) + (z - cz) * (z - cz)).sqrt())
-        .sum::<f32>()
-        / (n as f32);
-
-    let ring_step = if is_structural { 0.38 } else { 0.24 };
-    let rings = ((avg_r / ring_step).ceil() as usize).clamp(1, 4);
-    let to_world = |x: f32, z: f32| origin + ax_x * x + ax_z * z;
-    let center_w = to_world(cx, cz);
-
-    for r in 0..rings {
-        let t0 = (r as f32) / (rings as f32);
-        let t1 = ((r + 1) as f32) / (rings as f32);
-        for i in 0..n {
-            let [x0, z0] = plane.polygon_xz[i];
-            let [x1, z1] = plane.polygon_xz[(i + 1) % n];
-            let p10 = to_world(cx + (x0 - cx) * t1, cz + (z0 - cz) * t1);
-            let p11 = to_world(cx + (x1 - cx) * t1, cz + (z1 - cz) * t1);
-            if r == 0 {
-                push_mesh_tri(out, center_w, p11, p10, normal, col);
-            } else {
-                let p00 = to_world(cx + (x0 - cx) * t0, cz + (z0 - cz) * t0);
-                let p01 = to_world(cx + (x1 - cx) * t0, cz + (z1 - cz) * t0);
-                push_mesh_quad(out, p00, p01, p11, p10, normal, col);
-            }
+        if !flat.is_empty() {
+            groups.push(("FlatSurfaces", flat));
         }
+        groups
     }
 }
 
@@ -2434,9 +2445,6 @@ impl TriMeshRenderer {
         }
     }
 
-    /// Pass 0 Hardware Depth-Buffer Pre-Pass: writes static room surfaces into Z-buffer only
-    /// (`color_mask = false`, pushed back `1.4cm` along `-normal` so items sitting ON tables never clip,
-    /// while occluded back-scan meshes AND virtual objects behind furniture/mugs/walls vanish cleanly).
     pub fn draw_depth_occlusion(&self, gl: &glow::Context, view_proj: &Mat4) {
         if self.vert_count <= 0 {
             return;
@@ -2470,7 +2478,6 @@ impl TriMeshRenderer {
         unsafe {
             gl.enable(glow::DEPTH_TEST);
             gl.depth_mask(false);
-            // Back-face culling works cleanly because TSDF Surface Nets guarantees outward CCW winding!
             gl.enable(glow::CULL_FACE);
             gl.cull_face(glow::BACK);
             gl.enable(glow::BLEND);
@@ -2520,466 +2527,198 @@ mod tests {
     }
 
     #[test]
-    fn coplanar_planes_merge_into_single_unified_polygon_without_overlap() {
+    fn flat_wall_merges_into_few_unified_quads_and_floor_never_renders() {
         let mut map = SpatialMeshMap::default();
-        let p1 = RawArPlane {
-            raw_type: 0,
-            pos: Vec3::new(0.0, -1.2, -1.5),
-            rot: Quat::IDENTITY,
-            extent_x: 1.2,
-            extent_z: 1.2,
-            polygon_xz: vec![[-0.6, -0.6], [0.6, -0.6], [0.6, 0.6], [-0.6, 0.6]],
-        };
-        let p2 = RawArPlane {
-            raw_type: 0,
-            pos: Vec3::new(0.5, -1.18, -1.5),
-            rot: Quat::IDENTITY,
-            extent_x: 1.0,
-            extent_z: 1.2,
-            polygon_xz: vec![[-0.5, -0.6], [0.5, -0.6], [0.5, 0.6], [-0.5, 0.6]],
-        };
-        map.ingest_ar_plane_polygons(&[p1, p2], 0.0);
-        assert_eq!(map.canonical_plane_count(), 1);
-        assert!(map.planes[0].extent_x >= 1.55);
-        assert_eq!(map.planes[0].kind, SurfaceKind::Floor);
-
-        let mut verts = Vec::new();
-        let (_, _, plane_tris) = map.build_triangle_mesh_buffer(Vec3::ZERO, Vec3::NEG_Z, &mut verts);
-        assert!(plane_tris >= 8);
-        assert_eq!(verts.len() % 3, 0);
-    }
-
-    #[test]
-    fn tsdf_hugs_curved_object_with_outward_ccw_winding_and_diff_maintain_skips_unchanged() {
-        let mut map = SpatialMeshMap::default();
-        let dw = 80usize;
-        let dh = 60usize;
-        let fx = 64.0f32;
-        let fy = 64.0f32;
-        let cx = 40.0f32;
-        let cy = 30.0f32;
-
-        // 0. Low-confidence (conf = 20) hallucinated mid-air depth must produce ZERO triangles!
-        let low_conf = vec![20u8; dw * dh];
-        let depth_ghost = make_synthetic_depth_image(dw, dh, |_, _| 750u16);
-        for _ in 0..5 {
-            map.ingest_depth_map(
-                &depth_ghost,
-                dw,
-                dh,
-                dw * 2,
-                2,
-                Some(&low_conf),
-                dw,
-                dh,
-                dw,
-                1,
-                false,
-                fx,
-                fy,
-                cx,
-                cy,
-                dw,
-                dh,
-                Vec3::ZERO,
-                Quat::IDENTITY,
-                true,
-                1,
-            );
-        }
-        map.step_greedy_meshing(16);
-        assert_eq!(map.confirmed_voxel_count(), 0, "low-confidence air ghost must never lock!");
-
-        // Synthetic curved cylinder/mug at z = -0.90m..-1.02m centered in view, background wall at z = -2.2m
-        let high_conf = vec![190u8; dw * dh];
-        let depth_obj = make_synthetic_depth_image(dw, dh, |x, y| {
-            let dx = x as f32 - cx;
-            let dy = y as f32 - cy;
-            if dx.abs() < 16.0 && dy.abs() < 14.0 {
-                let curve_mm = 900.0 + (dx * dx) * 0.45;
-                curve_mm as u16
-            } else {
-                2200u16
-            }
-        });
-
-        // Turbo scan for 3 independent frames locks the curved static object cleanly (weight >= 42)
-        for _ in 0..3 {
-            let st = map.ingest_depth_map(
-                &depth_obj,
-                dw,
-                dh,
-                dw * 2,
-                2,
-                Some(&high_conf),
-                dw,
-                dh,
-                dw,
-                1,
-                false,
-                fx,
-                fy,
-                cx,
-                cy,
-                dw,
-                dh,
-                Vec3::ZERO,
-                Quat::IDENTITY,
-                true,
-                1,
-            );
-            assert!(st.valid_rays > 500);
-        }
-        assert!(map.has_dense_depth);
-        let rebuilt = map.step_greedy_meshing(32);
-        assert!(rebuilt >= 1);
-
-        let mut verts = Vec::new();
-        let (chunks, tris, _plane_tris) = map.build_triangle_mesh_buffer(Vec3::ZERO, Vec3::NEG_Z, &mut verts);
-        assert!(chunks >= 1);
-        assert!(tris >= 40, "expected dense conformal triangles, got {}", tris);
-
-        // Verify ALL front-facing triangles have outward CCW winding pointing back toward camera (+Z)
-        let mut outward_ccw = 0usize;
-        let mut near_curved_obj = 0usize;
-        for tri in verts.chunks_exact(3) {
-            let p0 = Vec3::from_array(tri[0].pos);
-            let p1 = Vec3::from_array(tri[1].pos);
-            let p2 = Vec3::from_array(tri[2].pos);
-            let n = Vec3::from_array(tri[0].normal);
-            let geo_n = (p1 - p0).cross(p2 - p0);
-            if geo_n.length_squared() > 1e-8 && geo_n.dot(n) > 0.0 {
-                outward_ccw += 1;
-            }
-            let mid = (p0 + p1 + p2) / 3.0;
-            if mid.z > -1.15 && mid.z < -0.82 && mid.x.abs() < 0.30 {
-                near_curved_obj += 1;
-            }
-        }
-        assert!(
-            outward_ccw * 10 >= (tris as usize) * 9,
-            "outward CCW winding ratio too low: {}/{}",
-            outward_ccw,
-            tris
-        );
-        assert!(
-            near_curved_obj >= 15,
-            "mesh must hug curved foreground object at z~-0.95m, found {} tris",
-            near_curved_obj
-        );
-
-        // Now LOCK (turbo = false) -> Compare & Maintain mode:
-        // (a) Unchanged scene with +6cm realistic monocular depth wobble MUST update EXACTLY 0 voxels!
-        let depth_wobble = make_synthetic_depth_image(dw, dh, |x, y| {
-            let dx = x as f32 - cx;
-            let dy = y as f32 - cy;
-            if dx.abs() < 16.0 && dy.abs() < 14.0 {
-                (960.0 + (dx * dx) * 0.45) as u16
-            } else {
-                2260u16
-            }
-        });
-        let maintain_wobble = map.ingest_depth_map(
-            &depth_wobble,
-            dw,
-            dh,
-            dw * 2,
-            2,
-            Some(&high_conf),
-            dw,
-            dh,
-            dw,
-            1,
-            false,
-            fx,
-            fy,
-            cx,
-            cy,
-            dw,
-            dh,
-            Vec3::ZERO,
-            Quat::IDENTITY,
-            false,
-            2,
-        );
-        assert_eq!(
-            maintain_wobble.updated_voxels, 0,
-            "TRUE LOCK must ignore ±6cm depth wobble on unchanged room!"
-        );
-
-        // (b) Turning camera to an UNSCANNED direction (+90 deg) while LOCKED must update EXACTLY 0 voxels!
-        let maintain_unscanned = map.ingest_depth_map(
-            &depth_obj,
-            dw,
-            dh,
-            dw * 2,
-            2,
-            Some(&high_conf),
-            dw,
-            dh,
-            dw,
-            1,
-            false,
-            fx,
-            fy,
-            cx,
-            cy,
-            dw,
-            dh,
-            Vec3::ZERO,
-            Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
-            false,
-            2,
-        );
-        assert_eq!(
-            maintain_unscanned.updated_voxels, 0,
-            "TRUE LOCK must NEVER scan brand-new unscanned directions!"
-        );
-
-        // (c) Single-frame removal glitch must NOT touch locked object (0 updates on tick 1 & 2)!
-        let depth_empty = make_synthetic_depth_image(dw, dh, |_, _| 2200u16);
-        let glitch_1 = map.ingest_depth_map(
-            &depth_empty,
-            dw,
-            dh,
-            dw * 2,
-            2,
-            Some(&high_conf),
-            dw,
-            dh,
-            dw,
-            1,
-            false,
-            fx,
-            fy,
-            cx,
-            cy,
-            dw,
-            dh,
-            Vec3::ZERO,
-            Quat::IDENTITY,
-            false,
-            2,
-        );
-        assert_eq!(glitch_1.updated_voxels, 0, "1-frame glitch must not erode locked mesh");
-
-        // (d) Persistent removal across 3+ consecutive ticks MUST confirm & carve away the removed object!
-        let mut total_carve_updates = 0u32;
-        for _ in 0..10 {
-            let st = map.ingest_depth_map(
-                &depth_empty,
-                dw,
-                dh,
-                dw * 2,
-                2,
-                Some(&high_conf),
-                dw,
-                dh,
-                dw,
-                1,
-                false,
-                fx,
-                fy,
-                cx,
-                cy,
-                dw,
-                dh,
-                Vec3::ZERO,
-                Quat::IDENTITY,
-                false,
-                2,
-            );
-            total_carve_updates += st.updated_voxels;
-        }
-        assert!(
-            total_carve_updates > 20,
-            "persistent removal must carve removed object, updated={}",
-            total_carve_updates
-        );
-        map.step_greedy_meshing(32);
-        let mut verts_after = Vec::new();
-        map.build_triangle_mesh_buffer(Vec3::ZERO, Vec3::NEG_Z, &mut verts_after);
-        let remaining_fg = verts_after
-            .chunks_exact(3)
-            .filter(|tri| {
-                let mid = (Vec3::from_array(tri[0].pos)
-                    + Vec3::from_array(tri[1].pos)
-                    + Vec3::from_array(tri[2].pos))
-                    / 3.0;
-                mid.z > -1.25 && mid.x.abs() < 0.25 && mid.y.abs() < 0.22
-            })
-            .count();
-        assert!(
-            remaining_fg < near_curved_obj / 3,
-            "removed object should be carved away: before={}, after={}",
-            near_curved_obj,
-            remaining_fg
-        );
-    }
-
-    #[test]
-    fn two_tier_separates_flat_wall_from_detail_object_and_smooth_anchored_interior_locks() {
-        let mut map = SpatialMeshMap::default();
-        // Register a canonical flat Wall plane at z = -2.0m (facing +Z toward camera)
-        let wall_rot = Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
+        // Register invisible floor at y = -0.80m for physics only
         map.ingest_ar_plane_polygons(
             &[RawArPlane {
-                raw_type: 1,
-                pos: Vec3::new(0.0, 0.0, -2.0),
-                rot: wall_rot,
+                raw_type: 0,
+                pos: Vec3::new(0.0, -0.80, -1.2),
+                rot: Quat::IDENTITY,
                 extent_x: 3.0,
-                extent_z: 2.4,
-                polygon_xz: vec![[-1.5, -1.2], [1.5, -1.2], [1.5, 1.2], [-1.5, 1.2]],
+                extent_z: 3.0,
+                polygon_xz: vec![[-1.5, -1.5], [1.5, -1.5], [1.5, 1.5], [-1.5, 1.5]],
             }],
             0.0,
         );
-        assert_eq!(map.canonical_plane_count(), 1);
+        assert_eq!(map.inferred_floor_y(), Some(-0.80));
 
+        // Purely flat vertical wall at z = -1.40m (NO bumps!)
         let dw = 80usize;
         let dh = 60usize;
-        let fx = 64.0f32;
-        let fy = 64.0f32;
-        let cx = 40.0f32;
-        let cy = 30.0f32;
+        let depth_wall = make_synthetic_depth_image(dw, dh, |_, _| 1400u16);
+        let conf = vec![190u8; dw * dh];
+        for _ in 0..3 {
+            map.ingest_depth_map(
+                &depth_wall, dw, dh, dw * 2, 2,
+                Some(&conf), dw, dh, dw, 1, false,
+                64.0, 64.0, 40.0, 30.0, dw, dh,
+                Vec3::ZERO, Quat::IDENTITY, true, 1,
+            );
+        }
+        map.step_greedy_meshing(64);
+        let mut verts = Vec::new();
+        let (_, detail_tris, flat_tris) = map.build_triangle_mesh_buffer(Vec3::ZERO, Vec3::NEG_Z, &mut verts);
+        assert!(flat_tris >= 2, "flat wall must emit merged flat sheets, got {}", flat_tris);
+        assert!(
+            flat_tris < 90,
+            "coplanar merge must collapse flat wall massively (not 1000+ micro-tris!), got flat={}, detail={}",
+            flat_tris, detail_tris
+        );
+        // Verify ZERO floor triangles exist!
+        let floor_tris = verts
+            .chunks_exact(3)
+            .filter(|tri| tri[0].normal[1] >= 0.78 && (tri[0].pos[1] + tri[1].pos[1] + tri[2].pos[1]) / 3.0 <= -0.74)
+            .count();
+        assert_eq!(floor_tris, 0, "floor must NEVER be rendered in visual mesh!");
+    }
 
-        // Protruding curved mug at z ~ -0.95m in front of the flat wall at z = -2.0m.
-        // Simulate realistic sparse ARCore RawDepthConfidence: high conf (160) on mug border, 0 on smooth mug center!
-        let depth = make_synthetic_depth_image(dw, dh, |x, y| {
-            let dx = x as f32 - cx;
-            let dy = y as f32 - cy;
-            if dx.abs() < 12.0 && dy.abs() < 12.0 {
-                (920.0 + (dx * dx) * 0.40) as u16
+    #[test]
+    fn closer_scan_refines_bumpy_object_to_finer_triangles_and_instantly_erases_floating_errors() {
+        let mut map = SpatialMeshMap::default();
+        let dw = 80usize;
+        let dh = 60usize;
+        let conf = vec![190u8; dw * dh];
+
+        // 1. Scan bumpy curved object from FAR (camera at z = +0.55m -> object at z = -1.0m is 1.55m away -> 5cm LOD)
+        let depth_far_bumpy = make_synthetic_depth_image(dw, dh, |x, y| {
+            let dx = x as f32 - 40.0;
+            let dy = y as f32 - 30.0;
+            if dx.abs() < 16.0 && dy.abs() < 14.0 {
+                // Rippled/bumpy 3D object around 1.55m away
+                (1520.0 + ((dx * 0.45).sin() * 45.0 + (dy * 0.45).cos() * 45.0).abs()) as u16
+            } else {
+                2400u16
+            }
+        });
+        for _ in 0..3 {
+            map.ingest_depth_map(
+                &depth_far_bumpy, dw, dh, dw * 2, 2,
+                Some(&conf), dw, dh, dw, 1, false,
+                64.0, 64.0, 40.0, 30.0, dw, dh,
+                Vec3::new(0.0, 0.0, 0.55), Quat::IDENTITY, true, 1,
+            );
+        }
+        map.step_greedy_meshing(64);
+        let mut verts_far = Vec::new();
+        let (_, detail_far, _) = map.build_triangle_mesh_buffer(Vec3::new(0.0, 0.0, 0.55), Vec3::NEG_Z, &mut verts_far);
+        assert!(detail_far >= 10, "far bumpy object should emit medium 5cm detail tris, got {}", detail_far);
+
+        // 2. Move camera UP CLOSE (z = -0.35m -> object at z = -1.0m is now 0.65m <= 0.95m -> unlocks ultra-fine 2.5cm tris!)
+        let depth_close_bumpy = make_synthetic_depth_image(dw, dh, |x, y| {
+            let dx = x as f32 - 40.0;
+            let dy = y as f32 - 30.0;
+            if dx.abs() < 26.0 && dy.abs() < 22.0 {
+                (620.0 + ((dx * 0.35).sin() * 38.0 + (dy * 0.35).cos() * 38.0).abs()) as u16
+            } else {
+                1500u16
+            }
+        });
+        for _ in 0..3 {
+            map.ingest_depth_map(
+                &depth_close_bumpy, dw, dh, dw * 2, 2,
+                Some(&conf), dw, dh, dw, 1, false,
+                64.0, 64.0, 40.0, 30.0, dw, dh,
+                Vec3::new(0.0, 0.0, -0.35), Quat::IDENTITY, true, 1,
+            );
+        }
+        map.step_greedy_meshing(64);
+        let mut verts_close = Vec::new();
+        let (_, detail_close, _) = map.build_triangle_mesh_buffer(Vec3::new(0.0, 0.0, -0.35), Vec3::NEG_Z, &mut verts_close);
+        assert!(
+            detail_close > detail_far,
+            "moving camera closer must refine bumpy object into finer/more triangles: far={}, close={}",
+            detail_far, detail_close
+        );
+
+        // 3. Floating error cleanup: now look straight through the old close object to a wall 0.5m behind it ->
+        //    zero carving dead-zone + hard erosion MUST erase it in just 2 Turbo frames!
+        let depth_clear = make_synthetic_depth_image(dw, dh, |_, _| 1500u16);
+        for _ in 0..2 {
+            map.ingest_depth_map(
+                &depth_clear, dw, dh, dw * 2, 2,
+                Some(&conf), dw, dh, dw, 1, false,
+                64.0, 64.0, 40.0, 30.0, dw, dh,
+                Vec3::new(0.0, 0.0, -0.35), Quat::IDENTITY, true, 1,
+            );
+        }
+        map.step_greedy_meshing(64);
+        let mut verts_healed = Vec::new();
+        map.build_triangle_mesh_buffer(Vec3::new(0.0, 0.0, -0.35), Vec3::NEG_Z, &mut verts_healed);
+        let remaining_err = verts_healed
+            .chunks_exact(3)
+            .filter(|tri| {
+                let mid = (Vec3::from_array(tri[0].pos) + Vec3::from_array(tri[1].pos) + Vec3::from_array(tri[2].pos)) / 3.0;
+                mid.z > -1.20 && mid.x.abs() < 0.25 && mid.y.abs() < 0.22
+            })
+            .count();
+        assert!(
+            remaining_err <= 6,
+            "zero-dead-zone carving must heal floating errors in 2 frames, remaining={}",
+            remaining_err
+        );
+    }
+
+    #[test]
+    fn true_lock_ignores_wobble_and_unscanned_directions_and_requires_3_ticks_for_change() {
+        let mut map = SpatialMeshMap::default();
+        let dw = 80usize;
+        let dh = 60usize;
+        let conf = vec![190u8; dw * dh];
+        let depth_obj = make_synthetic_depth_image(dw, dh, |x, y| {
+            let dx = x as f32 - 40.0;
+            let dy = y as f32 - 30.0;
+            if dx.abs() < 16.0 && dy.abs() < 14.0 {
+                (900.0 + (dx * dx) * 0.40) as u16
             } else {
                 2000u16
             }
         });
-        let mut sparse_conf = vec![160u8; dw * dh];
-        for y in 0..dh {
-            for x in 0..dw {
-                let dx = (x as f32 - cx).abs();
-                let dy = (y as f32 - cy).abs();
-                // Smooth inner core of mug has conf = 0, but is anchored within ±4px to confident border!
-                if dx < 4.0 && dy < 4.0 {
-                    sparse_conf[y * dw + x] = 0;
-                }
-            }
-        }
-
-        for _ in 0..4 {
-            map.ingest_depth_map(
-                &depth,
-                dw,
-                dh,
-                dw * 2,
-                2,
-                Some(&sparse_conf),
-                dw,
-                dh,
-                dw,
-                1,
-                false,
-                fx,
-                fy,
-                cx,
-                cy,
-                dw,
-                dh,
-                Vec3::ZERO,
-                Quat::IDENTITY,
-                true,
-                1,
-            );
-        }
-        map.step_greedy_meshing(32);
-
-        let mut verts = Vec::new();
-        let (_, detail_tris, plane_tris) = map.build_triangle_mesh_buffer(Vec3::ZERO, Vec3::NEG_Z, &mut verts);
-        assert!(detail_tris >= 24, "detail object must build crisp TSDF tris, got {}", detail_tris);
-        assert!(plane_tris >= 8, "flat wall must stay sleek Tier-1 architectural plane, got {}", plane_tris);
-
-        // Almost ALL Tier-2 TSDF triangles should belong to the protruding mug (z > -1.3m), NOT the flat wall at z = -2.0m!
-        let detail_slice = &verts[..(detail_tris as usize) * 3];
-        let wall_micro_tris = detail_slice
-            .chunks_exact(3)
-            .filter(|tri| (tri[0].pos[2] + tri[1].pos[2] + tri[2].pos[2]) / 3.0 < -1.75)
-            .count();
-        assert!(
-            wall_micro_tris * 5 < detail_tris as usize,
-            "flat wall should not waste TSDF detail tris: wall_micro={}, detail={}",
-            wall_micro_tris,
-            detail_tris
-        );
-    }
-
-    #[test]
-    fn fake_wall_on_object_erodes_or_demotes_when_depth_contradicts_it() {
-        let mut map = SpatialMeshMap::default();
-        let wall_rot = Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
-
-        // 1. Small monitor-sized vertical plane (0.85m x 0.55m = 0.46m²) must NEVER qualify as Tier-1 architectural Wall!
-        map.ingest_ar_plane_polygons(
-            &[RawArPlane {
-                raw_type: 1,
-                pos: Vec3::new(0.0, 0.0, -1.0),
-                rot: wall_rot,
-                extent_x: 0.85,
-                extent_z: 0.55,
-                polygon_xz: vec![[-0.425, -0.275], [0.425, -0.275], [0.425, 0.275], [-0.425, 0.275]],
-            }],
-            0.0,
-        );
-        assert!(!map.planes[0].is_true_structural_tier1());
-
-        // 2. Large wall (2.4m x 2.0m) at z = -1.0m that actually turns out to be an opened door / moved board
-        //    (dense depth sees straight through it to z = -2.2m) MUST be pruned dynamically!
-        map.clear();
-        map.ingest_ar_plane_polygons(
-            &[RawArPlane {
-                raw_type: 1,
-                pos: Vec3::new(0.0, 0.0, -1.0),
-                rot: wall_rot,
-                extent_x: 2.4,
-                extent_z: 2.0,
-                polygon_xz: vec![[-1.2, -1.0], [1.2, -1.0], [1.2, 1.0], [-1.2, 1.0]],
-            }],
-            0.0,
-        );
-        assert_eq!(map.canonical_plane_count(), 1);
-        assert!(map.planes[0].is_true_structural_tier1());
-
-        let dw = 80usize;
-        let dh = 60usize;
-        let depth_behind = make_synthetic_depth_image(dw, dh, |_, _| 2200u16);
-        let conf = vec![180u8; dw * dh];
         for _ in 0..3 {
             map.ingest_depth_map(
-                &depth_behind,
-                dw,
-                dh,
-                dw * 2,
-                2,
-                Some(&conf),
-                dw,
-                dh,
-                dw,
-                1,
-                false,
-                64.0,
-                64.0,
-                40.0,
-                30.0,
-                dw,
-                dh,
-                Vec3::ZERO,
-                Quat::IDENTITY,
-                true,
-                2,
+                &depth_obj, dw, dh, dw * 2, 2,
+                Some(&conf), dw, dh, dw, 1, false,
+                64.0, 64.0, 40.0, 30.0, dw, dh,
+                Vec3::ZERO, Quat::IDENTITY, true, 1,
             );
         }
-        assert_eq!(
-            map.canonical_plane_count(),
-            0,
-            "stale Wall contradicted by ray-through depth must be dynamically removed!"
+        map.step_greedy_meshing(64);
+
+        // Unchanged scene with +5cm wobble while Locked -> 0 writes!
+        let depth_wobble = make_synthetic_depth_image(dw, dh, |x, y| {
+            let dx = x as f32 - 40.0;
+            let dy = y as f32 - 30.0;
+            if dx.abs() < 16.0 && dy.abs() < 14.0 {
+                (950.0 + (dx * dx) * 0.40) as u16
+            } else {
+                2050u16
+            }
+        });
+        let st_w = map.ingest_depth_map(
+            &depth_wobble, dw, dh, dw * 2, 2,
+            Some(&conf), dw, dh, dw, 1, false,
+            64.0, 64.0, 40.0, 30.0, dw, dh,
+            Vec3::ZERO, Quat::IDENTITY, false, 2,
         );
+        assert_eq!(st_w.updated_voxels, 0);
+
+        // Turning +90 deg into unscanned space while Locked -> 0 writes!
+        let st_u = map.ingest_depth_map(
+            &depth_obj, dw, dh, dw * 2, 2,
+            Some(&conf), dw, dh, dw, 1, false,
+            64.0, 64.0, 40.0, 30.0, dw, dh,
+            Vec3::ZERO, Quat::from_rotation_y(std::f32::consts::FRAC_PI_2), false, 2,
+        );
+        assert_eq!(st_u.updated_voxels, 0);
+
+        // 1-frame glitch -> 0 writes!
+        let depth_empty = make_synthetic_depth_image(dw, dh, |_, _| 2000u16);
+        let st_g1 = map.ingest_depth_map(
+            &depth_empty, dw, dh, dw * 2, 2,
+            Some(&conf), dw, dh, dw, 1, false,
+            64.0, 64.0, 40.0, 30.0, dw, dh,
+            Vec3::ZERO, Quat::IDENTITY, false, 2,
+        );
+        assert_eq!(st_g1.updated_voxels, 0);
     }
 }

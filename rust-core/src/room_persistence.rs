@@ -709,19 +709,42 @@ mod tests {
     #[test]
     fn obj_exporter_emits_valid_wavefront_obj_faces() {
         let mut map = SpatialMeshMap::default();
-        map.ingest_ar_plane_polygons(
-            &[RawArPlane {
-                raw_type: 0,
-                pos: Vec3::new(0.0, -1.2, -1.5),
-                rot: Quat::IDENTITY,
-                extent_x: 1.4,
-                extent_z: 1.4,
-                polygon_xz: vec![[-0.7, -0.7], [0.7, -0.7], [0.7, 0.7], [-0.7, 0.7]],
-            }],
-            0.0,
-        );
+        let dw = 64usize;
+        let dh = 48usize;
+        let mut depth = vec![0u8; dw * dh * 2];
+        for i in 0..(dw * dh) {
+            let le = 1400u16.to_le_bytes();
+            depth[i * 2] = le[0];
+            depth[i * 2 + 1] = le[1];
+        }
+        let conf = vec![190u8; dw * dh];
+        for _ in 0..3 {
+            map.ingest_depth_map(
+                &depth,
+                dw,
+                dh,
+                dw * 2,
+                2,
+                Some(&conf),
+                dw,
+                dh,
+                dw,
+                1,
+                false,
+                56.0,
+                56.0,
+                32.0,
+                24.0,
+                dw,
+                dh,
+                Vec3::ZERO,
+                Quat::IDENTITY,
+                true,
+                1,
+            );
+        }
         let obj = export_room_to_obj(&mut map);
-        assert!(obj.contains("g Floor"));
+        assert!(obj.contains("g FlatSurfaces") || obj.contains("g DetailObjects"));
         assert!(obj.contains("v "));
         assert!(obj.contains("vn "));
         assert!(obj.contains("f 1//1 2//1 3//1"));

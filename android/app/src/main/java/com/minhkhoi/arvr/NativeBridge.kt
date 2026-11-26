@@ -42,17 +42,11 @@ object NativeBridge {
     external fun nativeRecenter()
     external fun nativeOnHandLandmarks(handCount: Int, packedData: FloatArray): Int
     external fun nativeSetRoomScanMode(mode: Int)
-    external fun nativeOnArPlanes(planeCount: Int, packedPlanes: FloatArray)
     external fun nativeOnArPlanePolygons(
         planeCount: Int,
         packedMeta: FloatArray,
         polyCounts: IntArray,
         packedPolyXz: FloatArray
-    )
-    external fun nativeOnDetectedObjects(
-        objectCount: Int,
-        packedObjects: FloatArray,
-        poseAndTan: FloatArray
     )
     external fun nativeOnPointCloud(pointCount: Int, packedXyzc: FloatArray)
     external fun nativeSpawnPhysicsBody(throwSpeed: Float)
@@ -104,7 +98,6 @@ object NativeBridge {
     external fun nativeDropPhysicsAtReticle()
     external fun nativeThrowPhysicsAtReticle(throwSpeed: Float)
     external fun nativeClearPhysicsBodies()
-    external fun nativeGetRoomLabels(outArr: FloatArray): Int
     external fun nativeGetPerfMetrics(outArr: FloatArray)
     external fun nativeGetRenderFrameMs(): Float
     external fun nativeIngestCameraImage(

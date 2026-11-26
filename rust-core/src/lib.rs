@@ -6,7 +6,6 @@ pub mod physics_3d;
 pub mod renderer;
 pub mod room_persistence;
 pub mod room_scanner;
-pub mod scene_3d;
 pub mod spatial_mesh;
 pub mod vision_ram;
 
@@ -16,7 +15,7 @@ use jni::objects::{JByteArray, JByteBuffer, JClass, JFloatArray, JIntArray};
 use jni::sys::{jboolean, jbyteArray, jfloat, jint, jlong, jstring, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
 use renderer::{GlRenderer, SharedInputState};
-use room_scanner::{FLOATS_PER_LABEL, FLOATS_PER_OBJECT, FLOATS_PER_PLANE, MAX_LABELS};
+use room_scanner::FLOATS_PER_PLANE;
 use spatial_mesh::{RawArPlane, MAX_POLY_VERTS};
 use vision_ram::{convert_latest_rgba, ingest_camera_planes, init_vision_ram, CaptureMeta};
 use std::cell::RefCell;
@@ -536,29 +535,6 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeSetRoomScanMode
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeOnArPlanes(
-    env: JNIEnv,
-    _class: JClass,
-    plane_count: jint,
-    packed_planes: JFloatArray,
-) {
-    if plane_count <= 0 {
-        if let Ok(mut state) = input_state().lock() {
-            state.on_ar_planes(0, &[]);
-        }
-        return;
-    }
-    let count = (plane_count as usize).min(room_scanner::MAX_PLANES);
-    let mut buf = vec![0.0f32; count * FLOATS_PER_PLANE];
-    if env.get_float_array_region(&packed_planes, 0, &mut buf).is_err() {
-        return;
-    }
-    if let Ok(mut state) = input_state().lock() {
-        state.on_ar_planes(count, &buf);
-    }
-}
-
-#[no_mangle]
 pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeOnArPlanePolygons(
     env: JNIEnv,
     _class: JClass,
@@ -616,47 +592,6 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeOnArPlanePolygo
 
     if let Ok(mut state) = input_state().lock() {
         state.on_ar_plane_polygons(raw_planes);
-    }
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeOnDetectedObjects(
-    env: JNIEnv,
-    _class: JClass,
-    object_count: jint,
-    packed_objects: JFloatArray,
-    pose_and_tan_arr: JFloatArray,
-) {
-    let mut pose_buf = [0.0f32; 9];
-    if env.get_float_array_region(&pose_and_tan_arr, 0, &mut pose_buf).is_err() {
-        return;
-    }
-    let cam_pos = Vec3::new(pose_buf[0], pose_buf[1], pose_buf[2]);
-    let q = Quat::from_xyzw(pose_buf[3], pose_buf[4], pose_buf[5], pose_buf[6]);
-    let cam_rot = if q.length_squared() > 1e-6 {
-        q.normalize()
-    } else {
-        Quat::IDENTITY
-    };
-    let tan_h = pose_buf[7];
-    let tan_v = pose_buf[8];
-
-    if object_count <= 0 {
-        if let Ok(mut state) = input_state().lock() {
-            state.on_detected_objects(0, &[], cam_pos, cam_rot, tan_h, tan_v);
-        }
-        return;
-    }
-    let count = (object_count as usize).min(room_scanner::MAX_OBJECTS);
-    let mut buf = vec![0.0f32; count * FLOATS_PER_OBJECT];
-    if env
-        .get_float_array_region(&packed_objects, 0, &mut buf)
-        .is_err()
-    {
-        return;
-    }
-    if let Ok(mut state) = input_state().lock() {
-        state.on_detected_objects(count, &buf, cam_pos, cam_rot, tan_h, tan_v);
     }
 }
 
@@ -886,36 +821,6 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeClearPhysicsBod
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeGetRoomLabels(
-    env: JNIEnv,
-    _class: JClass,
-    out_arr: JFloatArray,
-) -> jint {
-    let labels = {
-        let Ok(state) = input_state().lock() else {
-            return 0;
-        };
-        state.projected_labels.clone()
-    };
-    let count = labels.len().min(MAX_LABELS);
-    if count == 0 {
-        return 0;
-    }
-    let mut buf = [0.0f32; MAX_LABELS * FLOATS_PER_LABEL];
-    for (i, lbl) in labels.iter().take(count).enumerate() {
-        let base = i * FLOATS_PER_LABEL;
-        buf[base] = lbl.kind_id as f32;
-        buf[base + 1] = lbl.left_u;
-        buf[base + 2] = lbl.left_v;
-        buf[base + 3] = lbl.right_u;
-        buf[base + 4] = lbl.right_v;
-        buf[base + 5] = lbl.score;
-    }
-    let _ = env.set_float_array_region(&out_arr, 0, &buf[..count * FLOATS_PER_LABEL]);
-    count as jint
-}
-
-#[no_mangle]
 pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeTickRelocalizer(
     _env: JNIEnv,
     _class: JClass,
@@ -1027,10 +932,9 @@ pub extern "system" fn Java_com_minhkhoi_arvr_NativeBridge_nativeDrawFrame(
             .map(|renderer| renderer.draw_frame(&snap))
     });
 
-    if let Some((fps, frame_ms, labels)) = timing {
+    if let Some((fps, frame_ms)) = timing {
         if let Ok(mut state) = input_state().lock() {
             state.record_render_timing(fps, frame_ms);
-            state.set_projected_labels(labels);
         }
     }
 }

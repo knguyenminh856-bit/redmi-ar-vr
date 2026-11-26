@@ -11,11 +11,7 @@ use crate::room_persistence::{
     pick_manual_anchor_keyframe, serialize_room_arroom, try_auto_relocalize, KeyframeBank,
     LoadedRoomMap,
 };
-use crate::room_scanner::{
-    project_room_labels, AabbCollider, PlaneMarker, ProjectedLabel, ReticleHit,
-    RoomScannerRenderer, SpatialMemoryCache, SurfaceKind, WorldObjectMarker,
-};
-use crate::scene_3d::Scene3D;
+use crate::room_scanner::{ReticleHit, RoomScannerRenderer, SurfaceKind};
 use crate::spatial_mesh::{RawArPlane, SpatialMeshMap, TriMeshRenderer, TriMeshVertex};
 use crate::vision_ram::extract_latest_luma_descriptor;
 use glam::{Mat4, Quat, Vec3};
@@ -71,9 +67,7 @@ pub struct SharedInputState {
     pub fov_scale: f32,
     pub ipd_meters: f32,
     pub stereo_mode: bool,
-    pub show_demo_scene: bool,
     pub recenter_requested: bool,
-    pub anchor_origin: Option<Mat4>,
     pub anchored_floor_y: Option<f32>,
 
     pub hands: [Option<HandData>; MAX_HANDS],
@@ -84,17 +78,12 @@ pub struct SharedInputState {
     pub draw_mode: DrawMode,
     pub finger_canvas: FingerCanvas,
 
-    pub pull_closer: bool,
-    pub boost_until: Option<Instant>,
-    pub palette_idx: u32,
-
     pub room_scan_mode: i32,
     pub mesh_occlusion_enabled: bool,
     pub scan_turbo: bool,
     pub depth_source_mode: i32,
     pub last_diff_changed: u32,
     pub reticle: ReticleHit,
-    pub spatial_cache: SpatialMemoryCache,
     pub spatial_mesh: SpatialMeshMap,
     pub cached_tri_mesh: Vec<TriMeshVertex>,
     pub cached_tri_src_gen: u64,
@@ -110,7 +99,6 @@ pub struct SharedInputState {
     pub last_reloc_desc_seq: u64,
     pub reloc_status: i32,
     pub reloc_best_pct: i32,
-    pub projected_labels: Vec<ProjectedLabel>,
 
     pub physics: PhysicsWorld,
     pub last_physics_step: Instant,
@@ -134,9 +122,7 @@ impl Default for SharedInputState {
             fov_scale: 1.0,
             ipd_meters: 0.064,
             stereo_mode: false,
-            show_demo_scene: false,
             recenter_requested: false,
-            anchor_origin: None,
             anchored_floor_y: None,
             hands: [None; MAX_HANDS],
             last_hand_instant: None,
@@ -144,16 +130,12 @@ impl Default for SharedInputState {
             current_gesture: HandGesture::None,
             draw_mode: DrawMode::Off,
             finger_canvas: FingerCanvas::default(),
-            pull_closer: false,
-            boost_until: None,
-            palette_idx: 0,
             room_scan_mode: 4,
             mesh_occlusion_enabled: true,
             scan_turbo: true,
             depth_source_mode: 0,
             last_diff_changed: 0,
             reticle: ReticleHit::default(),
-            spatial_cache: SpatialMemoryCache::default(),
             spatial_mesh: SpatialMeshMap::default(),
             cached_tri_mesh: Vec::new(),
             cached_tri_src_gen: 0,
@@ -169,7 +151,6 @@ impl Default for SharedInputState {
             last_reloc_desc_seq: 0,
             reloc_status: 0,
             reloc_best_pct: 0,
-            projected_labels: Vec::new(),
             physics: PhysicsWorld::default(),
             last_physics_step: Instant::now(),
             perf: PerfMetrics::default(),
@@ -258,7 +239,6 @@ impl SharedInputState {
         let clamped = mode.clamp(0, 4);
         self.room_scan_mode = clamped;
         if clamped == 0 {
-            self.spatial_cache.clear();
             self.spatial_mesh.clear();
             self.keyframe_bank.clear();
             self.pending_room = None;
@@ -271,7 +251,6 @@ impl SharedInputState {
             self.cached_tri_count = 0;
             self.cached_detail_tris = 0;
             self.cached_plane_tris = 0;
-            self.projected_labels.clear();
             self.reticle = ReticleHit::default();
             self.perf.active_planes = 0;
             self.perf.active_objects = 0;
@@ -279,8 +258,8 @@ impl SharedInputState {
             self.perf.voxel_count = 0;
             self.perf.mesh_chunks = 0;
             self.perf.mesh_triangles = 0;
-        self.perf.detail_triangles = 0;
-        self.perf.plane_triangles = 0;
+            self.perf.detail_triangles = 0;
+            self.perf.plane_triangles = 0;
             self.perf.keyframe_count = 0;
             self.perf.reloc_status = 0;
             self.perf.reloc_best_pct = 0;
@@ -289,9 +268,6 @@ impl SharedInputState {
             self.perf.reticle_hit_kind = 0;
             self.perf.reticle_surface_kind = 0;
             self.perf.reticle_dist = 0.0;
-        } else if clamped != 2 {
-            self.spatial_cache.clear_objects();
-            self.perf.active_objects = 0;
         }
     }
 
@@ -434,7 +410,6 @@ impl SharedInputState {
 
     pub fn clear_spatial_mesh(&mut self) {
         self.spatial_mesh.clear();
-        self.spatial_cache.clear();
         self.keyframe_bank.clear();
         self.pending_room = None;
         self.reloc_status = 0;
@@ -589,7 +564,6 @@ impl SharedInputState {
         let floor_y = self
             .spatial_mesh
             .inferred_floor_y()
-            .or_else(|| self.spatial_cache.inferred_floor_y())
             .unwrap_or_else(|| self.anchored_floor_y.unwrap_or(cam_pos.y - 1.35));
         if dir.y < -0.08 {
             let t = (floor_y - cam_pos.y) / dir.y;
@@ -617,28 +591,6 @@ impl SharedInputState {
         (0, 0, 0.0)
     }
 
-    pub fn on_ar_planes(&mut self, count: usize, packed: &[f32]) {
-        if self.room_scan_mode <= 0 || count == 0 {
-            return;
-        }
-        let mut raw = Vec::with_capacity(count);
-        for i in 0..count {
-            let b = i * 10;
-            if b + 10 > packed.len() {
-                break;
-            }
-            raw.push(RawArPlane {
-                raw_type: packed[b].round() as i32,
-                pos: Vec3::new(packed[b + 1], packed[b + 2], packed[b + 3]),
-                rot: Quat::from_xyzw(packed[b + 4], packed[b + 5], packed[b + 6], packed[b + 7]),
-                extent_x: packed[b + 8].clamp(0.05, 8.0),
-                extent_z: packed[b + 9].clamp(0.05, 8.0),
-                polygon_xz: Vec::new(),
-            });
-        }
-        self.on_ar_plane_polygons(raw);
-    }
-
     pub fn on_ar_plane_polygons(&mut self, planes: Vec<RawArPlane>) {
         if self.room_scan_mode <= 0 {
             return;
@@ -646,34 +598,6 @@ impl SharedInputState {
         self.spatial_mesh
             .ingest_ar_plane_polygons(&planes, self.ar_pos.y);
         self.perf.cached_planes = self.spatial_mesh.canonical_plane_count() as u32;
-    }
-
-    pub fn on_detected_objects(
-        &mut self,
-        count: usize,
-        packed: &[f32],
-        cam_pos: Vec3,
-        cam_rot: Quat,
-        tan_h: f32,
-        tan_v: f32,
-    ) {
-        if self.room_scan_mode != 2 {
-            self.spatial_cache.clear_objects();
-            return;
-        }
-        self.spatial_cache.ingest_detected_objects(
-            count,
-            packed,
-            cam_pos,
-            cam_rot,
-            tan_h,
-            tan_v,
-            self.room_scan_mode,
-        );
-    }
-
-    pub fn set_projected_labels(&mut self, labels: Vec<ProjectedLabel>) {
-        self.projected_labels = labels;
     }
 
     pub fn on_point_cloud(&mut self, count: usize, packed_xyzc: &[f32]) {
@@ -816,9 +740,6 @@ impl SharedInputState {
                         .spawn_throw(origin, dir, 2.5, Some(BodyShape::Sphere));
                 }
             }
-            101 => self.pull_closer = !self.pull_closer,
-            102 => self.boost_until = Some(now + std::time::Duration::from_millis(3500)),
-            103 => self.palette_idx = (self.palette_idx + 1) % 3,
             104 => self.finger_canvas.clear(),
             105 => self.recenter_requested = true,
             _ => {}
@@ -851,11 +772,9 @@ impl SharedInputState {
             (Vec3::ZERO, head, head)
         };
 
-        if self.recenter_requested || self.anchor_origin.is_none() {
-            if self.has_ar_pose || self.has_gyro || self.recenter_requested {
-                self.anchor_origin = Some(compute_yaw_aligned_anchor(cam_pos_capture, head_rot_120hz));
-                self.recenter_requested = false;
-            }
+        if self.recenter_requested {
+            self.anchored_floor_y = Some(cam_pos_capture.y - 1.35);
+            self.recenter_requested = false;
         }
 
         let hands_fresh = self
@@ -887,10 +806,9 @@ impl SharedInputState {
             None
         };
 
-        // Rule 3 & 4: FPS-governed budgeted incremental TSDF Surface Nets Meshing
-        // Fast 18x18x18 halo mesher handles 6 chunks/tick in Turbo Scan, or 1..2 in Maintain mode (0 when unchanged!)
+        // FPS-governed budgeted incremental 2.5cm Adaptive TSDF Meshing
         let max_dirty = if self.scan_turbo {
-            if self.perf.frame_ms > 10.5 { 3 } else { 6 }
+            if self.perf.frame_ms > 10.5 { 4 } else { 8 }
         } else if self.perf.frame_ms > 10.5 {
             1
         } else {
@@ -900,31 +818,19 @@ impl SharedInputState {
             self.spatial_mesh.step_greedy_meshing(max_dirty);
         }
 
+        // Invisible floor/table planes + TSDF AABBs kept strictly for realistic physics collisions
         let active_planes = if self.room_scan_mode > 0 {
-            self.spatial_mesh
-                .snapshot_plane_markers(self.room_scan_mode == 2)
+            self.spatial_mesh.snapshot_plane_markers(false)
         } else {
             Vec::new()
         };
-        let (_, active_objects) = if self.room_scan_mode == 2 {
-            self.spatial_cache.snapshot_visible(2, now)
-        } else {
-            (Vec::new(), Vec::new())
-        };
-        let mut blocks_25d = if self.room_scan_mode > 0 {
+        let blocks_25d = if self.room_scan_mode > 0 {
             self.spatial_mesh.collect_physics_chunk_aabbs(cam_pos_capture)
         } else {
             Vec::new()
         };
-        if self.room_scan_mode == 2 {
-            let obj_boxes = self.spatial_cache.build_25d_colliders(cam_pos_capture, 2);
-            for b in obj_boxes.into_iter().filter(|b| b.is_object_box) {
-                blocks_25d.push(b);
-            }
-        }
 
-        // Rebuild static Surface-Nets + Plane Mesh VBO when either Triangle View (mode 4) OR
-        // Hardware Depth-Buffer Occlusion is active (and only when map/camera actually changed!)
+        // Rebuild Adaptive TSDF Mesh VBO when either Triangle View (mode 4) OR Hardware Depth Occlusion is active
         let tri_mesh_mode = self.room_scan_mode == 4;
         let mesh_occlusion_active = self.mesh_occlusion_enabled && self.room_scan_mode > 0;
         let need_mesh_vbo = tri_mesh_mode || mesh_occlusion_active;
@@ -974,7 +880,7 @@ impl SharedInputState {
         );
 
         self.perf.active_planes = active_planes.len() as u32;
-        self.perf.active_objects = active_objects.len() as u32;
+        self.perf.active_objects = 0;
         self.perf.cached_planes = self.spatial_mesh.canonical_plane_count() as u32;
         self.perf.voxel_count = self.spatial_mesh.confirmed_voxel_count() as u32;
         self.perf.physics_bodies = self.physics.bodies.len() as u32;
@@ -989,22 +895,11 @@ impl SharedInputState {
         self.perf.scan_turbo = if self.scan_turbo { 1 } else { 0 };
         self.perf.last_diff_changed = self.last_diff_changed;
 
-        let boost_factor = match self.boost_until {
-            Some(until) if until > now => {
-                (until.duration_since(now).as_secs_f32() / 3.5).clamp(0.0, 1.0)
-            }
-            _ => {
-                self.boost_until = None;
-                0.0
-            }
-        };
-
         FrameSnapshot {
             cam_pos_capture,
             cam_rot_capture,
             head_pos_120hz: cam_pos_capture,
             head_rot_120hz,
-            anchor_origin: self.anchor_origin.unwrap_or(Mat4::IDENTITY),
             has_camera_frame: self.has_camera_frame,
             tan_half_h: self.cam_tan_half_h,
             tan_half_v: self.cam_tan_half_v,
@@ -1012,22 +907,14 @@ impl SharedInputState {
             fov_scale: self.fov_scale,
             ipd_meters: self.ipd_meters,
             stereo_mode: self.stereo_mode,
-            show_demo_scene: self.show_demo_scene,
             hands: active_hands,
-            pull_closer: self.pull_closer,
-            boost_factor,
-            palette_idx: self.palette_idx,
             draw_upload_gen: self.finger_canvas.upload_generation,
             draw_verts: self.finger_canvas.verts.clone(),
-            room_planes: active_planes,
-            room_objects: active_objects,
-            blocks_25d,
             reticle: if self.room_scan_mode > 0 {
                 self.reticle
             } else {
                 ReticleHit::default()
             },
-            show_grid: matches!(self.room_scan_mode, 1 | 2),
             tri_mesh_mode,
             mesh_occlusion_active,
             tri_mesh_gen: self.cached_tri_upload_gen,
@@ -1043,7 +930,6 @@ pub struct FrameSnapshot {
     pub cam_rot_capture: Quat,
     pub head_pos_120hz: Vec3,
     pub head_rot_120hz: Quat,
-    pub anchor_origin: Mat4,
     pub has_camera_frame: bool,
     pub tan_half_h: f32,
     pub tan_half_v: f32,
@@ -1051,37 +937,16 @@ pub struct FrameSnapshot {
     pub fov_scale: f32,
     pub ipd_meters: f32,
     pub stereo_mode: bool,
-    pub show_demo_scene: bool,
     pub hands: [Option<HandData>; MAX_HANDS],
-    pub pull_closer: bool,
-    pub boost_factor: f32,
-    pub palette_idx: u32,
     pub draw_upload_gen: u64,
     pub draw_verts: Vec<DrawVertex>,
-    pub room_planes: Vec<PlaneMarker>,
-    pub room_objects: Vec<WorldObjectMarker>,
-    pub blocks_25d: Vec<AabbCollider>,
     pub reticle: ReticleHit,
-    pub show_grid: bool,
     pub tri_mesh_mode: bool,
     pub mesh_occlusion_active: bool,
     pub tri_mesh_gen: u64,
     pub tri_mesh_verts: Option<Vec<TriMeshVertex>>,
     pub physics_bodies: Vec<PhysicsBody>,
     pub physics_rings: Vec<ImpactRing>,
-}
-
-pub fn compute_yaw_aligned_anchor(head_pos: Vec3, head_rot: Quat) -> Mat4 {
-    let raw_fwd = head_rot * -Vec3::Z;
-    let horiz_fwd = Vec3::new(raw_fwd.x, 0.0, raw_fwd.z).normalize_or_zero();
-    let anchor_rot = if horiz_fwd.length_squared() > 1e-4 {
-        let right = horiz_fwd.cross(Vec3::Y).normalize();
-        let basis = glam::Mat3::from_cols(right, Vec3::Y, -horiz_fwd);
-        Quat::from_mat3(&basis)
-    } else {
-        Quat::IDENTITY
-    };
-    Mat4::from_rotation_translation(anchor_rot, head_pos)
 }
 
 pub fn compute_eye_projection(
@@ -1169,7 +1034,6 @@ pub fn compute_stereo_views(head_pos: Vec3, head_rot: Quat, ipd_meters: f32) -> 
 pub struct GlRenderer {
     gl: glow::Context,
     passthrough: PassthroughRenderer,
-    scene: Scene3D,
     hand_overlay: HandOverlayRenderer,
     finger_draw: FingerDrawRenderer,
     room_scanner: RoomScannerRenderer,
@@ -1178,7 +1042,6 @@ pub struct GlRenderer {
     pub gpu_renderer_name: String,
     width: i32,
     height: i32,
-    start_time: Instant,
     last_frame_time: Option<Instant>,
     ema_frame_ms: f32,
 }
@@ -1187,7 +1050,6 @@ impl GlRenderer {
     pub fn new(gl: glow::Context) -> Result<Self, String> {
         let gpu_renderer_name = unsafe { gl.get_parameter_string(glow::RENDERER) };
         let passthrough = PassthroughRenderer::new(&gl)?;
-        let scene = Scene3D::new(&gl)?;
         let hand_overlay = HandOverlayRenderer::new(&gl)?;
         let finger_draw = FingerDrawRenderer::new(&gl)?;
         let room_scanner = RoomScannerRenderer::new(&gl)?;
@@ -1196,7 +1058,6 @@ impl GlRenderer {
         Ok(Self {
             gl,
             passthrough,
-            scene,
             hand_overlay,
             finger_draw,
             room_scanner,
@@ -1205,7 +1066,6 @@ impl GlRenderer {
             gpu_renderer_name,
             width: 1200,
             height: 1080,
-            start_time: Instant::now(),
             last_frame_time: None,
             ema_frame_ms: 8.33,
         })
@@ -1220,7 +1080,7 @@ impl GlRenderer {
         self.height = height.max(2);
     }
 
-    pub fn draw_frame(&mut self, snap: &FrameSnapshot) -> (f32, f32, Vec<ProjectedLabel>) {
+    pub fn draw_frame(&mut self, snap: &FrameSnapshot) -> (f32, f32) {
         let now = Instant::now();
         if let Some(prev) = self.last_frame_time {
             let dt_ms = (now.duration_since(prev).as_secs_f32() * 1000.0).clamp(1.0, 200.0);
@@ -1253,13 +1113,14 @@ impl GlRenderer {
             .update_hands(&self.gl, &snap.hands, quad_hw, quad_hh);
         self.finger_draw
             .sync_if_dirty(&self.gl, &snap.draw_verts, snap.draw_upload_gen);
+        // Draw ONLY the sleek 3D aiming reticle (no legacy floor grid carpets or floating boxes!)
         self.room_scanner.update(
             &self.gl,
-            &snap.room_planes,
-            &snap.room_objects,
-            &snap.blocks_25d,
+            &[],
+            &[],
+            &[],
             &snap.reticle,
-            snap.show_grid,
+            false,
             snap.head_pos_120hz,
             snap.head_rot_120hz,
         );
@@ -1272,19 +1133,8 @@ impl GlRenderer {
 
         let t_cam_capture =
             Mat4::from_rotation_translation(snap.cam_rot_capture, snap.cam_pos_capture);
-        let elapsed = self.start_time.elapsed().as_secs_f32();
-        let (cube_model, octa_model) = if snap.show_demo_scene {
-            Scene3D::object_transforms(
-                &snap.anchor_origin,
-                elapsed,
-                snap.pull_closer,
-                snap.boost_factor,
-            )
-        } else {
-            (Mat4::IDENTITY, Mat4::IDENTITY)
-        };
 
-        let (left_vp, right_vp, left_uv_bounds, right_uv_bounds) = if !snap.stereo_mode {
+        if !snap.stereo_mode {
             let eye_aspect = w as f32 / h as f32;
             let proj = compute_eye_projection(
                 eye_aspect,
@@ -1297,7 +1147,7 @@ impl GlRenderer {
                 Mat4::from_rotation_translation(snap.head_rot_120hz, snap.head_pos_120hz).inverse();
             let vp = proj * mono_view;
             let pass_mvp = vp * t_cam_capture;
-            let (mono_scissor, mono_uv_bounds) =
+            let (mono_scissor, _) =
                 compute_quad_screen_bounds(&pass_mvp, quad_hw, quad_hh, 0, w, h);
 
             unsafe {
@@ -1310,15 +1160,6 @@ impl GlRenderer {
                     .draw(&self.gl, &pass_mvp, snap.has_camera_frame);
                 if snap.mesh_occlusion_active {
                     self.tri_mesh.draw_depth_occlusion(&self.gl, &vp);
-                }
-                if snap.show_demo_scene {
-                    self.scene.draw(
-                        &self.gl,
-                        &vp,
-                        &cube_model,
-                        &octa_model,
-                        snap.palette_idx,
-                    );
                 }
                 self.physics_renderer.draw(
                     &self.gl,
@@ -1341,8 +1182,6 @@ impl GlRenderer {
                 self.finger_draw.draw(&self.gl, &vp);
                 self.hand_overlay.draw(&self.gl, &pass_mvp);
             }
-
-            (vp, vp, mono_uv_bounds, mono_uv_bounds)
         } else {
             let half_w = (w / 2).max(1);
             let right_w = (w - half_w).max(1);
@@ -1363,9 +1202,9 @@ impl GlRenderer {
             let right_vp = proj_eye * right_view;
             let right_pass_mvp = right_vp * t_cam_capture;
 
-            let (left_scissor, left_uv_bounds) =
+            let (left_scissor, _) =
                 compute_quad_screen_bounds(&left_pass_mvp, quad_hw, quad_hh, 0, half_w, h);
-            let (right_scissor, right_uv_bounds) =
+            let (right_scissor, _) =
                 compute_quad_screen_bounds(&right_pass_mvp, quad_hw, quad_hh, half_w, right_w, h);
 
             unsafe {
@@ -1380,15 +1219,6 @@ impl GlRenderer {
                     .draw(&self.gl, &left_pass_mvp, snap.has_camera_frame);
                 if snap.mesh_occlusion_active {
                     self.tri_mesh.draw_depth_occlusion(&self.gl, &left_vp);
-                }
-                if snap.show_demo_scene {
-                    self.scene.draw(
-                        &self.gl,
-                        &left_vp,
-                        &cube_model,
-                        &octa_model,
-                        snap.palette_idx,
-                    );
                 }
                 self.physics_renderer.draw(
                     &self.gl,
@@ -1418,15 +1248,6 @@ impl GlRenderer {
                 if snap.mesh_occlusion_active {
                     self.tri_mesh.draw_depth_occlusion(&self.gl, &right_vp);
                 }
-                if snap.show_demo_scene {
-                    self.scene.draw(
-                        &self.gl,
-                        &right_vp,
-                        &cube_model,
-                        &octa_model,
-                        snap.palette_idx,
-                    );
-                }
                 self.physics_renderer.draw(
                     &self.gl,
                     &right_vp,
@@ -1455,29 +1276,13 @@ impl GlRenderer {
                 self.gl.clear(glow::COLOR_BUFFER_BIT);
                 self.gl.disable(glow::SCISSOR_TEST);
             }
+        }
 
-            (left_vp, right_vp, left_uv_bounds, right_uv_bounds)
-        };
-
-        let labels = if snap.room_planes.is_empty() && snap.room_objects.is_empty() {
-            Vec::new()
-        } else {
-            project_room_labels(
-                &snap.room_planes,
-                &snap.room_objects,
-                &left_vp,
-                &right_vp,
-                left_uv_bounds,
-                right_uv_bounds,
-            )
-        };
-
-        (fps, self.ema_frame_ms, labels)
+        (fps, self.ema_frame_ms)
     }
 
     pub fn destroy(&self) {
         self.passthrough.destroy(&self.gl);
-        self.scene.destroy(&self.gl);
         self.hand_overlay.destroy(&self.gl);
         self.finger_draw.destroy(&self.gl);
         self.room_scanner.destroy(&self.gl);
@@ -1539,7 +1344,6 @@ mod tests {
     fn anchored_floor_locks_in_world_and_reticle_drop_does_not_chase_camera() {
         let mut state = SharedInputState::default();
         assert!(!state.stereo_mode);
-        assert!(!state.show_demo_scene);
         assert_eq!(state.room_scan_mode, 4);
 
         // Camera starts at y = 0.0 -> world floor anchors at -1.35
