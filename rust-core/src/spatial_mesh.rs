@@ -12,13 +12,14 @@ pub const CHUNK_VOLUME: usize = CHUNK_DIM * CHUNK_DIM * CHUNK_DIM; // 4096 voxel
 pub const CELL_SIZE: f32 = 0.025; // 2.5cm ultra-fine base grid -> 0.40m cube/chunk (close-up bumpy detail!)
 pub const TSDF_TRUNC: f32 = CELL_SIZE * 3.0; // ±7.5cm narrow band (eliminates carving dead-zone!)
 pub const CLOSE_DETAIL_DIST_CM: u8 = 95; // <= 0.95m camera distance unlocks ultra-fine 2.5cm triangles; > 0.95m merges 2x2 (5cm)
-pub const MAX_ACTIVE_CHUNKS: usize = 320; // ~5.1 MB TSDF RAM cap (fits effortlessly in 6-8 GB phone RAM)
+pub const MAX_ACTIVE_CHUNKS: usize = 1200; // ~19.2 MB TSDF RAM cap (holds an entire 360° room + floor at 2.5cm with zero eviction!)
 pub const MAX_CANONICAL_PLANES: usize = 24;
 pub const MAX_POLY_VERTS: usize = 24;
-pub const MAX_MESH_VERTICES: usize = 90_000; // 30,000 triangles sorted nearest-first (~4.68 MB VBO)
-pub const MAX_RENDER_RADIUS_M: f32 = 5.5;
+pub const MAX_MESH_VERTICES: usize = 150_000; // 50,000 triangles kept live in GPU VBO for instant 360° turning
+pub const MAX_RENDER_RADIUS_M: f32 = 6.5;
 
 pub const MESH_MIN_WEIGHT: u8 = 24; // Locks in 2 frames close/high-conf or 3 frames smooth; rejects 1-frame noise
+pub const PROTECTED_WEIGHT: u8 = 46; // Multi-view confirmed surface: immune to 1-frame turn-back lag/jitter!
 pub const LOCK_CHANGE_CONFIRM: u8 = 3; // True Lock mode requires 3 consecutive frames (~1.5s) before mutating TSDF
 
 const TRI_MESH_VERT: &str = r#"#version 300 es
@@ -244,16 +245,24 @@ impl VoxelChunk {
 
         let mut old_wf = old_w as f32;
         if is_carve {
-            // Instant self-healing: cap old weight aggressively so floating errors vanish in 1-2 frames!
-            old_wf = old_wf.min(16.0);
+            // Weak/unconfirmed glitches (< 46) clear immediately; multi-view confirmed surfaces (>= 46)
+            // only reach here after 2 consecutive consistent frames, then erode cleanly!
+            old_wf = if old_w >= PROTECTED_WEIGHT {
+                old_wf.min(24.0)
+            } else {
+                old_wf.min(14.0)
+            };
         } else if old_w > 0 && obs_dist_cm < 250 {
-            if (obs_dist_cm as u16) + 18 < (old_d as u16) {
-                // Much closer view -> override stale distant error cleanly!
-                old_wf = old_wf.min(12.0);
-                add_w = (add_w * 1.45).min(30.0);
-            } else if (obs_dist_cm as u16) > (old_d as u16) + 35 {
-                // Distant view looking at an already close-up detailed voxel -> barely perturb it!
-                add_w *= 0.25;
+            if (obs_dist_cm as u16) + 20 < (old_d as u16) && add_w >= 15.0 {
+                // Genuine close-up high-confidence scan -> smoothly refine stale distant data!
+                old_wf = old_wf.min(22.0);
+                add_w = (add_w * 1.35).min(28.0);
+            } else if (obs_dist_cm as u16) > (old_d as u16) + 20 {
+                // Distant view looking at an already close-up detailed voxel -> preserve crisp detail!
+                add_w *= 0.15;
+            } else if old_w >= PROTECTED_WEIGHT {
+                // Already well-scanned locked room memory seen again from same distance -> resist ARCore turn drift!
+                add_w *= 0.28;
             }
         }
 
@@ -956,13 +965,6 @@ impl SpatialMeshMap {
             return None;
         }
 
-        // Floor is never rendered -> never acts as an invisible fake floor collider!
-        if let Some(fy_floor) = self.inferred_floor_y() {
-            if n.y >= 0.78 && (pos.y - radius) <= fy_floor + 0.052 {
-                return None;
-            }
-        }
-
         // Confirm real rendered triangles exist at the surface contact point
         let contact = pos - n * signed_dist.max(0.0);
         let (cgx, cgy, cgz) = Self::world_to_cell(contact);
@@ -996,7 +998,6 @@ impl SpatialMeshMap {
         if d.length_squared() < 1e-4 {
             return None;
         }
-        let floor_y = self.inferred_floor_y();
         let step = 0.018f32; // 1.8cm (< 2.5cm cell)
         let mut t = min_dist.max(0.02);
         let mut prev_valid = false;
@@ -1048,11 +1049,7 @@ impl SpatialMeshMap {
                     if n.length_squared() < 1e-4 {
                         n = -d;
                     }
-                    // Ignore bare floor level (never rendered visually)
-                    let on_suppressed_floor = floor_y
-                        .map(|fy| n.y >= 0.78 && hit_pos.y <= fy + 0.052)
-                        .unwrap_or(false);
-                    if !on_suppressed_floor && n.dot(-d) > -0.25 {
+                    if n.dot(-d) > -0.25 {
                         return Some((hit_pos, n, hit_t));
                     }
                 }
@@ -1388,10 +1385,11 @@ impl SpatialMeshMap {
         updated
     }
 
-    /// Zero-dead-zone free-space ray carving:
-    /// - Turbo (`diff_only = false`): carves right up to `d_obs - 5.5cm` (overlapping seamlessly with
-    ///   `integrate_surface_band`'s `+sdf` front band!) and hard-erodes floating errors in 1-2 frames!
-    /// - Locked (`diff_only = true`): requires 3 consecutive ticks (`LOCK_CHANGE_CONFIRM`) before carving.
+    /// Memory-safe free-space ray carving:
+    /// - Fresh/weak glitches (`old_w < PROTECTED_WEIGHT`): carved immediately in 1 frame (`margin = 6.2cm`).
+    /// - Multi-view confirmed room memory (`old_w >= PROTECTED_WEIGHT`): protected against 1-frame turn-back
+    ///   lag/jitter! Requires high raw confidence (`strong_carve`), clear `9.5cm` separation behind the surface,
+    ///   and `2` consecutive consistent frames (`vote_change >= 2`) in Turbo (or `3` in Locked mode).
     #[allow(clippy::too_many_arguments)]
     fn carve_free_space_ray(
         &mut self,
@@ -1400,12 +1398,13 @@ impl SpatialMeshMap {
         d_obs: f32,
         carve_w: f32,
         diff_only: bool,
+        strong_carve: bool,
         gen: u64,
         border_flips: &mut Vec<((i32, i32, i32), usize, usize, usize)>,
     ) -> u32 {
-        let margin = if diff_only { 0.12 } else { 0.055 };
-        let max_t = (d_obs - margin).min(2.65);
-        if max_t <= 0.18 {
+        let weak_max_t = (d_obs - if diff_only { 0.12 } else { 0.062 }).min(2.65);
+        let protected_max_t = (d_obs - if diff_only { 0.12 } else { 0.095 }).min(2.65);
+        if weak_max_t <= 0.18 {
             return 0;
         }
         let step = CELL_SIZE * 0.85; // 2.1cm step (< 2.5cm cell -> zero Swiss cheese!)
@@ -1415,7 +1414,7 @@ impl SpatialMeshMap {
         let mut prev_cell = (i32::MAX, i32::MAX, i32::MAX);
         let mut miss_ckey = (i32::MAX, i32::MAX, i32::MAX);
 
-        while t < max_t && steps < 118 {
+        while t < weak_max_t && steps < 118 {
             let cell = Self::world_to_cell(cam_pos + dir * t);
             if cell != prev_cell {
                 prev_cell = cell;
@@ -1426,7 +1425,7 @@ impl SpatialMeshMap {
                         let old_w = chunk.weight[idx];
                         let old_t = chunk.tsdf[idx];
                         if diff_only {
-                            if old_w >= MESH_MIN_WEIGHT && old_t <= 18 {
+                            if strong_carve && old_w >= MESH_MIN_WEIGHT && old_t <= 18 && t < protected_max_t {
                                 let votes = chunk.vote_change(idx, gen);
                                 if votes >= LOCK_CHANGE_CONFIRM {
                                     if chunk.fuse_voxel(idx, 1.0, carve_w.max(36.0), 255, true, gen) {
@@ -1443,8 +1442,28 @@ impl SpatialMeshMap {
                                     }
                                 }
                             }
+                        } else if old_w >= PROTECTED_WEIGHT && old_t < 96 {
+                            // Confirmed room surface: NEVER let 1 noisy turn-back frame scratch it!
+                            if strong_carve && t < protected_max_t {
+                                let votes = chunk.vote_change(idx, gen);
+                                if votes >= 2 {
+                                    if chunk.fuse_voxel(idx, 1.0, carve_w.max(40.0), 255, true, gen) {
+                                        carved += 1;
+                                        if lx == 0
+                                            || ly == 0
+                                            || lz == 0
+                                            || lx == CHUNK_DIM - 1
+                                            || ly == CHUNK_DIM - 1
+                                            || lz == CHUNK_DIM - 1
+                                        {
+                                            border_flips.push((ckey, lx, ly, lz));
+                                        }
+                                    }
+                                }
+                            }
                         } else if old_w > 0 && old_t < 96 {
-                            if chunk.fuse_voxel(idx, 1.0, carve_w.max(40.0), 255, true, gen) {
+                            // Unconfirmed weak glitch -> instant 1-frame self-healing!
+                            if chunk.fuse_voxel(idx, 1.0, carve_w.max(36.0), 255, true, gen) {
                                 carved += 1;
                                 if lx == 0
                                     || ly == 0
@@ -1567,7 +1586,6 @@ impl SpatialMeshMap {
         self.tick_gen = self.tick_gen.wrapping_add(1);
         let gen = self.tick_gen;
         let rot = cam_rot.normalize();
-        let floor_y = self.inferred_floor_y();
 
         let sx = dw as f32 / img_w as f32;
         let sy = dh as f32 / img_h as f32;
@@ -1577,8 +1595,9 @@ impl SpatialMeshMap {
         let cy_d = cy * sy;
 
         let step_px = stride.clamp(1, 4);
-        let pad_x = (dw / 24).max(2);
-        let pad_y = (dh / 24).max(2);
+        // Trim distorted outer 10% left/right & 8% top/bottom edges of ARCore monocular depth!
+        let pad_x = (dw / 10).max(4);
+        let pad_y = (dh / 12).max(3);
         let max_depth_m = if turbo { 2.85f32 } else { 2.65f32 };
 
         let mut stats = DepthIngestStats::default();
@@ -1592,38 +1611,38 @@ impl SpatialMeshMap {
                 if (220..=2900).contains(&d_mm) {
                     let dm = d_mm as f32 * 0.001;
                     if dm <= max_depth_m {
-                        let (conf_ok, base_w, allow_carve) = if let Some(cb) = conf_bytes {
+                        let (conf_ok, base_w, allow_carve, strong_carve) = if let Some(cb) = conf_bytes {
                             let c0 = read_conf_u8(cb, x, y, dw, dh, cw, ch, c_row_stride, c_pix_stride);
                             if !turbo {
                                 if c0 >= 65 {
-                                    (true, 18.0f32, true)
+                                    (true, 18.0f32, true, c0 >= 85)
                                 } else if c0 >= 30
                                     && max_nearby_conf(cb, x, y, dw, dh, cw, ch, c_row_stride, c_pix_stride) >= 75
                                 {
-                                    (true, 14.0f32, true)
+                                    (true, 14.0f32, true, false)
                                 } else {
-                                    (false, 0.0f32, false)
+                                    (false, 0.0f32, false, false)
                                 }
                             } else if is_raw_only {
                                 if c0 >= 65 {
-                                    (true, if c0 >= 130 { 18.0 } else { 13.0 }, true)
+                                    (true, if c0 >= 130 { 18.0 } else { 13.0 }, true, c0 >= 95)
                                 } else {
-                                    (false, 0.0f32, false)
+                                    (false, 0.0f32, false, false)
                                 }
                             } else if c0 >= 90 {
-                                (true, 18.0f32, true)
+                                (true, 18.0f32, true, true)
                             } else if c0 >= 35 {
-                                (true, 13.0f32, true)
+                                (true, 13.0f32, true, c0 >= 85)
                             } else {
                                 let nb_c = max_nearby_conf(cb, x, y, dw, dh, cw, ch, c_row_stride, c_pix_stride);
                                 if nb_c >= 35 {
-                                    (true, 10.0f32, nb_c >= 60)
+                                    (true, 10.0f32, nb_c >= 60, false)
                                 } else {
-                                    (false, 0.0f32, false)
+                                    (false, 0.0f32, false, false)
                                 }
                             }
                         } else {
-                            (true, 11.0f32, true)
+                            (true, 11.0f32, true, false)
                         };
 
                         if !conf_ok {
@@ -1659,12 +1678,6 @@ impl SpatialMeshMap {
                                 let hit_world = cam_pos + world_vec;
                                 stats.valid_rays += 1;
 
-                                // NO FLOOR MESH: skip integrating flat bare floor pixels (<= floor_y + 4.5cm),
-                                // while still letting this ray carve any floating errors hovering above the floor!
-                                let on_bare_floor = floor_y
-                                    .map(|fy| hit_world.y <= fy + 0.045)
-                                    .unwrap_or(false);
-
                                 // Distance-proportional quality boost: close-up rays (<1.0m) carry much higher accuracy!
                                 let dist_boost = if dist <= 0.95 { 1.25 } else { 1.0 };
 
@@ -1677,39 +1690,23 @@ impl SpatialMeshMap {
                                             dist,
                                             40.0,
                                             false,
+                                            strong_carve,
                                             gen,
                                             &mut border_flips,
                                         );
                                     }
-                                    if !on_bare_floor {
-                                        stats.updated_voxels += self.integrate_surface_band(
-                                            cam_pos,
-                                            dir,
-                                            dist,
-                                            base_w * dist_boost,
-                                            gen,
-                                            &mut border_flips,
-                                        );
-                                    }
+                                    stats.updated_voxels += self.integrate_surface_band(
+                                        cam_pos,
+                                        dir,
+                                        dist,
+                                        base_w * dist_boost,
+                                        gen,
+                                        &mut border_flips,
+                                    );
                                 } else {
                                     // TRUE LOCK MODE:
-                                    // 1. Unchanged locked surface (±10cm) or bare floor -> 0 writes!
-                                    if on_bare_floor || self.match_locked_surface_along_ray(cam_pos, dir, dist) {
-                                        if on_bare_floor && allow_carve {
-                                            let carved = self.carve_free_space_ray(
-                                                cam_pos,
-                                                dir,
-                                                dist,
-                                                36.0,
-                                                true,
-                                                gen,
-                                                &mut border_flips,
-                                            );
-                                            if carved > 0 {
-                                                stats.changed_rays += 1;
-                                                stats.updated_voxels += carved;
-                                            }
-                                        }
+                                    // 1. Unchanged locked surface (±10cm) -> 0 writes!
+                                    if self.match_locked_surface_along_ray(cam_pos, dir, dist) {
                                         x += step_px;
                                         continue;
                                     }
@@ -1721,6 +1718,7 @@ impl SpatialMeshMap {
                                             dist,
                                             36.0,
                                             true,
+                                            strong_carve,
                                             gen,
                                             &mut border_flips,
                                         );
@@ -1787,7 +1785,6 @@ impl SpatialMeshMap {
         }
         self.tick_gen = self.tick_gen.wrapping_add(1);
         let gen = self.tick_gen;
-        let floor_y = self.inferred_floor_y();
         let n = point_count.min(packed_xyzc.len() / 4);
         let mut border_flips: Vec<((i32, i32, i32), usize, usize, usize)> = Vec::new();
 
@@ -1801,11 +1798,6 @@ impl SpatialMeshMap {
             if !pt.is_finite() {
                 continue;
             }
-            if let Some(fy) = floor_y {
-                if pt.y <= fy + 0.045 {
-                    continue;
-                }
-            }
             let delta = pt - cam_pos;
             let dist_sq = delta.length_squared();
             if !(0.22 * 0.22..=3.2 * 3.2).contains(&dist_sq) {
@@ -1814,7 +1806,7 @@ impl SpatialMeshMap {
             let dist = dist_sq.sqrt();
             let dir = delta / dist;
             if i % 3 == 0 {
-                self.carve_free_space_ray(cam_pos, dir, dist, 18.0, false, gen, &mut border_flips);
+                self.carve_free_space_ray(cam_pos, dir, dist, 18.0, false, false, gen, &mut border_flips);
             }
             let w = if conf >= 0.72 { 16.0 } else { 12.0 };
             self.integrate_surface_band(cam_pos, dir, dist, w, gen, &mut border_flips);
@@ -1841,9 +1833,8 @@ impl SpatialMeshMap {
             return 0;
         }
 
-        let floor_y = self.inferred_floor_y();
         for ckey in &dirty_keys {
-            let (detail_tris, flat_tris, aabbs) = self.build_chunk_adaptive_mesh(*ckey, floor_y);
+            let (detail_tris, flat_tris, aabbs) = self.build_chunk_adaptive_mesh(*ckey);
             if let Some(chunk) = self.chunks.get_mut(ckey) {
                 chunk.detail_tris = detail_tris;
                 chunk.flat_tris = flat_tris;
@@ -1865,7 +1856,6 @@ impl SpatialMeshMap {
     fn build_chunk_adaptive_mesh(
         &self,
         ckey: (i32, i32, i32),
-        floor_y: Option<f32>,
     ) -> (Vec<TriMeshVertex>, Vec<TriMeshVertex>, Vec<AabbCollider>) {
         let Some(chunk) = self.chunks.get(&ckey) else {
             return (Vec::new(), Vec::new(), Vec::new());
@@ -2070,18 +2060,10 @@ impl SpatialMeshMap {
             }
         }
 
-        // Step C: Collect axis-aligned slices (+X/-X, +Y/-Y, +Z/-Z), drop floor quads, and run
-        // Coplanar Greedy Merge (flat faces -> 1 unified quad) + Distance LOD (<=95cm: 2.5cm, >95cm: 5cm)!
+        // Step C: Collect axis-aligned slices (+X/-X, +Y/-Y, +Z/-Z) and run Coplanar Greedy Merge
+        // (flat walls, tabletops, AND scanned floors -> 1 unified sheet!) + Distance LOD (<=95cm: 2.5cm, >95cm: 5cm)!
         let mut detail_tris = Vec::with_capacity((chunk.surface_count as usize) * 3);
         let mut flat_tris = Vec::with_capacity(128);
-
-        let is_floor_quad = |mid: Vec3, n: Vec3| -> bool {
-            if let Some(fy) = floor_y {
-                n.y >= 0.78 && mid.y <= fy + 0.052
-            } else {
-                false
-            }
-        };
 
         // Axis 0 (+X / -X slices indexed by lx, grid[lz][ly])
         for lx in 0..CHUNK_DIM {
@@ -2110,9 +2092,6 @@ impl SpatialMeshMap {
                         let n = (dual_norm[i0] + dual_norm[i1] + dual_norm[i2] + dual_norm[i3]).normalize_or_zero();
                         let n = if n.length_squared() > 1e-4 { n } else if s0 { Vec3::X } else { Vec3::NEG_X };
                         let mid = (p0 + p2) * 0.5;
-                        if is_floor_quad(mid, n) {
-                            continue;
-                        }
                         let curv = (dual_curv[i0] + dual_curv[i1] + dual_curv[i2] + dual_curv[i3]) * 0.25;
                         let min_d = dual_dist[i0].min(dual_dist[i1]).min(dual_dist[i2]).min(dual_dist[i3]);
                         let axis_dir = if s0 { Vec3::X } else { Vec3::NEG_X };
@@ -2162,9 +2141,6 @@ impl SpatialMeshMap {
                         let n = (dual_norm[i0] + dual_norm[i1] + dual_norm[i2] + dual_norm[i3]).normalize_or_zero();
                         let n = if n.length_squared() > 1e-4 { n } else if s0 { Vec3::Y } else { Vec3::NEG_Y };
                         let mid = (p0 + p2) * 0.5;
-                        if is_floor_quad(mid, n) {
-                            continue;
-                        }
                         let curv = (dual_curv[i0] + dual_curv[i1] + dual_curv[i2] + dual_curv[i3]) * 0.25;
                         let min_d = dual_dist[i0].min(dual_dist[i1]).min(dual_dist[i2]).min(dual_dist[i3]);
                         let axis_dir = if s0 { Vec3::Y } else { Vec3::NEG_Y };
@@ -2214,9 +2190,6 @@ impl SpatialMeshMap {
                         let n = (dual_norm[i0] + dual_norm[i1] + dual_norm[i2] + dual_norm[i3]).normalize_or_zero();
                         let n = if n.length_squared() > 1e-4 { n } else if s0 { Vec3::Z } else { Vec3::NEG_Z };
                         let mid = (p0 + p2) * 0.5;
-                        if is_floor_quad(mid, n) {
-                            continue;
-                        }
                         let curv = (dual_curv[i0] + dual_curv[i1] + dual_curv[i2] + dual_curv[i3]) * 0.25;
                         let min_d = dual_dist[i0].min(dual_dist[i1]).min(dual_dist[i2]).min(dual_dist[i3]);
                         let axis_dir = if s0 { Vec3::Z } else { Vec3::NEG_Z };
@@ -2346,12 +2319,13 @@ impl SpatialMeshMap {
         out
     }
 
-    /// Builds nearest-first Adaptive Mesh VBO returning `(active_chunks, detail_tris, flat_merged_tris)`.
-    /// ZERO floor sheets and ZERO stuck ARCore plane rectangles!
+    /// Builds nearest-first FULL-360° Adaptive Mesh VBO returning `(active_chunks, detail_tris, flat_merged_tris)`.
+    /// Keeps ALL scanned chunks within `6.5m` in GPU memory (ZERO behind-camera culling!) so turning 360°
+    /// in place NEVER hides or forgets already-scanned walls, floors, or objects!
     pub fn build_triangle_mesh_buffer(
         &self,
         cam_pos: Vec3,
-        cam_fwd: Vec3,
+        _cam_fwd: Vec3,
         out: &mut Vec<TriMeshVertex>,
     ) -> (u32, u32, u32) {
         out.clear();
@@ -2367,12 +2341,8 @@ impl SpatialMeshMap {
                 (ckey.1 as f32 + 0.5) * chunk_span,
                 (ckey.2 as f32 + 0.5) * chunk_span,
             );
-            let to_c = center - cam_pos;
-            let dist = to_c.length();
+            let dist = (center - cam_pos).length();
             if dist > MAX_RENDER_RADIUS_M {
-                continue;
-            }
-            if dist > 1.0 && to_c.dot(cam_fwd) < -0.9 {
                 continue;
             }
             visible_chunks.push((dist, chunk));
@@ -2449,6 +2419,7 @@ impl SpatialMeshMap {
         self.ingest_ar_plane_polygons(&raw_planes, cam_y);
 
         let gen = self.tick_gen;
+        let rotated = q_align.angle_between(Quat::IDENTITY) > 0.05;
         let mut imported_voxels = 0usize;
         for &sv in saved_voxels {
             let w_curr = q_align * sv.world_pos + t_align;
@@ -2457,19 +2428,36 @@ impl SpatialMeshMap {
             }
             let (gx, gy, gz) = Self::world_to_cell(w_curr);
             let (ckey, lx, ly, lz) = Self::split_cell(gx, gy, gz);
+            let sdf_norm = (sv.tsdf as f32 / 127.0).clamp(-1.0, 1.0);
+            let prior_w = (sv.weight as f32).clamp(PROTECTED_WEIGHT as f32 + 6.0, 80.0);
             if let Some(chunk) = self.get_or_alloc_chunk(ckey, gen) {
                 let idx = VoxelChunk::idx(lx, ly, lz);
-                let sdf_norm = (sv.tsdf as f32 / 127.0).clamp(-1.0, 1.0);
-                let prior_w = (sv.weight as f32).clamp(MESH_MIN_WEIGHT as f32 + 10.0, 80.0);
                 chunk.fuse_voxel(idx, sdf_norm, prior_w, 90, false, gen);
                 chunk.dirty = true;
                 imported_voxels += 1;
+            }
+            // When rotated relative to saved session, fill nearest half-cell offset if empty so zero Moiré holes form
+            if rotated {
+                let fx = (w_curr.x / CELL_SIZE) - (gx as f32 + 0.5);
+                let fz = (w_curr.z / CELL_SIZE) - (gz as f32 + 0.5);
+                let nx = gx + if fx >= 0.0 { 1 } else { -1 };
+                let nz = gz + if fz >= 0.0 { 1 } else { -1 };
+                for (tx, tz) in [(nx, gz), (gx, nz)] {
+                    let (n_ckey, nlx, nly, nlz) = Self::split_cell(tx, gy, tz);
+                    if let Some(nchunk) = self.get_or_alloc_chunk(n_ckey, gen) {
+                        let nidx = VoxelChunk::idx(nlx, nly, nlz);
+                        if nchunk.weight[nidx] == 0 {
+                            nchunk.fuse_voxel(nidx, sdf_norm, prior_w * 0.75, 95, false, gen);
+                            nchunk.dirty = true;
+                        }
+                    }
+                }
             }
         }
         if imported_voxels >= 16 {
             self.has_dense_depth = true;
         }
-        self.step_greedy_meshing(96);
+        self.step_greedy_meshing(MAX_ACTIVE_CHUNKS);
         self.mesh_gen = self.mesh_gen.wrapping_add(1);
     }
 
@@ -2677,23 +2665,10 @@ mod tests {
     }
 
     #[test]
-    fn flat_wall_merges_into_few_unified_quads_and_floor_never_renders() {
+    fn flat_wall_and_scanned_floor_both_merge_into_few_unified_quads() {
         let mut map = SpatialMeshMap::default();
-        // Register invisible floor at y = -0.80m for physics only
-        map.ingest_ar_plane_polygons(
-            &[RawArPlane {
-                raw_type: 0,
-                pos: Vec3::new(0.0, -0.80, -1.2),
-                rot: Quat::IDENTITY,
-                extent_x: 3.0,
-                extent_z: 3.0,
-                polygon_xz: vec![[-1.5, -1.5], [1.5, -1.5], [1.5, 1.5], [-1.5, 1.5]],
-            }],
-            0.0,
-        );
-        assert_eq!(map.inferred_floor_y(), Some(-0.80));
 
-        // Purely flat vertical wall at z = -1.40m (NO bumps!)
+        // 1. Purely flat vertical wall at z = -1.40m
         let dw = 80usize;
         let dh = 60usize;
         let depth_wall = make_synthetic_depth_image(dw, dh, |_, _| 1400u16);
@@ -2706,21 +2681,74 @@ mod tests {
                 Vec3::ZERO, Quat::IDENTITY, true, 1,
             );
         }
-        map.step_greedy_meshing(64);
+        // 2. Scan a real flat floor at y = -1.20m (camera looking straight down from y = 0.0 -> 1200mm)
+        let depth_floor = make_synthetic_depth_image(dw, dh, |_, _| 1200u16);
+        let look_down = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+        for _ in 0..3 {
+            map.ingest_depth_map(
+                &depth_floor, dw, dh, dw * 2, 2,
+                Some(&conf), dw, dh, dw, 1, false,
+                64.0, 64.0, 40.0, 30.0, dw, dh,
+                Vec3::ZERO, look_down, true, 1,
+            );
+        }
+        map.step_greedy_meshing(128);
         let mut verts = Vec::new();
         let (_, detail_tris, flat_tris) = map.build_triangle_mesh_buffer(Vec3::ZERO, Vec3::NEG_Z, &mut verts);
-        assert!(flat_tris >= 2, "flat wall must emit merged flat sheets, got {}", flat_tris);
+        assert!(flat_tris >= 4, "flat wall + floor must emit merged flat sheets, got {}", flat_tris);
         assert!(
-            flat_tris < 90,
-            "coplanar merge must collapse flat wall massively (not 1000+ micro-tris!), got flat={}, detail={}",
+            flat_tris < 160,
+            "coplanar merge must collapse flat wall + floor cleanly, got flat={}, detail={}",
             flat_tris, detail_tris
         );
-        // Verify ZERO floor triangles exist!
+        // Verify scanned floor triangles ARE present and merged!
         let floor_tris = verts
             .chunks_exact(3)
-            .filter(|tri| tri[0].normal[1] >= 0.78 && (tri[0].pos[1] + tri[1].pos[1] + tri[2].pos[1]) / 3.0 <= -0.74)
+            .filter(|tri| tri[0].normal[1] >= 0.78 && (tri[0].pos[1] + tri[1].pos[1] + tri[2].pos[1]) / 3.0 <= -1.12)
             .count();
-        assert_eq!(floor_tris, 0, "floor must NEVER be rendered in visual mesh!");
+        assert!(floor_tris >= 2, "scanned floor must render as merged flat triangles, got {}", floor_tris);
+    }
+
+    #[test]
+    fn turning_360_preserves_room_vbo_and_single_lag_frame_never_destroys_locked_wall() {
+        let mut map = SpatialMeshMap::default();
+        let dw = 80usize;
+        let dh = 60usize;
+        let conf = vec![190u8; dw * dh];
+        let depth_wall = make_synthetic_depth_image(dw, dh, |_, _| 1300u16);
+
+        // Scan Wall A cleanly in front (-Z) for 4 frames -> reaches PROTECTED_WEIGHT (>= 46)
+        for _ in 0..4 {
+            map.ingest_depth_map(
+                &depth_wall, dw, dh, dw * 2, 2,
+                Some(&conf), dw, dh, dw, 1, false,
+                64.0, 64.0, 40.0, 30.0, dw, dh,
+                Vec3::ZERO, Quat::IDENTITY, true, 1,
+            );
+        }
+        map.step_greedy_meshing(128);
+
+        // Turn 180° around (facing +Z, Wall A is directly behind camera!) -> VBO MUST STILL KEEP Wall A!
+        let mut verts_back = Vec::new();
+        let (_, d_back, f_back) = map.build_triangle_mesh_buffer(Vec3::ZERO, Vec3::Z, &mut verts_back);
+        assert!(d_back + f_back >= 2, "turning 180 deg must NEVER strip Wall A from GPU VBO!");
+
+        // Turn back toward Wall A with 1 single noisy lag frame seeing +25cm deeper ->
+        // protected memory MUST NOT be destroyed by 1 single frame!
+        let depth_lag = make_synthetic_depth_image(dw, dh, |_, _| 1550u16);
+        map.ingest_depth_map(
+            &depth_lag, dw, dh, dw * 2, 2,
+            Some(&conf), dw, dh, dw, 1, false,
+            64.0, 64.0, 40.0, 30.0, dw, dh,
+            Vec3::ZERO, Quat::IDENTITY, true, 1,
+        );
+        map.step_greedy_meshing(128);
+        let hit_after_1 = map.raycast_scanned_surface(Vec3::ZERO, Vec3::NEG_Z, 0.15, 3.0);
+        assert!(
+            hit_after_1.is_some() && (hit_after_1.unwrap().2 - 1.30).abs() < 0.06,
+            "1 single noisy turn-back frame must NEVER destroy confirmed Wall A! got {:?}",
+            hit_after_1
+        );
     }
 
     #[test]

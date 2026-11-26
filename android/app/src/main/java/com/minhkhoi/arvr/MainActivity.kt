@@ -53,7 +53,6 @@ import com.google.ar.core.CameraConfig
 import com.google.ar.core.CameraConfigFilter
 import com.google.ar.core.Config
 import com.google.ar.core.Coordinates2d
-import com.google.ar.core.Plane
 import com.google.ar.core.Session
 import com.google.ar.core.TrackingState
 import java.nio.ByteBuffer
@@ -166,9 +165,7 @@ class MainActivity : Activity(), SensorEventListener {
     @Volatile
     private var handMode = 0 // 0=Tắt (mặc định tối ưu 3D), 1=Tự động, 2=Nhanh
     @Volatile
-    private var roomScanMode = 4 // 4=Lưới △ (Surface Nets mượt + Che khuất), 1=Lưới 3D, 3=Ẩn lưới, 2=+AI Vật, 0=TẮT
-    @Volatile
-    private var cachedPlanesCount = 0
+    private var roomScanMode = 4 // 4=Lưới △ (Thích ứng 2.5cm + Gộp phẳng + Quét sàn), 3=Ẩn lưới, 0=TẮT
     private var telemetryVisible = false
     private var availableUpdate: UpdateCheckResult? = null
     private var pendingInstallPermissionResume = false
@@ -181,18 +178,15 @@ class MainActivity : Activity(), SensorEventListener {
     private var hidePopupRunnable: Runnable? = null
     private lateinit var leftRoomPane: FrameLayout
     private lateinit var rightRoomPane: FrameLayout
-    private val packedPlanesBuf = FloatArray(16 * 10)
-    private val packedPolyCountsBuf = IntArray(16)
-    private val packedPolyXzBuf = FloatArray(16 * 24 * 2)
     private val pointCloudBuf = FloatArray(512 * 4)
     private val depthFocalBuf = FloatArray(2)
     private val depthPpBuf = FloatArray(2)
     private val depthDimsBuf = IntArray(2)
-    private var lastPlaneExtractNs = 0L
     private var lastPointCloudNs = 0L
     private var lastRawDepthNs = 0L
     private var lastDepthTimestampNs = 0L
     private var lastRelocIngestNs = 0L
+    private var blurSettleUntilNs = 0L
     private var hasPrevArPose = false
     private var prevArPosX = 0f
     private var prevArPosY = 0f
@@ -788,11 +782,11 @@ class MainActivity : Activity(), SensorEventListener {
         val task = object : Runnable {
             override fun run() {
                 autoSaveRoomCache(showBanner = false)
-                mainHandler.postDelayed(this, 35_000L)
+                mainHandler.postDelayed(this, 20_000L)
             }
         }
         autoSaveRunnable = task
-        mainHandler.postDelayed(task, 35_000L)
+        mainHandler.postDelayed(task, 20_000L)
     }
 
     private fun stopAutoSaveLoop() {
@@ -1045,7 +1039,6 @@ class MainActivity : Activity(), SensorEventListener {
         )
         NativeBridge.nativeSetRoomScanMode(roomScanMode)
         if (roomScanMode == 0) {
-            cachedPlanesCount = 0
             relocPending = false
             relocBar.visibility = View.GONE
         }
@@ -1063,7 +1056,7 @@ class MainActivity : Activity(), SensorEventListener {
 
         if (showPopup) {
             val banner = when (roomScanMode) {
-                4 -> "\uD83D\uDD3A  Lưới thích ứng 2.5cm: Lại gần siêu mịn · Phẳng tự gộp 1 tấm · Đã bỏ sàn"
+                4 -> "\uD83D\uDD3A  Lưới thích ứng 2.5cm: Quét cả sàn + Gộp phẳng + Nhớ phòng 360°"
                 3 -> "\uD83D\uDC41  Ẩn lưới (Giữ che khuất vật thật + Vật lý + Hồng tâm)"
                 else -> "\u23F9  Đã TẮT quét không gian & hồng tâm"
             }
@@ -1266,7 +1259,7 @@ class MainActivity : Activity(), SensorEventListener {
             1 -> "Khớp:${relocPct}%"
             2 -> "Tự khớp OK"
             3 -> "Khớp tay OK"
-            else -> "Mốc:${kfCount}/8"
+            else -> "Mốc:${kfCount}/16"
         }
 
         val depthModeAct = metricsBuf[21].toInt()
@@ -1294,7 +1287,7 @@ class MainActivity : Activity(), SensorEventListener {
             .append("v${BuildConfig.VERSION_NAME} ($shortSha) | $viewLabel | ${batPct}% ${String.format(Locale.US, "%.1f", tempC)}°C | ${totalRamMb}MB\n")
             .append(String.format(Locale.US, "GPU: %d fps (%.1fms) | %s | %s | %s\n", renderFps, frameMs, depthSrc, occTag, torchTag))
             .append("Track: $trackMode | $scanTag | Tâm: $reticleSummary | Vật lý: $physBodies\n")
-            .append("Chi tiết: ${detailTris}\u25B3 ($meshChunks chunk) | Phẳng gộp: ${flatTris}\u25B3 (Không sàn) | $relocTag\n")
+            .append("Chi tiết: ${detailTris}\u25B3 ($meshChunks chunk) | Phẳng gộp: ${flatTris}\u25B3 | $relocTag\n")
             .append("Tay ($activeHands): $gestureName | $handAiText")
             .toString()
 
@@ -1546,7 +1539,7 @@ class MainActivity : Activity(), SensorEventListener {
         val planes = metricsBuf[10].toInt()
         val chunks = metricsBuf[16].toInt()
         val kfs = metricsBuf[18].toInt()
-        roomStatusText.text = "Hiện tại: $chunks chunk 3D | $planes mặt phẳng | $kfs/8 mốc ảnh\n${roomStorage.autoCacheSummaryText()}"
+        roomStatusText.text = "Hiện tại: $chunks chunk 3D | $kfs/16 mốc ảnh định vị\n${roomStorage.autoCacheSummaryText()}"
 
         roomStorage.listRooms { rooms ->
             roomListContainer.removeAllViews()
@@ -1806,7 +1799,7 @@ class MainActivity : Activity(), SensorEventListener {
             setTextColor(Color.parseColor("#B0BEC5"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             setPadding(0, dp(8f), 0, 0)
-            text = "Lưới thích ứng 2.5cm: Đưa máy lại gần đồ vật (<1m) để quét mịn & tự sửa lỗi lơ lửng; tường/mặt phẳng tự gộp thành 1 tấm sạch, không vẽ sàn.\nMẹo VR: Volume+ = Đặt lại mốc sàn | Volume- = Đổi chế độ vẽ tay"
+            text = "Lưới thích ứng 2.5cm: Đưa máy lại gần đồ vật (<1m) để quét mịn; sàn, tường & mặt bàn tự gộp phẳng; nhớ trọn phòng 360° & tự lưu vào máy.\nMẹo VR: Volume+ = Đặt lại | Volume- = Đổi chế độ vẽ tay"
         }
 
         contentBox.addView(row1)
@@ -1997,11 +1990,7 @@ class MainActivity : Activity(), SensorEventListener {
                     }
                     val config = Config(session).apply {
                         focusMode = Config.FocusMode.AUTO
-                        planeFindingMode = if (roomScanMode > 0) {
-                            Config.PlaneFindingMode.HORIZONTAL
-                        } else {
-                            Config.PlaneFindingMode.DISABLED
-                        }
+                        planeFindingMode = Config.PlaneFindingMode.DISABLED
                         lightEstimationMode = Config.LightEstimationMode.DISABLED
                         instantPlacementMode = Config.InstantPlacementMode.DISABLED
                         depthMode = when {
@@ -2049,11 +2038,7 @@ class MainActivity : Activity(), SensorEventListener {
             val session = arSession ?: return
             try {
                 val cfg = session.config
-                val target = if (roomScanMode > 0) {
-                    Config.PlaneFindingMode.HORIZONTAL
-                } else {
-                    Config.PlaneFindingMode.DISABLED
-                }
+                val target = Config.PlaneFindingMode.DISABLED
                 val targetDepth = when {
                     roomScanMode <= 0 -> Config.DepthMode.DISABLED
                     depthSupportLevel == 2 -> Config.DepthMode.AUTOMATIC
@@ -2385,6 +2370,13 @@ class MainActivity : Activity(), SensorEventListener {
                                             sensorPoseNow.qw() * prevArQw
                                     ).coerceIn(0f, 1f)
                                     camAngSpeedRadS = (2f * kotlin.math.acos(qDot)) / dtSec
+                                    val turnLimitAng = if (scanTurbo) 0.90f else 0.75f
+                                    val turnLimitLin = if (scanTurbo) 0.90f else 0.75f
+                                    if (camAngSpeedRadS > turnLimitAng || camLinSpeedMS > turnLimitLin) {
+                                        // 240ms post-turn settle cooldown: waits for ARCore Depth temporal filter
+                                        // to converge after turning so laggy depth NEVER scrambles scanned rooms!
+                                        blurSettleUntilNs = nowNs + 240_000_000L
+                                    }
                                 }
                                 if (valid) {
                                     prevArPosX = sensorPoseNow.tx()
@@ -2431,64 +2423,6 @@ class MainActivity : Activity(), SensorEventListener {
                                     valid
                                 )
 
-                                // Silent floor-height elevation tracking ONLY (so bare floor isn't drawn);
-                                // NEVER used for physics colliders or reticle!
-                                val planeIntervalNs = if (cachedPlanesCount < 3) 250_000_000L else 800_000_000L
-                                if (roomScanMode > 0 && nowNs - lastPlaneExtractNs >= planeIntervalNs) {
-                                    lastPlaneExtractNs = nowNs
-                                    try {
-                                        var pCount = 0
-                                        var polyCursor = 0
-                                        for (plane in session.getAllTrackables(Plane::class.java)) {
-                                            if (pCount >= 16) break
-                                            if (plane.trackingState != TrackingState.TRACKING || plane.subsumedBy != null) {
-                                                continue
-                                            }
-                                            val rawType = when (plane.type) {
-                                                Plane.Type.HORIZONTAL_UPWARD_FACING -> 0f
-                                                Plane.Type.VERTICAL -> 1f
-                                                Plane.Type.HORIZONTAL_DOWNWARD_FACING -> 2f
-                                            }
-                                            val p = plane.centerPose
-                                            val base = pCount * 10
-                                            packedPlanesBuf[base] = rawType
-                                            packedPlanesBuf[base + 1] = p.tx()
-                                            packedPlanesBuf[base + 2] = p.ty()
-                                            packedPlanesBuf[base + 3] = p.tz()
-                                            packedPlanesBuf[base + 4] = p.qx()
-                                            packedPlanesBuf[base + 5] = p.qy()
-                                            packedPlanesBuf[base + 6] = p.qz()
-                                            packedPlanesBuf[base + 7] = p.qw()
-                                            packedPlanesBuf[base + 8] = plane.extentX
-                                            packedPlanesBuf[base + 9] = plane.extentZ
-
-                                            val polyBuf = plane.polygon
-                                            val rawVerts = polyBuf.limit() / 2
-                                            val keptVerts = rawVerts.coerceAtMost(24)
-                                            packedPolyCountsBuf[pCount] = keptVerts
-                                            if (keptVerts > 0 && polyCursor + keptVerts * 2 <= packedPolyXzBuf.size) {
-                                                val step = if (rawVerts > 24) rawVerts.toFloat() / 24f else 1f
-                                                for (vi in 0 until keptVerts) {
-                                                    val srcIdx = ((vi * step).toInt()).coerceIn(0, rawVerts - 1)
-                                                    packedPolyXzBuf[polyCursor++] = polyBuf.get(srcIdx * 2)
-                                                    packedPolyXzBuf[polyCursor++] = polyBuf.get(srcIdx * 2 + 1)
-                                                }
-                                            } else {
-                                                packedPolyCountsBuf[pCount] = 0
-                                            }
-                                            pCount++
-                                        }
-                                        cachedPlanesCount = pCount
-                                        NativeBridge.nativeOnArPlanePolygons(
-                                            pCount,
-                                            packedPlanesBuf,
-                                            packedPolyCountsBuf,
-                                            packedPolyXzBuf
-                                        )
-                                    } catch (_: Throwable) {
-                                    }
-                                }
-
                                 // Fallback SLAM 3D PointCloud (only active in Turbo scan on non-Depth devices / before Depth warms up)
                                 val pcIntervalNs = if (depthSupportLevel > 0) 500_000_000L else 200_000_000L
                                 if (roomScanMode > 0 && valid && scanTurbo && nowNs - lastPointCloudNs >= pcIntervalNs) {
@@ -2510,15 +2444,15 @@ class MainActivity : Activity(), SensorEventListener {
                                     }
                                 }
 
-                                // Primary Conformal 3.5cm TSDF Depth Pipeline (Zero-Copy Direct ByteBuffer -> Rust):
-                                // - Turbo Scan ON:  ~9Hz (110ms), continuous high-confidence fusion + anti-blur gate
+                                // Primary Adaptive 2.5cm TSDF Depth Pipeline (Zero-Copy Direct ByteBuffer -> Rust):
+                                // - Turbo Scan ON:  ~9Hz (110ms) with 240ms post-turn settle guard & protected room memory
                                 // - Locked Mode:    2.0Hz (500ms), TRUE LOCK — ignores wobble & unscanned space, 3-tick confirm!
                                 val depthIntervalNs = if (scanTurbo) 110_000_000L else 500_000_000L
                                 if (roomScanMode > 0 && valid && depthSupportLevel > 0 && nowNs - lastRawDepthNs >= depthIntervalNs) {
-                                    val maxAngVel = if (scanTurbo) 1.50f else 1.00f
-                                    val maxLinVel = if (scanTurbo) 1.35f else 0.90f
-                                    if (camAngSpeedRadS > maxAngVel || camLinSpeedMS > maxLinVel) {
-                                        // Motion-blur / fast-pan protection: skip blurred frame so mid-air ghosts NEVER spawn!
+                                    val maxAngVel = if (scanTurbo) 0.90f else 0.75f
+                                    val maxLinVel = if (scanTurbo) 0.90f else 0.75f
+                                    if (camAngSpeedRadS > maxAngVel || camLinSpeedMS > maxLinVel || nowNs < blurSettleUntilNs) {
+                                        // Motion-blur & 240ms post-turn settle protection: prevents scrambled turn-back layers!
                                         blurSkipActive = true
                                     } else {
                                         blurSkipActive = false

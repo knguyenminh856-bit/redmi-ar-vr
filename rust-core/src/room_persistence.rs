@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 
 pub const ARROOM_MAGIC: [u8; 4] = *b"ARRM";
 pub const ARROOM_VERSION: u16 = 2; // v2 stores narrow-band TSDF (idx, tsdf: i8, weight: u8); loader stays v1-compatible
-pub const MAX_KEYFRAMES: usize = 8;
+pub const MAX_KEYFRAMES: usize = 16;
 
 #[derive(Clone, Debug)]
 pub struct RelocKeyframe {
@@ -48,7 +48,7 @@ impl KeyframeBank {
         let too_close = self.frames.iter().any(|k| {
             let dp = (k.cam_pos - cam_pos).length();
             let da = k.cam_rot.angle_between(rot);
-            dp < 0.55 && da < 0.56
+            dp < 0.45 && da < 0.45
         });
         if too_close {
             return false;
@@ -410,7 +410,7 @@ pub fn deserialize_room_arroom(data: &[u8]) -> Result<LoadedRoomMap, String> {
     let chunk_count = r.read_u32()? as usize;
     let kf_count = r.read_u32()? as usize;
 
-    if plane_count > 64 || chunk_count > 384 || kf_count > 16 {
+    if plane_count > 64 || chunk_count > 2048 || kf_count > 32 {
         return Err("Exceeded safety limits in .arroom file".to_string());
     }
 
